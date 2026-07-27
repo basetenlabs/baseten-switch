@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Baseten documentation
+    url: https://docs.baseten.co/
+    about: Read the Baseten platform and CLI documentation.

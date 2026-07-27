@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "source": "https://inference.baseten.co/v1/models",
+  "fetched_at": "2026-07-25T20:46:58Z",
+  "source_sha256": "f2bc63e4f26407399b386139b9e880f76265c449a0d6143b821c7575a106bee3",
+  "data": [
+    {
+      "id": "zai-org/GLM-5.2",
+      "pricing": {
+        "prompt": 0.0000014,
+        "completion": 0.0000044,
+        "input_cache_read": 0.00000014
+      }
+    },
+    {
+      "id": "moonshotai/Kimi-K2.7-Code",
+      "pricing": {
+        "prompt": 0.00000095,
+        "completion": 0.000004,
+        "input_cache_read": 0.00000016
+      }
+    },
+    {
+      "id": "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B",
+      "pricing": {
+        "prompt": 0.0000006,
+        "completion": 0.0000024,
+        "input_cache_read": 0.00000012
+      }
+    }
+  ]
+}

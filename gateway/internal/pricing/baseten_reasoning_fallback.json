@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "source": "models_dev",
+  "source_commit": "c40d2ae92595fd40962923b100b93405e597b6b1",
+  "captured_at": "2026-07-25T00:00:00Z",
+  "models": {
+    "zai-org/GLM-5.2": {
+      "reasoning": true,
+      "reasoning_options": [
+        {
+          "type": "toggle"
+        }
+      ]
+    },
+    "moonshotai/Kimi-K2.7-Code": {
+      "reasoning": true,
+      "reasoning_options": [
+        {
+          "type": "toggle"
+        }
+      ]
+    },
+    "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B": {
+      "reasoning": true,
+      "reasoning_options": [
+        {
+          "type": "toggle"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,273 @@
+{
+  "generated_at": 1784937600,
+  "window": {
+    "since": 1784332800,
+    "until": 1784937600
+  },
+  "coverage": {
+    "request_rows": 1184,
+    "priced_actual_cost_rows": 1184,
+    "unpriced_actual_cost_rows": 0,
+    "savings_eligible_rows": 779,
+    "savings_unpriced_rows": 0,
+    "complete": true,
+    "reason": ""
+  },
+  "cost": {
+    "summary": {
+      "actual_claude_cost_usd": 172.4,
+      "actual_baseten_cost_usd": 143.5,
+      "estimated_native_cost_for_baseten_usd": 738.6,
+      "saved_usd": 595.1,
+      "saved_percent": 80.5714
+    },
+    "providers": [
+      {
+      "provider": "Claude",
+      "requests": 405,
+      "tokens": 18400000,
+      "actual_cost_usd": 172.4,
+      "priced_rows": 405,
+      "unpriced_rows": 0
+      },
+      {
+      "provider": "Baseten",
+      "requests": 779,
+      "tokens": 96300000,
+      "actual_cost_usd": 143.5,
+      "priced_rows": 779,
+      "unpriced_rows": 0
+      }
+    ],
+    "models": [
+      {
+        "provider": "Claude",
+        "model_id": "fable",
+        "display_name": "Fable",
+      "requests": 90,
+      "tokens": 4800000,
+      "actual_cost_usd": 34.48,
+      "priced_rows": 90,
+      "unpriced_rows": 0
+      },
+      {
+        "provider": "Claude",
+        "model_id": "opus",
+        "display_name": "Opus",
+      "requests": 62,
+      "tokens": 3200000,
+      "actual_cost_usd": 62.064,
+      "priced_rows": 62,
+      "unpriced_rows": 0
+      },
+      {
+        "provider": "Claude",
+        "model_id": "sonnet",
+        "display_name": "Sonnet",
+      "requests": 223,
+      "tokens": 8900000,
+      "actual_cost_usd": 65.512,
+      "priced_rows": 223,
+      "unpriced_rows": 0
+      },
+      {
+        "provider": "Claude",
+        "model_id": "haiku",
+        "display_name": "Haiku",
+      "requests": 30,
+      "tokens": 1500000,
+      "actual_cost_usd": 10.344,
+      "priced_rows": 30,
+      "unpriced_rows": 0
+      },
+      {
+        "provider": "Baseten",
+        "model_id": "zai-org/GLM-5.2",
+        "display_name": "GLM 5.2",
+      "requests": 620,
+      "tokens": 72513900,
+      "actual_cost_usd": 112.3,
+      "priced_rows": 620,
+      "unpriced_rows": 0
+      },
+      {
+        "provider": "Baseten",
+        "model_id": "moonshotai/Kimi-K3",
+        "display_name": "Kimi K3",
+      "requests": 159,
+      "tokens": 23786100,
+      "actual_cost_usd": 31.2,
+      "priced_rows": 159,
+      "unpriced_rows": 0
+      }
+    ],
+    "savings": {
+      "by_baseten_model": [
+        {
+          "model_id": "zai-org/GLM-5.2",
+          "display_name": "GLM 5.2",
+          "actual_baseten_cost_usd": 112.3,
+          "estimated_native_cost_usd": 570.0,
+          "saved_usd": 457.7,
+          "saved_percent": 80.2982
+        },
+        {
+          "model_id": "moonshotai/Kimi-K3",
+          "display_name": "Kimi K3",
+          "actual_baseten_cost_usd": 31.2,
+          "estimated_native_cost_usd": 168.6,
+          "saved_usd": 137.4,
+          "saved_percent": 81.4947
+        }
+      ],
+      "mappings": [
+        {
+          "baseten_model_id": "zai-org/GLM-5.2",
+          "baseten_display_name": "GLM 5.2",
+          "requested_claude_family": "Fable",
+          "actual_baseten_cost_usd": 35.2,
+          "estimated_native_cost_usd": 320.0
+        },
+        {
+          "baseten_model_id": "zai-org/GLM-5.2",
+          "baseten_display_name": "GLM 5.2",
+          "requested_claude_family": "Opus",
+          "actual_baseten_cost_usd": 16.6,
+          "estimated_native_cost_usd": 75.0
+        },
+        {
+          "baseten_model_id": "zai-org/GLM-5.2",
+          "baseten_display_name": "GLM 5.2",
+          "requested_claude_family": "Sonnet",
+          "actual_baseten_cost_usd": 54.8,
+          "estimated_native_cost_usd": 160.0
+        },
+        {
+          "baseten_model_id": "zai-org/GLM-5.2",
+          "baseten_display_name": "GLM 5.2",
+          "requested_claude_family": "Haiku",
+          "actual_baseten_cost_usd": 5.7,
+          "estimated_native_cost_usd": 15.0
+        },
+        {
+          "baseten_model_id": "moonshotai/Kimi-K3",
+          "baseten_display_name": "Kimi K3",
+          "requested_claude_family": "Fable",
+          "actual_baseten_cost_usd": 9.8,
+          "estimated_native_cost_usd": 80.0
+        },
+        {
+          "baseten_model_id": "moonshotai/Kimi-K3",
+          "baseten_display_name": "Kimi K3",
+          "requested_claude_family": "Opus",
+          "actual_baseten_cost_usd": 5.2,
+          "estimated_native_cost_usd": 25.0
+        },
+        {
+          "baseten_model_id": "moonshotai/Kimi-K3",
+          "baseten_display_name": "Kimi K3",
+          "requested_claude_family": "Sonnet",
+          "actual_baseten_cost_usd": 14.7,
+          "estimated_native_cost_usd": 55.0
+        },
+        {
+          "baseten_model_id": "moonshotai/Kimi-K3",
+          "baseten_display_name": "Kimi K3",
+          "requested_claude_family": "Haiku",
+          "actual_baseten_cost_usd": 1.5,
+          "estimated_native_cost_usd": 8.6
+        }
+      ]
+    }
+  },
+  "performance": {
+    "providers": [
+      {
+        "provider": "Claude",
+        "requests": 405,
+        "tokens": 18400000,
+        "ttft_samples": 392,
+        "median_ttft_ms": 610,
+        "output_tps_samples": 385,
+        "median_output_tokens_per_second": 54
+      },
+      {
+        "provider": "Baseten",
+        "requests": 779,
+        "tokens": 96300000,
+        "ttft_samples": 750,
+        "median_ttft_ms": 245,
+        "output_tps_samples": 742,
+        "median_output_tokens_per_second": 138
+      }
+    ],
+    "models": [
+      {
+        "provider": "Claude",
+        "model_id": "fable",
+        "display_name": "Fable",
+        "requests": 90,
+        "tokens": 4800000,
+        "ttft_samples": 87,
+        "median_ttft_ms": 690,
+        "output_tps_samples": 84,
+        "median_output_tokens_per_second": 46
+      },
+      {
+        "provider": "Claude",
+        "model_id": "opus",
+        "display_name": "Opus",
+        "requests": 62,
+        "tokens": 3200000,
+        "ttft_samples": 59,
+        "median_ttft_ms": 650,
+        "output_tps_samples": 58,
+        "median_output_tokens_per_second": 50
+      },
+      {
+        "provider": "Claude",
+        "model_id": "sonnet",
+        "display_name": "Sonnet",
+        "requests": 223,
+        "tokens": 8900000,
+        "ttft_samples": 217,
+        "median_ttft_ms": 590,
+        "output_tps_samples": 214,
+        "median_output_tokens_per_second": 58
+      },
+      {
+        "provider": "Claude",
+        "model_id": "haiku",
+        "display_name": "Haiku",
+        "requests": 30,
+        "tokens": 1500000,
+        "ttft_samples": 29,
+        "median_ttft_ms": 420,
+        "output_tps_samples": 29,
+        "median_output_tokens_per_second": 78
+      },
+      {
+        "provider": "Baseten",
+        "model_id": "zai-org/GLM-5.2",
+        "display_name": "GLM 5.2",
+        "requests": 620,
+        "tokens": 72513900,
+        "ttft_samples": 598,
+        "median_ttft_ms": 232,
+        "output_tps_samples": 590,
+        "median_output_tokens_per_second": 145
+      },
+      {
+        "provider": "Baseten",
+        "model_id": "moonshotai/Kimi-K3",
+        "display_name": "Kimi K3",
+        "requests": 159,
+        "tokens": 23786100,
+        "ttft_samples": 152,
+        "median_ttft_ms": 268,
+        "output_tps_samples": 152,
+        "median_output_tokens_per_second": 121
+      }
+    ]
+  }
+}

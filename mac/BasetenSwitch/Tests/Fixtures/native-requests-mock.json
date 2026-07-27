@@ -1,0 +1,46 @@
+{
+  "items": [
+    {
+      "event_id": "request-newest",
+      "completed_at": "2026-07-26T18:02:03.456Z",
+      "client": "claude-code",
+      "configured_route": "baseten",
+      "effective_provider": "anthropic",
+      "requested_model": "claude-sonnet-4-5",
+      "served_model": "claude-sonnet-4-5",
+      "status": 200,
+      "duration_ms": 1842,
+      "termination_reason": "completed",
+      "subagent": false,
+      "fallback": {
+        "attempted": true,
+        "count": 1,
+        "trigger": "image_input_unsupported"
+      }
+    },
+    {
+      "event_id": "request-older",
+      "completed_at": "2026-07-26T18:01:00Z",
+      "client": "codex",
+      "configured_route": "baseten",
+      "effective_provider": "baseten",
+      "requested_model": "openai/gpt-oss-120b",
+      "served_model": "openai/gpt-oss-120b",
+      "status": null,
+      "duration_ms": 721,
+      "termination_reason": "client_cancelled",
+      "subagent": true,
+      "fallback": {
+        "attempted": false,
+        "count": 0,
+        "trigger": null
+      }
+    }
+  ],
+  "next_cursor": "older-page-token",
+  "has_more": true,
+  "coverage": {
+    "complete": false,
+    "reason": "history truncated by retention"
+  }
+}

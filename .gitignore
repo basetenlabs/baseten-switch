@@ -1,0 +1,26 @@
+# Build outputs
+result
+gateway/bin/
+gateway/*.test
+tests/fresh-install/build/
+mac/BasetenSwitch/.build/
+mac/BasetenSwitch/dist/
+mac/BasetenSwitch/dist-preview/
+
+# Logs
+*.log
+
+# Local credentials
+.env*
+
+# OS junk
+.DS_Store
+dist/
+
+# Python test caches
+__pycache__/
+*.pyc
+
+# Claude Code session state (agent worktrees, local settings)
+.claude/
+gateway/baseten-switch

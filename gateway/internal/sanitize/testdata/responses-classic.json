@@ -1,0 +1,25 @@
+{
+  "model": "example-model",
+  "input": [
+    {
+      "role": "user",
+      "content": "hello"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "example",
+      "parameters": {
+        "type": "object"
+      }
+    },
+    {
+      "type": "tool_search"
+    },
+    {
+      "type": "image_generation"
+    }
+  ],
+  "tool_choice": "auto"
+}

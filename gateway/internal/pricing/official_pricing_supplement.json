@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "source": "anthropic_official_pricing",
+  "source_urls": [
+    "https://platform.claude.com/docs/en/about-claude/pricing",
+    "https://platform.claude.com/docs/en/build-with-claude/prompt-caching"
+  ],
+  "captured_at": "2026-07-26T00:00:00Z",
+  "reviewed_at": "2026-07-26T00:00:00Z",
+  "content_sha256": "0016612b23adf833e5f9a993f69c86fc71c515436a98d9c5c662672a894facf5",
+  "entries": [
+    {
+      "provider": "anthropic",
+      "model": "claude-fable-5",
+      "profile": "standard",
+      "dimension": "cache_write_1h",
+      "usd_per_million": 20
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-haiku-4-5",
+      "profile": "standard",
+      "dimension": "cache_write_1h",
+      "usd_per_million": 2
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-haiku-4-5-20251001",
+      "profile": "standard",
+      "dimension": "cache_write_1h",
+      "usd_per_million": 2
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-4-5",
+      "profile": "standard",
+      "dimension": "cache_write_1h",
+      "usd_per_million": 10
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-4-5-20251101",
+      "profile": "standard",
+      "dimension": "cache_write_1h",
+      "usd_per_million": 10
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-4-6",
+      "profile": "standard",
+      "dimension": "cache_write_1h",
+      "usd_per_million": 10
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-4-7",
+      "profile": "standard",
+      "dimension": "cache_write_1h",
+      "usd_per_million": 10
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-4-8",
+      "profile": "fast",
+      "dimension": "cache_write_1h",
+      "usd_per_million": 20
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-4-8",
+      "profile": "standard",
+      "dimension": "cache_write_1h",
+      "usd_per_million": 10
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5",
+      "profile": "fast",
+      "dimension": "cache_write_1h",
+      "usd_per_million": 20
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5",
+      "profile": "standard",
+      "dimension": "cache_write_1h",
+      "usd_per_million": 10
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-5",
+      "profile": "standard",
+      "dimension": "cache_write_1h",
+      "usd_per_million": 6
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-5-20250929",
+      "profile": "standard",
+      "dimension": "cache_write_1h",
+      "usd_per_million": 6
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-6",
+      "profile": "standard",
+      "dimension": "cache_write_1h",
+      "usd_per_million": 6
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-sonnet-5",
+      "profile": "standard",
+      "dimension": "cache_write_1h",
+      "usd_per_million": 4,
+      "effective_until": "2026-08-31"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-sonnet-5",
+      "profile": "standard",
+      "dimension": "cache_write_1h",
+      "usd_per_million": 6,
+      "effective_from": "2026-09-01"
+    }
+  ]
+}

@@ -1,0 +1,266 @@
+name: Prepare signed release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Exact signed v<major>.<minor>.<patch> tag to build
+        required: true
+        type: string
+      build_number:
+        description: Period-separated numeric macOS bundle build number
+        required: true
+        type: string
+      approved_license_spdx:
+        description: SPDX identifier approved for the repository license
+        required: true
+        type: string
+
+permissions: read-all
+
+concurrency:
+  group: release-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Build, attest, and prepare draft
+    runs-on: macos-15
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out the selected tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: refs/tags/${{ inputs.release_tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: gateway/go.mod
+          cache-dependency-path: gateway/go.sum
+
+      - name: Verify exact signed release tag
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SIGNING_PUBLIC_KEY_BASE64: ${{ secrets.RELEASE_TAG_SIGNING_PUBLIC_KEY_BASE64 }}
+          EXPECTED_FINGERPRINT: ${{ vars.RELEASE_TAG_SIGNING_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { printf 'release tag must match v<major>.<minor>.<patch>\n' >&2; exit 1; }
+          [[ "$(git cat-file -t "refs/tags/$RELEASE_TAG")" == tag ]] \
+            || { printf 'release tag must be an annotated signed tag\n' >&2; exit 1; }
+          [[ -n "$SIGNING_PUBLIC_KEY_BASE64" && -n "$EXPECTED_FINGERPRINT" ]] \
+            || { printf 'release tag verification key and fingerprint are required\n' >&2; exit 1; }
+          signing_key="$RUNNER_TEMP/release-tag-signing-key.asc"
+          printf '%s' "$SIGNING_PUBLIC_KEY_BASE64" | base64 -D >"$signing_key"
+          actual_fingerprint="$(
+            gpg --batch --with-colons --import-options show-only --import "$signing_key" \
+              | awk -F: '$1 == "fpr" { print $10; exit }'
+          )"
+          actual_fingerprint="$(printf '%s' "$actual_fingerprint" | tr '[:lower:]' '[:upper:]')"
+          expected_fingerprint="$(printf '%s' "$EXPECTED_FINGERPRINT" | tr '[:lower:]' '[:upper:]')"
+          [[ -n "$actual_fingerprint" && "$actual_fingerprint" == "$expected_fingerprint" ]] \
+            || { printf 'release tag signing key fingerprint is not approved\n' >&2; exit 1; }
+          gpg --batch --import "$signing_key"
+          git verify-tag "$RELEASE_TAG"
+          [[ "$(git rev-parse "HEAD^{commit}")" == "$(git rev-parse "${RELEASE_TAG}^{commit}")" ]] \
+            || { printf 'checkout is not the selected tag commit\n' >&2; exit 1; }
+          [[ "$(git describe --tags --exact-match HEAD)" == "$RELEASE_TAG" ]] \
+            || { printf 'HEAD is not exactly the selected tag\n' >&2; exit 1; }
+
+      - name: Run repository release gate
+        run: scripts/check.sh --offline
+
+      - name: Verify release workflow and formula contracts
+        run: |
+          scripts/release/test-release-workflow.sh
+          scripts/release/test-render-formula.sh
+
+      - name: Provision ephemeral signing, notarization, and SBOM inputs
+        env:
+          CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          SBOM_GENERATOR_BASE64: ${{ secrets.BASETEN_SWITCH_SBOM_GENERATOR_BASE64 }}
+          EXPECTED_SBOM_GENERATOR_SHA256: ${{ vars.BASETEN_SWITCH_SBOM_GENERATOR_SHA256 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          for value in \
+            "$CERTIFICATE_P12_BASE64" \
+            "$CERTIFICATE_PASSWORD" \
+            "$NOTARY_KEY_P8_BASE64" \
+            "$NOTARY_KEY_ID" \
+            "$NOTARY_ISSUER_ID" \
+            "$SBOM_GENERATOR_BASE64" \
+            "$EXPECTED_SBOM_GENERATOR_SHA256"; do
+            [[ -n "$value" ]] || { printf 'required protected release input is missing\n' >&2; exit 1; }
+          done
+          [[ "$EXPECTED_SBOM_GENERATOR_SHA256" =~ ^[[:xdigit:]]{64}$ ]] \
+            || { printf 'SBOM generator digest must be a SHA-256 value\n' >&2; exit 1; }
+
+          keychain="$RUNNER_TEMP/baseten-switch-release.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          certificate="$RUNNER_TEMP/developer-id.p12"
+          notary_key="$RUNNER_TEMP/AuthKey_${NOTARY_KEY_ID}.p8"
+          sbom_generator="$RUNNER_TEMP/baseten-switch-sbom-generator"
+          notary_profile="baseten-switch-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          printf '%s' "$CERTIFICATE_P12_BASE64" | base64 -D >"$certificate"
+          printf '%s' "$NOTARY_KEY_P8_BASE64" | base64 -D >"$notary_key"
+          printf '%s' "$SBOM_GENERATOR_BASE64" | base64 -D >"$sbom_generator"
+          chmod 0700 "$sbom_generator"
+          actual_sbom_sha256="$(shasum -a 256 "$sbom_generator" | awk '{print $1}')"
+          expected_sbom_sha256="$(
+            printf '%s' "$EXPECTED_SBOM_GENERATOR_SHA256" | tr '[:upper:]' '[:lower:]'
+          )"
+          [[ "$actual_sbom_sha256" == "$expected_sbom_sha256" ]] \
+            || { printf 'SBOM generator does not match the approved digest\n' >&2; exit 1; }
+
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" \
+            -k "$keychain" \
+            -P "$CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain"
+          security list-keychains -d user -s "$keychain"
+
+          xcrun notarytool store-credentials "$notary_profile" \
+            --key "$notary_key" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER_ID"
+
+          {
+            printf 'BASETEN_SWITCH_NOTARY_PROFILE=%s\n' "$notary_profile"
+            printf 'BASETEN_SWITCH_SBOM_GENERATOR=%s\n' "$sbom_generator"
+          } >>"$GITHUB_ENV"
+
+      - name: Build signed and notarized release assets
+        env:
+          BASETEN_SWITCH_RELEASE_TAG: ${{ inputs.release_tag }}
+          BASETEN_SWITCH_BUILD_NUMBER: ${{ inputs.build_number }}
+          BASETEN_SWITCH_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          BASETEN_SWITCH_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: scripts/release/build-artifacts.sh
+
+      - name: Scan release archive for secrets
+        env:
+          GITLEAKS_MAX_ARCHIVE_DEPTH: "2"
+        run: scripts/security/run-gitleaks.sh dist
+
+      - name: Resolve release SBOM path
+        id: release-files
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          sbom="dist/baseten-switch_${version}.cdx.json"
+          [[ -s "$sbom" ]] || { printf 'release SBOM is missing: %s\n' "$sbom" >&2; exit 1; }
+          printf 'sbom=%s\n' "$sbom" >>"$GITHUB_OUTPUT"
+
+      - name: Scan release SBOM for vulnerabilities
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          sbom: ${{ steps.release-files.outputs.sbom }}
+          fail-build: true
+          severity-cutoff: high
+          output-format: table
+
+      - name: Render checksum-pinned Homebrew formula and patch
+        id: formula
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          APPROVED_LICENSE_SPDX: ${{ inputs.approved_license_spdx }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          artifact_name="baseten-switch_${version}_darwin_universal.zip"
+          artifact="dist/$artifact_name"
+          artifact_sha256="$(
+            awk -v artifact="$artifact_name" '$2 == artifact { print $1 }' dist/checksums.txt
+          )"
+          [[ "$artifact_sha256" =~ ^[[:xdigit:]]{64}$ ]] \
+            || { printf 'final artifact checksum is missing from checksums.txt\n' >&2; exit 1; }
+
+          tap_stage="$GITHUB_WORKSPACE/dist/homebrew-tap"
+          formula="$tap_stage/Formula/baseten-switch.rb"
+          patch="dist/baseten-switch_${version}_homebrew.patch"
+          scripts/release/render-formula.sh \
+            --tag "$RELEASE_TAG" \
+            --sha256 "$artifact_sha256" \
+            --approved-license-spdx "$APPROVED_LICENSE_SPDX" \
+            --output "$formula" \
+            --patch-output "$patch"
+          {
+            printf 'artifact=%s\n' "$artifact"
+            printf 'formula=%s\n' "$formula"
+            printf 'patch=%s\n' "$patch"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Attest the exact final ZIP
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: ${{ steps.formula.outputs.artifact }}
+
+      - name: Preserve formula and tap patch as workflow artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: baseten-switch-${{ inputs.release_tag }}-homebrew
+          path: |
+            ${{ steps.formula.outputs.formula }}
+            ${{ steps.formula.outputs.patch }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create draft release without replacing assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            printf 'release already exists for %s; refusing to replace or add assets\n' \
+              "$RELEASE_TAG" >&2
+            exit 1
+          fi
+          version="${RELEASE_TAG#v}"
+          gh release create "$RELEASE_TAG" \
+            "dist/baseten-switch_${version}_darwin_universal.zip" \
+            "dist/baseten-switch_${version}.cdx.json" \
+            "dist/checksums.txt" \
+            "dist/notarization-${version}-payload.json" \
+            "dist/notarization-${version}-artifact.json" \
+            --draft \
+            --verify-tag \
+            --title "Baseten Switch $RELEASE_TAG" \
+            --notes-from-tag
+
+      - name: Remove ephemeral signing material
+        if: always()
+        run: |
+          rm -f \
+            "$RUNNER_TEMP/developer-id.p12" \
+            "$RUNNER_TEMP"/AuthKey_*.p8 \
+            "$RUNNER_TEMP/baseten-switch-sbom-generator" \
+            "$RUNNER_TEMP/release-tag-signing-key.asc"
+          release_keychain="$RUNNER_TEMP/baseten-switch-release.keychain-db"
+          if [[ -e "$release_keychain" ]]; then
+            security delete-keychain "$release_keychain" || true
+          fi

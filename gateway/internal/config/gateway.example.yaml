@@ -1,0 +1,85 @@
+# gateway.yaml -- Baseten Switch gateway config ('baseten-switch config init' writes exactly this file).
+# Field reference: config/schema.md.
+# Topology: harness -> door 127.0.0.1:45271 -> router 127.0.0.1:45272.
+# ${VAR} resolves from the environment, then ~/.config/baseten-switch/env (mode 0600); no secrets live here.
+
+global:
+  # One global switch. Off is absolute native passthrough; On applies saved routing policy.
+  routing_enabled: true
+
+  # Upstream auth; baseten is OPTIONAL with OAuth ('baseten auth login'), see schema.md for the API-key path.
+  auth:
+    baseten:   ${BASETEN_API_KEY}
+    anthropic: ${ANTHROPIC_API_KEY}
+
+  # Private segmented JSONL request store; the dashboards read it.
+  telemetry_dir: ~/.config/baseten-switch/telemetry
+  telemetry_enabled: true
+  telemetry_retention_days: 90
+
+  # Retry and timeout knobs shared by all harnesses.
+  retry_max: 3
+  request_timeout: 600s
+  # Per-attempt first-byte deadline; expiry falls through to fallback_route. 0/absent = disabled.
+  # ttft_timeout: 30s
+
+clients:
+  # One entry per harness; entries share one router listener (dispatch by path).
+
+  - name: claude-code
+    enabled: true
+    bind_addr: 127.0.0.1:45272
+    protocol_shape: anthropic
+    # What the harness sends to the gateway (collected, not yet enforced).
+    auth_token:
+      header: Authorization
+      value: ${ANTHROPIC_AUTH_TOKEN}
+    # Baseten target for requests without an explicit family route.
+    default_model: zai-org/GLM-5.2
+    # Every Claude family defaults to GLM-5.2 and remains editable while the global switch is Off.
+    model_routes:
+      fable:  zai-org/GLM-5.2
+      opus:   zai-org/GLM-5.2
+      sonnet: zai-org/GLM-5.2
+      haiku:  zai-org/GLM-5.2
+    # Picker-visible Baseten models for Claude Code; see the model-discovery contract.
+    model_aliases:
+      claude-baseten-glm-5-2:   zai-org/GLM-5.2
+      claude-baseten-kimi-k2-7: moonshotai/Kimi-K2.7-Code
+      claude-baseten-nemotron:  nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B
+    # Route Claude Code subagent (sidechain) traffic to a model; toggle with 'baseten-switch claude subagents'. See the subagent-routing contract.
+    # subagent_model: claude-baseten-glm-5-2
+    # subagent_routing: on
+    # Tried when baseten is unreachable, returns 429/5xx, or ttft_timeout expires (30s cooldown).
+    fallback_route: anthropic
+
+  # codex ships parked (enabled: false; no listener bound); 'baseten-switch codex on' offers to
+  # enable it, or set enabled: true and SIGHUP the router yourself.
+  - name: codex
+    enabled: false
+    bind_addr: 127.0.0.1:45272
+    protocol_shape: openai
+    auth_token:
+      header: Authorization
+      value: ${CODEX_AUTH_TOKEN}
+    default_model: zai-org/GLM-5.2
+    # Responses request normalization and stream consistency safeguards.
+    # The additional_tools rewrite is experimental and must be opted into.
+    responses_compatibility:
+      text_format_default: on
+      additional_tools_input: off
+      reasoning_effort: on
+      function_arguments_consistency: on
+    # Emergency only. Empty means no tool types are removed.
+    responses_strip_tool_types: []
+    fallback_route: openai
+
+# Front-door ports: harnesses point at bind_addr; forwards to router_addr, serves the native provider when tripped.
+door:
+  cooldown: 15s
+  probe_interval: 3s
+  ports:
+    - bind_addr: 127.0.0.1:45271
+      router_addr: 127.0.0.1:45272
+
+# Additional door ports may target separate router listeners when needed.

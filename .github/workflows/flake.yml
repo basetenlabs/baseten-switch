@@ -1,0 +1,67 @@
+name: flake
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+# Superseded pushes to the same ref stop early instead of finishing a
+# build nobody will read.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # nix build runs the cmd/baseten-switch Go tests inside the sandbox (no
+  # HOME, no network beyond loopback), which is what keeps them honest
+  # about host-state leaks. -L streams those test logs into the CI log.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
+        with:
+          use-flakehub: false
+
+      - name: Build and test
+        run: nix build -L .#baseten-switch
+
+      - name: Version stamp
+        run: ./result/bin/baseten-switch --version
+
+  build-darwin:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
+        with:
+          use-flakehub: false
+
+      - name: Build and test
+        run: nix build -L .#baseten-switch
+
+      - name: Version stamp
+        run: ./result/bin/baseten-switch --version
+
+  # aarch64-linux has no runner here; evaluating every declared system
+  # still catches flake-level breakage (a dropped platform, a bad attr)
+  # without building anything.
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Evaluate all systems
+        run: nix flake check --all-systems --no-build

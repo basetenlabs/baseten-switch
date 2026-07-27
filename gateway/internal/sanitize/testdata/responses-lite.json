@@ -1,0 +1,22 @@
+{
+  "model": "example-model",
+  "input": [
+    {
+      "type": "additional_tools",
+      "tools": [
+        {
+          "type": "function",
+          "name": "example",
+          "parameters": {
+            "type": "object"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": "hello"
+    }
+  ],
+  "tool_choice": "auto"
+}

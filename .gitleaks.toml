@@ -1,0 +1,9 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic token used only by the isolated fresh-install stub"
+regexTarget = "match"
+regexes = [
+  '''baseten-switch-fresh-install-local-token''',
+]
