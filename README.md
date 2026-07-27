@@ -5,6 +5,11 @@ coding harnesses between their native providers and models served on Baseten.
 One global switch controls Baseten routing, and per-client mappings select the
 model that serves each request.
 
+> **Beta:** Baseten Switch is under active development. Interfaces,
+> configuration, and behavior may change between releases. The current macOS
+> build is ad hoc signed and not yet notarized by Apple, so first launch may
+> require approval under System Settings → Privacy & Security.
+
 The first public release supports macOS 13 or newer on Apple Silicon and Intel.
 
 ## Quick start
