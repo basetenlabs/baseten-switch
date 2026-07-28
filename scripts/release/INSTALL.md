@@ -1,5 +1,9 @@
 # Install Baseten Switch on macOS
 
+> **Beta:** Baseten Switch is currently a public beta. The CLI and app are
+> ad-hoc signed but are not Apple-notarized. macOS may require explicit
+> approval before the app opens for the first time.
+
 Homebrew is the canonical public install and upgrade channel. This one
 command installs the Baseten CLI and Baseten Switch from Baseten's public tap:
 
@@ -20,10 +24,9 @@ baseten-switch doctor --probe
 
 Approved direct installs use
 `baseten-switch_<version>_darwin_universal.zip`. The release also publishes
-`baseten-switch_<version>.cdx.json` and `checksums.txt`. Verify both SHA-256
-entries before extracting the ZIP.
+`checksums.txt`. Verify the ZIP's SHA-256 entry before extracting it.
 
-The release ZIP contains the universal CLI, a nested notarized
+The release ZIP contains the universal, ad-hoc signed CLI, a nested ad-hoc signed
 `Baseten Switch.app.zip`, and `install.sh`. Run:
 
 ```sh
@@ -33,9 +36,24 @@ cd baseten-switch_<version>
 ./install.sh
 ```
 
-The installer validates Developer ID signatures, the app's stapled
-notarization ticket, Gatekeeper acceptance, versions, and architectures.
-It never clears macOS quarantine metadata.
+The installer validates the ad-hoc signatures, matching versions, and universal
+architectures. An ad-hoc signature detects changes after packaging, but it does
+not establish an Apple-verified developer identity or notarization.
+
+## First launch approval
+
+If macOS blocks the beta app on first launch:
+
+1. In Finder, open `~/Applications`, double-click **Baseten Switch**, then
+   dismiss the warning.
+2. Choose **Apple menu > System Settings > Privacy & Security**.
+3. Scroll to the **Security** section and click **Open Anyway** for Baseten
+   Switch.
+4. Confirm **Open** and authenticate if macOS asks.
+
+The **Open Anyway** button is available for about one hour after the blocked
+launch attempt. A managed Mac may prevent this override. Baseten Switch does
+not ask users to clear quarantine metadata or disable Gatekeeper.
 
 ## Uninstall
 

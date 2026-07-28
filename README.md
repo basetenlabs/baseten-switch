@@ -35,6 +35,11 @@ user launch agents, starts the local gateway, installs Baseten Switch.app in
 sessions to the gateway. The final command checks the complete request path
 with a small live request.
 
+If macOS blocks the app's first launch, open **System Settings → Privacy &
+Security**, scroll to **Security**, and click **Open Anyway**. This control
+appears after a blocked launch attempt. A managed Mac may prohibit the
+override.
+
 ## Use the Mac app
 
 The menu bar app is the primary interface for daily use. It provides:

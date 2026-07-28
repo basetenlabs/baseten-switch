@@ -3,9 +3,7 @@
 #
 # Outputs:
 #   dist/baseten-switch_<version>_darwin_universal.zip
-#   dist/baseten-switch_<version>.cdx.json
 #   dist/checksums.txt
-#   dist/notarization-<version>-{payload,artifact}.json
 #
 # The outer ZIP contains:
 #   bin/baseten-switch
@@ -15,10 +13,10 @@
 #   THIRD_PARTY_NOTICES.md
 #   README.md
 #
-# Release builds fail closed. They require a Developer ID Application
-# identity, an expected Team ID, a notarytool keychain profile, numeric
-# plist versions, and an executable CycloneDX SBOM generator hook.
-# This script never uploads or replaces published assets.
+# Beta release builds fail closed. They require an explicit ad-hoc signing
+# mode and numeric plist versions. The output is ad-hoc signed, not
+# notarized, and is intended for the public beta. This script never uploads
+# or replaces published assets.
 
 set -euo pipefail
 
@@ -33,19 +31,12 @@ usage() {
 Usage: scripts/release/build-artifacts.sh [--dry-run]
 
 Required for a release build:
-  BASETEN_SWITCH_RELEASE_TAG       Signed tag, for example v0.2.0
-  BASETEN_SWITCH_BUILD_NUMBER      Period-separated integers, for example 42
-  BASETEN_SWITCH_SIGNING_IDENTITY  Developer ID Application identity
-  BASETEN_SWITCH_TEAM_ID           Apple Developer Team ID
-  BASETEN_SWITCH_NOTARY_PROFILE    notarytool keychain profile
-  BASETEN_SWITCH_SBOM_GENERATOR    Executable CycloneDX generator hook
+  BASETEN_SWITCH_RELEASE_TAG          Exact tag, for example v0.2.0
+  BASETEN_SWITCH_BUILD_NUMBER         Period-separated integers, for example 42
+  BASETEN_SWITCH_RELEASE_SIGNING_MODE Must be "adhoc"
 
-SBOM hook contract:
-  "$BASETEN_SWITCH_SBOM_GENERATOR" <final-outer-zip> <output-cdx-json>
-
-The hook must write a nonempty CycloneDX JSON file to the second path.
-The script writes checksums.txt for the final ZIP and SBOM after both
-notarization submissions succeed.
+The script writes checksums.txt for the final ZIP. Beta artifacts are
+ad-hoc signed and are not Apple-notarized.
 EOF
 }
 
@@ -75,10 +66,8 @@ fi
 marketing_version="${release_tag#v}"
 build_number="${BASETEN_SWITCH_BUILD_NUMBER:-}"
 artifact_name="baseten-switch_${marketing_version}_darwin_universal.zip"
-sbom_name="baseten-switch_${marketing_version}.cdx.json"
 dist_dir="$REPO_DIR/dist"
 artifact="$dist_dir/$artifact_name"
-sbom="$dist_dir/$sbom_name"
 checksums="$dist_dir/checksums.txt"
 
 if [[ "$dry_run" == 1 ]]; then
@@ -90,10 +79,9 @@ if [[ "$dry_run" == 1 ]]; then
   printf 'archive entries:  bin/baseten-switch\n'
   printf '                  Baseten Switch.app.zip\n'
   printf '                  install.sh, LICENSE, THIRD_PARTY_NOTICES.md, README.md\n'
-  printf 'sbom:             %s\n' "$sbom"
-  printf 'checksums:        %s (final ZIP and SBOM)\n' "$checksums"
-  printf 'signing:          Developer ID Application, hardened runtime, secure timestamp\n'
-  printf 'notarization:     payload ZIP, stapled app, then exact final outer ZIP\n'
+  printf 'checksums:        %s (final ZIP)\n' "$checksums"
+  printf 'signing:          explicit ad-hoc beta signatures\n'
+  printf 'notarization:     none (public beta)\n'
   printf 'publication:      separate immutable release step; this script never uploads\n'
   exit 0
 fi
@@ -101,31 +89,14 @@ fi
 [[ "$build_number" =~ ^[0-9]+(\.[0-9]+)*$ ]] \
   || fail "BASETEN_SWITCH_BUILD_NUMBER must contain period-separated integers"
 
-signing_identity="${BASETEN_SWITCH_SIGNING_IDENTITY:-}"
-team_id="${BASETEN_SWITCH_TEAM_ID:-}"
-notary_profile="${BASETEN_SWITCH_NOTARY_PROFILE:-}"
-sbom_generator="${BASETEN_SWITCH_SBOM_GENERATOR:-}"
-
-[[ "$signing_identity" == "Developer ID Application:"* ]] \
-  || fail "BASETEN_SWITCH_SIGNING_IDENTITY must name a Developer ID Application certificate"
-[[ "$team_id" =~ ^[A-Z0-9]{10}$ ]] \
-  || fail "BASETEN_SWITCH_TEAM_ID must be a 10-character Apple Developer Team ID"
-[[ -n "$notary_profile" ]] \
-  || fail "BASETEN_SWITCH_NOTARY_PROFILE is required; create it with 'xcrun notarytool store-credentials'"
-[[ -x "$sbom_generator" ]] \
-  || fail "BASETEN_SWITCH_SBOM_GENERATOR must point to an executable CycloneDX generator"
+release_signing_mode="${BASETEN_SWITCH_RELEASE_SIGNING_MODE:-}"
+[[ "$release_signing_mode" == "adhoc" ]] \
+  || fail "BASETEN_SWITCH_RELEASE_SIGNING_MODE must be 'adhoc' for beta releases"
 [[ "$(uname -s)" == "Darwin" ]] || fail "release builds require macOS"
 
-for command in go lipo codesign plutil ditto zip unzip shasum xcrun spctl security; do
+for command in go lipo codesign plutil ditto zip unzip shasum; do
   command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
 done
-signing_identities="$(security find-identity -v -p codesigning)"
-grep -Fq "$signing_identity" <<<"$signing_identities" \
-  || fail "Developer ID signing identity is not available in the active keychain: $signing_identity"
-xcrun notarytool history \
-  --keychain-profile "$notary_profile" \
-  --output-format json >/dev/null \
-  || fail "notarytool credentials are unavailable or invalid for profile: $notary_profile"
 for required_file in \
   "$REPO_DIR/LICENSE" \
   "$REPO_DIR/THIRD_PARTY_NOTICES.md" \
@@ -140,12 +111,12 @@ exact_tag="$(git -C "$REPO_DIR" describe --tags --exact-match HEAD 2>/dev/null |
 [[ -z "$(git -C "$REPO_DIR" status --porcelain --untracked-files=no)" ]] \
   || fail "release builds require a clean tracked worktree"
 
-for output in "$artifact" "$sbom" "$checksums"; do
+for output in "$artifact" "$checksums"; do
   [[ ! -e "$output" ]] \
     || fail "refusing to replace existing release output: ${output#"$REPO_DIR/"}"
 done
 
-verify_developer_id() {
+verify_adhoc_signature() {
   local target="$1"
   local deep="${2:-0}"
   local signature_info
@@ -156,43 +127,14 @@ verify_developer_id() {
   codesign "${verify_args[@]}" "$target" \
     || fail "code-signature verification failed: $target"
   signature_info="$(codesign --display --verbose=4 "$target" 2>&1)"
-  grep -q '^Authority=Developer ID Application:' <<<"$signature_info" \
-    || fail "Developer ID Application authority missing: $target"
-  grep -qxF "TeamIdentifier=$team_id" <<<"$signature_info" \
-    || fail "TeamIdentifier is not $team_id: $target"
-}
-
-notarize() {
-  local input="$1"
-  local log_path="$2"
-  local submission_summary
-  local submission_id
-  local status
-  submission_summary="$(mktemp "$stage_root/notary-submission.XXXXXX")"
-  xcrun notarytool submit "$input" \
-    --keychain-profile "$notary_profile" \
-    --wait \
-    --output-format json >"$submission_summary" \
-    || fail "notarization submission failed: $input (log: $log_path)"
-  status="$(plutil -extract status raw -o - "$submission_summary" 2>/dev/null || true)"
-  submission_id="$(plutil -extract id raw -o - "$submission_summary" 2>/dev/null || true)"
-  [[ "$status" == "Accepted" ]] \
-    || fail "notarization was not accepted for $input (status: ${status:-unknown}; submission: $submission_summary)"
-  [[ -n "$submission_id" ]] \
-    || fail "notarytool returned no submission ID for $input"
-  xcrun notarytool log "$submission_id" \
-    --keychain-profile "$notary_profile" \
-    "$log_path" >/dev/null \
-    || fail "could not retrieve notarization log for $input"
-  [[ -s "$log_path" ]] \
-    || fail "notarytool produced an empty notarization log for $input"
+  grep -qxF 'Signature=adhoc' <<<"$signature_info" \
+    || fail "required ad-hoc beta signature is missing: $target"
 }
 
 stage_root="$(mktemp -d)"
 stage="$stage_root/archive"
-payload_stage="$stage_root/notary-payload"
 trap 'rm -rf "$stage_root"' EXIT
-mkdir -p "$stage/bin" "$payload_stage/bin" "$dist_dir"
+mkdir -p "$stage/bin" "$dist_dir"
 
 log "building universal CLI (${release_tag})"
 for goarch in arm64 amd64; do
@@ -208,16 +150,15 @@ lipo -create -output "$stage/bin/baseten-switch" \
   "$stage_root/baseten-switch-arm64" \
   "$stage_root/baseten-switch-amd64"
 chmod 0755 "$stage/bin/baseten-switch"
-codesign --force --options runtime --timestamp \
-  --sign "$signing_identity" "$stage/bin/baseten-switch"
-verify_developer_id "$stage/bin/baseten-switch"
+codesign --force --sign - "$stage/bin/baseten-switch"
+verify_adhoc_signature "$stage/bin/baseten-switch"
 [[ "$("$stage/bin/baseten-switch" --version)" == "baseten-switch $release_tag" ]] \
   || fail "CLI version does not match $release_tag"
 
-log "building Developer ID menubar app"
+log "building ad-hoc signed beta menubar app"
 BASETEN_SWITCH_MARKETING_VERSION="$marketing_version" \
 BASETEN_SWITCH_BUILD_NUMBER="$build_number" \
-BASETEN_SWITCH_SIGNING_IDENTITY="$signing_identity" \
+BASETEN_SWITCH_RELEASE_SIGNING_MODE="$release_signing_mode" \
   "$REPO_DIR/scripts/build-menubar.sh" --variant stable --release
 app="$REPO_DIR/mac/BasetenSwitch/dist/Baseten Switch.app"
 app_plist="$app/Contents/Info.plist"
@@ -226,8 +167,8 @@ app_plist="$app/Contents/Info.plist"
   || fail "app marketing version does not match $marketing_version"
 [[ "$(plutil -extract CFBundleVersion raw "$app_plist")" == "$build_number" ]] \
   || fail "app build number does not match $build_number"
-verify_developer_id "$app" 1
-verify_developer_id "$app/Contents/MacOS/BasetenSwitch"
+verify_adhoc_signature "$app" 1
+verify_adhoc_signature "$app/Contents/MacOS/BasetenSwitch"
 
 for binary in "$stage/bin/baseten-switch" "$app/Contents/MacOS/BasetenSwitch"; do
   archs="$(lipo -archs "$binary")"
@@ -238,27 +179,6 @@ for binary in "$stage/bin/baseten-switch" "$app/Contents/MacOS/BasetenSwitch"; d
     esac
   done
 done
-
-log "notarizing signed payload"
-ditto "$stage/bin/baseten-switch" "$payload_stage/bin/baseten-switch"
-ditto "$app" "$payload_stage/Baseten Switch.app"
-payload_zip="$stage_root/notary-payload.zip"
-(
-  cd "$payload_stage"
-  zip -qry "$payload_zip" .
-)
-payload_log="$dist_dir/notarization-${marketing_version}-payload.json"
-[[ ! -e "$payload_log" ]] || fail "refusing to replace existing notarization log: $payload_log"
-notarize "$payload_zip" "$payload_log"
-
-log "stapling and validating app"
-xcrun stapler staple "$app" || fail "failed to staple the menubar app"
-xcrun stapler validate "$app" || fail "stapled ticket validation failed"
-verify_developer_id "$app" 1
-spctl --assess --type execute --verbose=4 "$app" \
-  || fail "Gatekeeper rejected the menubar app"
-spctl --assess --type execute --verbose=4 "$stage/bin/baseten-switch" \
-  || fail "Gatekeeper rejected the CLI"
 
 log "assembling $artifact_name"
 ditto -c -k --keepParent "$app" "$stage/Baseten Switch.app.zip"
@@ -286,23 +206,11 @@ if grep -Eq '(^|/)docs/' <<<"$archive_entries"; then
   fail "outer ZIP must not bundle the docs directory"
 fi
 
-log "notarizing exact final outer ZIP"
-artifact_log="$dist_dir/notarization-${marketing_version}-artifact.json"
-[[ ! -e "$artifact_log" ]] || fail "refusing to replace existing notarization log: $artifact_log"
-notarize "$artifact" "$artifact_log"
-
-log "generating CycloneDX SBOM"
-"$sbom_generator" "$artifact" "$sbom" \
-  || fail "SBOM generator failed"
-[[ -s "$sbom" ]] || fail "SBOM generator did not write $sbom"
-grep -Eq '"bomFormat"[[:space:]]*:[[:space:]]*"CycloneDX"' "$sbom" \
-  || fail "SBOM is not a CycloneDX JSON document"
-
 log "writing checksums.txt"
 (
   cd "$dist_dir"
-  shasum -a 256 "$artifact_name" "$sbom_name" >checksums.txt
+  shasum -a 256 "$artifact_name" >checksums.txt
 )
 
 log "release assets complete"
-printf '%s\n' "$artifact" "$sbom" "$checksums" "$payload_log" "$artifact_log"
+printf '%s\n' "$artifact" "$checksums"

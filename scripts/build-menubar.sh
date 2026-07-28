@@ -10,9 +10,9 @@
 #   scripts/build-menubar.sh --variant preview
 #   scripts/build-menubar.sh --variant stable --release
 #
-# Local builds use an ad hoc signature for development only. --release
-# requires a Developer ID Application identity, a numeric marketing
-# version, and a numeric build number.
+# Local builds use an ad hoc development signature. --release requires
+# the explicit ad-hoc beta release mode, a numeric marketing version,
+# and a numeric build number.
 #
 # Outputs:
 #   stable:  mac/BasetenSwitch/dist/Baseten Switch.app
@@ -37,10 +37,10 @@ Usage: scripts/build-menubar.sh [--variant stable|preview] [--release]
 
 Build the universal macOS menubar app. Stable is the default.
 
-Development builds use an ad hoc signature. Release builds require:
-  BASETEN_SWITCH_SIGNING_IDENTITY   Developer ID Application identity
-  BASETEN_SWITCH_MARKETING_VERSION Numeric version, for example 0.2.0
-  BASETEN_SWITCH_BUILD_NUMBER      Numeric build, for example 42
+Development builds use an ad hoc signature. Beta release builds require:
+  BASETEN_SWITCH_RELEASE_SIGNING_MODE  Must be "adhoc"
+  BASETEN_SWITCH_MARKETING_VERSION     Numeric version, for example 0.2.0
+  BASETEN_SWITCH_BUILD_NUMBER          Numeric build, for example 42
 EOF
 }
 
@@ -91,13 +91,13 @@ esac
 if [[ "$RELEASE_BUILD" == 1 ]]; then
     MARKETING_VERSION="${BASETEN_SWITCH_MARKETING_VERSION:-}"
     BUILD_NUMBER="${BASETEN_SWITCH_BUILD_NUMBER:-}"
-    SIGNING_IDENTITY="${BASETEN_SWITCH_SIGNING_IDENTITY:-}"
+    RELEASE_SIGNING_MODE="${BASETEN_SWITCH_RELEASE_SIGNING_MODE:-}"
+    [[ "$RELEASE_SIGNING_MODE" == "adhoc" ]] \
+        || fail "release build requires BASETEN_SWITCH_RELEASE_SIGNING_MODE=adhoc"
     [[ "$MARKETING_VERSION" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]] \
         || fail "release build requires BASETEN_SWITCH_MARKETING_VERSION as two or three period-separated integers"
     [[ "$BUILD_NUMBER" =~ ^[0-9]+(\.[0-9]+)*$ ]] \
         || fail "release build requires BASETEN_SWITCH_BUILD_NUMBER as period-separated integers"
-    [[ "$SIGNING_IDENTITY" == "Developer ID Application:"* ]] \
-        || fail "release build requires BASETEN_SWITCH_SIGNING_IDENTITY beginning with 'Developer ID Application:'"
 else
     MARKETING_VERSION="${BASETEN_SWITCH_MARKETING_VERSION:-0.0.0}"
     BUILD_NUMBER="${BASETEN_SWITCH_BUILD_NUMBER:-0}"
@@ -186,12 +186,9 @@ cat > "$APP/Contents/Info.plist" <<EOF
 EOF
 
 if [[ "$RELEASE_BUILD" == 1 ]]; then
-    echo "==> codesign (Developer ID, hardened runtime, secure timestamp)"
-    codesign --force --options runtime --timestamp \
-        --sign "$SIGNING_IDENTITY" \
-        "$APP/Contents/MacOS/${EXECUTABLE_NAME}"
-    codesign --force --options runtime --timestamp \
-        --sign "$SIGNING_IDENTITY" "$APP"
+    echo "==> codesign (ad-hoc beta release)"
+    codesign --force --sign - "$APP/Contents/MacOS/${EXECUTABLE_NAME}"
+    codesign --force --sign - "$APP"
 else
     echo "==> codesign (development-only ad hoc signature)"
     codesign --force --sign - "$APP"
@@ -206,10 +203,13 @@ plutil -extract NSAppleEventsUsageDescription raw "$APP/Contents/Info.plist" >/d
 codesign --verify --deep --strict --verbose=2 "$APP"
 if [[ "$RELEASE_BUILD" == 1 ]]; then
     signature_info="$(codesign --display --verbose=4 "$APP" 2>&1)"
-    grep -q '^Authority=Developer ID Application:' <<<"$signature_info" \
-        || fail "${APP} is not signed by a Developer ID Application certificate"
-    grep -Eq '^TeamIdentifier=[A-Z0-9]+$' <<<"$signature_info" \
-        || fail "${APP} has no Developer ID TeamIdentifier"
+    grep -qxF 'Signature=adhoc' <<<"$signature_info" \
+        || fail "${APP} does not have the required ad-hoc beta signature"
+    executable_signature_info="$(
+        codesign --display --verbose=4 "$APP/Contents/MacOS/${EXECUTABLE_NAME}" 2>&1
+    )"
+    grep -qxF 'Signature=adhoc' <<<"$executable_signature_info" \
+        || fail "${APP} executable does not have the required ad-hoc beta signature"
 fi
 test -x "$APP/Contents/MacOS/${EXECUTABLE_NAME}"
 test -s "$APP/Contents/Resources/AppIcon.icns"
