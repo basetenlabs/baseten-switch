@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install a signed, notarized Baseten Switch release payload on macOS.
+# Install an ad-hoc signed Baseten Switch beta release payload on macOS.
 # Homebrew is the canonical public installation path. This installer is
 # retained for release-asset verification and approved direct installs.
 set -eu
@@ -56,25 +56,15 @@ for binary in bin/baseten-switch "$APP_BIN"; do
 done
 
 /usr/bin/codesign --verify --strict --verbose=2 bin/baseten-switch \
-    || fail "CLI Developer ID signature is invalid"
+    || fail "CLI ad-hoc signature is invalid"
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP" \
-    || fail "app Developer ID signature is invalid"
+    || fail "app ad-hoc signature is invalid"
 CLI_SIGNATURE="$(/usr/bin/codesign --display --verbose=4 bin/baseten-switch 2>&1)"
 APP_SIGNATURE="$(/usr/bin/codesign --display --verbose=4 "$APP" 2>&1)"
-printf '%s\n' "$CLI_SIGNATURE" | grep -q '^Authority=Developer ID Application:' \
-    || fail "CLI is not signed with Developer ID Application"
-printf '%s\n' "$APP_SIGNATURE" | grep -q '^Authority=Developer ID Application:' \
-    || fail "app is not signed with Developer ID Application"
-CLI_TEAM="$(printf '%s\n' "$CLI_SIGNATURE" | sed -n 's/^TeamIdentifier=//p')"
-APP_TEAM="$(printf '%s\n' "$APP_SIGNATURE" | sed -n 's/^TeamIdentifier=//p')"
-[ -n "$CLI_TEAM" ] && [ "$CLI_TEAM" = "$APP_TEAM" ] \
-    || fail "CLI and app TeamIdentifier values do not match"
-/usr/bin/xcrun stapler validate "$APP" \
-    || fail "app notarization ticket is missing or invalid"
-/usr/sbin/spctl --assess --type execute --verbose=4 bin/baseten-switch \
-    || fail "Gatekeeper rejected the CLI"
-/usr/sbin/spctl --assess --type execute --verbose=4 "$APP" \
-    || fail "Gatekeeper rejected the app"
+printf '%s\n' "$CLI_SIGNATURE" | grep -qxF 'Signature=adhoc' \
+    || fail "CLI does not have the required ad-hoc beta signature"
+printf '%s\n' "$APP_SIGNATURE" | grep -qxF 'Signature=adhoc' \
+    || fail "app does not have the required ad-hoc beta signature"
 
 mkdir -p "$BIN_DIR"
 /usr/bin/install -m 0755 bin/baseten-switch "$BIN_DIR/baseten-switch"
@@ -106,6 +96,12 @@ case ":$PATH:" in
 esac
 
 cat <<'EOF'
+
+Beta notice:
+
+  This build is ad-hoc signed and is not Apple-notarized. On first launch,
+  macOS may require you to try opening Baseten Switch once, then go to
+  System Settings > Privacy & Security and click Open Anyway.
 
 Quick start:
 

@@ -34,10 +34,27 @@ git -C "$tap_checkout" apply "$patch" \
 cmp "$formula" "$tap_checkout/Formula/baseten-switch.rb" \
     || fail "tap patch does not produce the rendered formula"
 
+grep -Fqx '# typed: strict' "$formula" \
+    || fail "formula omitted the Homebrew Sorbet sigil"
+grep -Fqx '# frozen_string_literal: true' "$formula" \
+    || fail "formula omitted the frozen string literal directive"
 grep -Fqx 'class BasetenSwitch < Formula' "$formula" \
     || fail "formula class is not BasetenSwitch"
-grep -Fqx '  version "1.2.3"' "$formula" \
-    || fail "formula version does not match the tag"
+if grep -Eq '^[[:space:]]*version[[:space:]]' "$formula"; then
+    fail "formula contains a redundant explicit version stanza"
+fi
+if command -v brew >/dev/null 2>&1; then
+    derived_version="$(
+        brew ruby -e \
+            'require "formulary"; path = Pathname(ARGV.fetch(0)); puts Formulary.from_contents("baseten-switch", path, path.read).version' \
+            "$formula"
+    )"
+    [[ "$derived_version" == "1.2.3" ]] \
+        || fail "Homebrew derived version '$derived_version' instead of 1.2.3"
+fi
+grep -Fqx \
+    '    assert_match "baseten-switch v#{version}", shell_output("#{bin}/baseten-switch --version")' \
+    "$formula" || fail "formula test does not use Homebrew's derived version"
 grep -Fqx '  license "MIT"' "$formula" \
     || fail "formula license does not use the explicit approved SPDX input"
 grep -Fqx \
@@ -48,8 +65,19 @@ grep -Fqx \
     "$formula" || fail "formula checksum is not normalized and pinned"
 grep -Fqx '  depends_on "basetenlabs/baseten/baseten"' "$formula" \
     || fail "formula does not depend on the fully qualified Baseten CLI"
-grep -Fqx '  depends_on macos: :ventura' "$formula" \
+grep -Fqx '  depends_on :macos' "$formula" \
+    || fail "formula is not restricted to macOS"
+grep -Fqx '    depends_on macos: :ventura' "$formula" \
     || fail "formula does not require Ventura"
+for caveat in \
+    'Baseten Switch is beta software. The bundled Mac app is ad-hoc signed' \
+    'and is not notarized by Apple.' \
+    'If macOS blocks the app, try to open it once, then open System Settings >' \
+    'Privacy & Security and click Open Anyway. Managed Macs may prohibit this' \
+    'override; contact your administrator if Open Anyway is unavailable.'; do
+    grep -Fqx "      $caveat" "$formula" \
+        || fail "formula omitted beta caveat: $caveat"
+done
 for payload in \
     'bin.install "bin/baseten-switch"' \
     'pkgshare.install "Baseten Switch.app.zip"' \
