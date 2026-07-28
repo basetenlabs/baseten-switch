@@ -24,8 +24,8 @@ baseten-switch doctor --probe
 
 The fully qualified Homebrew command adds Baseten's public tap and installs
 both Baseten Switch and its Baseten CLI dependency. It requires no GitHub
-login, separate `brew tap`, second install command, or local compiler. Stable
-releases use a universal Developer ID-signed and notarized artifact.
+login, separate `brew tap`, second install command, or local compiler. The beta
+release includes a universal macOS artifact for Apple Silicon and Intel.
 
 `setup` verifies the Baseten CLI and its current credential, opens
 `baseten auth login` when needed, and creates the initial configuration.
