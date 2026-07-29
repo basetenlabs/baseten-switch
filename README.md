@@ -15,6 +15,7 @@ The first public release supports macOS 13 or newer on Apple Silicon and Intel.
 ## Quick start
 
 ```sh
+brew trust basetenlabs/baseten
 brew install basetenlabs/baseten/baseten-switch
 baseten-switch setup
 baseten-switch up --install
