@@ -175,9 +175,11 @@ baseten-switch uninstall --purge --yes
 brew uninstall baseten-switch
 ```
 
-Uninstall never removes Baseten CLI credentials or keychain entries. If the
-app's Start at Login item prevents safe bundle removal, the command prints the
-manual action required in macOS System Settings.
+Uninstall never removes Baseten CLI credentials or keychain entries. The Mac
+app unregisters its own Start at Login item as part of bundle removal. When
+the installed app predates that helper or the unregister fails, the command
+leaves the bundle in place and prints the manual action required in macOS
+System Settings.
 
 ## Privacy and trust
 

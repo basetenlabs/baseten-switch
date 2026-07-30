@@ -175,3 +175,62 @@ enum LoginItem {
         FileHandle.standardError.write(Data("[BasetenSwitch] \(msg)\n".utf8))
     }
 }
+
+// MARK: - Headless CLI one-shot mode
+
+/// Whether a post-unregister status counts as removed for the CLI
+/// uninstall path. Pure so the decision table is unit-testable; the
+/// SMAppService calls stay in LoginItemCLI.run (the LoginItem pattern).
+/// .notFound qualifies: macOS reports it when no live registration can
+/// be tied to this bundle (never registered, or a superseded signing
+/// identity), which is exactly the desired end state for uninstall.
+func loginItemUnregisterAccepted(_ status: SMAppService.Status) -> Bool {
+    switch status {
+    case .notRegistered, .notFound:
+        return true
+    case .enabled, .requiresApproval:
+        return false
+    @unknown default:
+        return false
+    }
+}
+
+/// Headless `--unregister-login-item` one-shot mode for
+/// `baseten-switch uninstall`. The SMAppService login item belongs to
+/// this app, so only this process can unregister it; the CLI execs the
+/// bundled executable with the flag after quitting the app. The bundle
+/// advertises support via the BasetenSwitchLoginItemCLI Info.plist
+/// marker (scripts/build-menubar.sh), so the CLI never launches the UI
+/// on bundles that predate this mode.
+enum LoginItemCLI {
+    static let flag = "--unregister-login-item"
+
+    static var requested: Bool {
+        CommandLine.arguments.contains(flag)
+    }
+
+    /// Unregisters and exits: 0 when no live registration remains
+    /// (never-registered and stale .notFound both qualify), 1 when a
+    /// live or pending registration survives. Never returns.
+    static func run() -> Never {
+        let before = LoginItem.status
+        do {
+            try SMAppService.mainApp.unregister()
+        } catch {
+            // unregister() throws when no entry can be tied to this
+            // bundle; that is the desired end state, so the status
+            // re-read below — not the throw — decides the outcome.
+            FileHandle.standardError.write(Data(
+                "[BasetenSwitch] unregister threw (deciding by status): \(error)\n".utf8))
+        }
+        let after = LoginItem.status
+        guard loginItemUnregisterAccepted(after) else {
+            FileHandle.standardError.write(Data(
+                "[BasetenSwitch] Start at Login still \(loginItemStatusName(after)) after unregister\n".utf8))
+            exit(1)
+        }
+        FileHandle.standardOutput.write(Data(
+            "Start at Login \(loginItemStatusName(before)) -> \(loginItemStatusName(after))\n".utf8))
+        exit(0)
+    }
+}

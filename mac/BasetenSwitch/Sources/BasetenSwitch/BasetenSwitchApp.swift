@@ -18,6 +18,14 @@ struct BasetenSwitchApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     init() {
+        // Headless one-shot modes run before the single-instance guard:
+        // the CLI drives --unregister-login-item during uninstall after
+        // quitting the app, and correctness must not depend on the quit
+        // having won (a surviving instance must not turn the unregister
+        // into a silent no-op exit).
+        if LoginItemCLI.requested {
+            LoginItemCLI.run()
+        }
 #if DEBUG
         // Fixture previews are separate and side-effect-free; allow them
         // alongside the packaged menubar process.
