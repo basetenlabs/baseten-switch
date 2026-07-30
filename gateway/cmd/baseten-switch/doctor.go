@@ -1448,16 +1448,47 @@ func doctorE2EChecks(add addCheck, o doctorOpts, doorSpecs []door.Config, doorUp
 		port := portOf(t.BindAddr)
 		probeStart := time.Now()
 		p := doctorProbeClient(httpC, t)
-		if doctorProbeOK(p) {
+		switch {
+		case doctorProbeOK(p):
 			add("e2e", "probe:"+port, docOK,
 				fmt.Sprintf("1-token request through the door succeeded (status %d, %dms, model %s)", p.Status, p.LatencyMs, orDash(p.Model)), "")
-		} else {
+		case doctorProbeNativeAuthOK(f, routerTargets[t.BindAddr], t.ProtocolShape, p):
+			expected := config.NativeRoute(t.ProtocolShape)
+			add("e2e", "probe:"+port, docOK,
+				fmt.Sprintf("the %s provider rejected the credential-less probe (status %d), as expected: the door-to-provider path is intact and harness requests carry their own %s credential", expected, p.Status, expected), "")
+			add("e2e", "route:"+port, docOK,
+				fmt.Sprintf("the configured route for the probe model is %q; the provider's own auth rejection stands in for a completed request", expected), "")
+			continue
+		default:
 			add("e2e", "probe:"+port, docFail,
 				fmt.Sprintf("1-token request through the door failed (status %d): %s", p.Status, orDash(p.Error)),
 				"baseten-switch status   (then check the router and door logs)")
 		}
 		doctorProbeRouteCheck(add, port, p, probeStart, f, routerTargets[t.BindAddr], t.ProtocolShape, telPath)
 	}
+}
+
+// doctorProbeNativeAuthOK reports whether a failed probe still proves
+// the harness path end to end. The probe deliberately carries no
+// provider credential, so on a native-configured route (routing off, or
+// a model_routes native pin for the probe's model) the provider's own
+// 401/403 is the expected answer: it could only have come back through
+// a working door→router→provider relay. Only an HTTP response from the
+// far end qualifies — a transport error (status 0) still fails.
+func doctorProbeNativeAuthOK(f *config.File, routerTarget, shape string, p *doctorProbeResult) bool {
+	if p.Status != http.StatusUnauthorized && p.Status != http.StatusForbidden {
+		return false
+	}
+	cli, ok := doctorClientFor(f, routerTarget, shape)
+	if !ok {
+		return false
+	}
+	globalRoutingEnabled := false
+	if f != nil && f.Global.RoutingEnabled != nil {
+		globalRoutingEnabled = *f.Global.RoutingEnabled
+	}
+	expected := gateway.ExpectedPrimaryRoute(cli, globalRoutingEnabled, doctorProbeRequestModel(shape))
+	return expected == config.NativeRoute(shape)
 }
 
 // doctorProbeRouteCheck asserts the probe was served by the route the
