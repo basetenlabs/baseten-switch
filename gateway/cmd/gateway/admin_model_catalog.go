@@ -40,9 +40,16 @@ type modelCatalogResponse struct {
 }
 
 type modelCatalogModel struct {
-	Slug        string                 `json:"slug"`
-	DisplayName string                 `json:"display_name"`
-	Reasoning   *modelCatalogReasoning `json:"reasoning,omitempty"`
+	Slug        string                  `json:"slug"`
+	DisplayName string                  `json:"display_name"`
+	RateLimits  []modelCatalogRateLimit `json:"rate_limits,omitempty"`
+	Reasoning   *modelCatalogReasoning  `json:"reasoning,omitempty"`
+}
+
+type modelCatalogRateLimit struct {
+	Type      string `json:"type"`
+	Unit      string `json:"unit"`
+	Threshold int64  `json:"threshold"`
 }
 
 type modelCatalogReasoning struct {
@@ -165,6 +172,7 @@ func modelCatalogModelsFromSnapshot(
 		resolved[i] = modelCatalogModel{
 			Slug:        model.Slug,
 			DisplayName: basetenModelDisplayName(snapshot, model.Slug),
+			RateLimits:  model.RateLimits,
 			Reasoning: modelCatalogReasoningFromSnapshot(
 				snapshot,
 				model.Slug,
@@ -406,7 +414,52 @@ func decodeModelCatalogItem(raw json.RawMessage) (modelCatalogModel, bool, error
 	return modelCatalogModel{
 		Slug:        slug,
 		DisplayName: displayName,
+		RateLimits:  decodeModelCatalogRateLimits(fields["rate_limits"]),
 	}, true, nil
+}
+
+// decodeModelCatalogRateLimits keeps only well-formed rate-limit entries:
+// a recognized type and unit with a non-negative integer threshold. Missing,
+// null, or malformed data yields nil so the field is omitted from responses.
+func decodeModelCatalogRateLimits(raw json.RawMessage) []modelCatalogRateLimit {
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+	var entries []json.RawMessage
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		return nil
+	}
+	limits := make([]modelCatalogRateLimit, 0, len(entries))
+	for _, entry := range entries {
+		var fields struct {
+			Type      string `json:"type"`
+			Unit      string `json:"unit"`
+			Threshold *int64 `json:"threshold"`
+		}
+		if err := json.Unmarshal(entry, &fields); err != nil {
+			continue
+		}
+		limitType := strings.ToUpper(strings.TrimSpace(fields.Type))
+		if limitType != "REQUEST" && limitType != "TOKEN" {
+			continue
+		}
+		unit := strings.ToUpper(strings.TrimSpace(fields.Unit))
+		if unit != "SECOND" && unit != "MINUTE" {
+			continue
+		}
+		if fields.Threshold == nil || *fields.Threshold < 0 {
+			continue
+		}
+		limits = append(limits, modelCatalogRateLimit{
+			Type:      limitType,
+			Unit:      unit,
+			Threshold: *fields.Threshold,
+		})
+	}
+	if len(limits) == 0 {
+		return nil
+	}
+	return limits
 }
 
 func decodeModelCatalogCursor(raw json.RawMessage) (string, error) {

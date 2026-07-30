@@ -184,6 +184,86 @@ func TestAdminModelCatalogReadyNormalizesAndSanitizesModels(t *testing.T) {
 	}
 }
 
+func TestAdminModelCatalogProjectsRateLimits(t *testing.T) {
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{
+			"items": [
+				{
+					"name": "vendor/limited",
+					"display_name": "Limited",
+					"rate_limits": [
+						{"type": "REQUEST", "unit": "MINUTE", "threshold": 600},
+						{"type": "TOKEN", "unit": "MINUTE", "threshold": 100000},
+						{"type": "token", "unit": "second", "threshold": 5000},
+						{"type": "REQUEST", "unit": "HOUR", "threshold": 1},
+						{"type": "CONCURRENCY", "unit": "MINUTE", "threshold": 5},
+						{"type": "REQUEST", "unit": "MINUTE", "threshold": -1},
+						{"type": "REQUEST", "unit": "MINUTE"},
+						{"type": "REQUEST", "unit": "MINUTE", "threshold": "600"},
+						"not an object",
+						null
+					]
+				},
+				{"name": "vendor/null-limits", "display_name": "Null", "rate_limits": null},
+				{"name": "vendor/no-limits", "display_name": "None"},
+				{"name": "vendor/wrong-type", "display_name": "Wrong", "rate_limits": {}}
+			],
+			"pagination": {"has_more": false, "cursor": null}
+		}`)
+	})
+	g, _, _ := testModelCatalogGateway(t, upstream, true)
+
+	recorder, response := modelCatalogRequest(t, g, http.MethodGet, nil)
+	if recorder.Code != http.StatusOK || response.State != "ready" {
+		t.Fatalf("status = %d response = %+v, want 200 ready", recorder.Code, response)
+	}
+	if len(response.Models) != 4 {
+		t.Fatalf("models = %+v, want four models", response.Models)
+	}
+	want := []modelCatalogRateLimit{
+		{Type: "REQUEST", Unit: "MINUTE", Threshold: 600},
+		{Type: "TOKEN", Unit: "MINUTE", Threshold: 100000},
+		{Type: "TOKEN", Unit: "SECOND", Threshold: 5000},
+	}
+	got := response.Models[0].RateLimits
+	if len(got) != len(want) {
+		t.Fatalf("rate limits = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("rate_limits[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+	for _, model := range response.Models[1:] {
+		if model.RateLimits != nil {
+			t.Errorf("model %q rate limits = %+v, want none",
+				model.Slug, model.RateLimits)
+		}
+	}
+	if containsAny(recorder.Body.String(), "CONCURRENCY", "HOUR", "not an object") {
+		t.Fatalf("response leaked malformed rate-limit entries: %s", recorder.Body.String())
+	}
+}
+
+func TestAdminModelCatalogOmitsRateLimitsFieldWhenAbsent(t *testing.T) {
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{
+			"items": [{"name": "vendor/plain", "display_name": "Plain"}],
+			"pagination": {"has_more": false, "cursor": null}
+		}`)
+	})
+	g, _, _ := testModelCatalogGateway(t, upstream, true)
+
+	recorder, response := modelCatalogRequest(t, g, http.MethodGet, nil)
+	if recorder.Code != http.StatusOK || response.State != "ready" ||
+		len(response.Models) != 1 {
+		t.Fatalf("status = %d response = %+v, want one ready model", recorder.Code, response)
+	}
+	if strings.Contains(recorder.Body.String(), "rate_limits") {
+		t.Fatalf("response includes empty rate_limits field: %s", recorder.Body.String())
+	}
+}
+
 func TestAdminModelCatalogPublishesNamesWithoutReplacingPricing(t *testing.T) {
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{
@@ -365,6 +445,9 @@ func TestAdminModelCatalogIgnoresNonSelectionFieldsAndUsesMetadataFallback(t *te
 
 func TestModelCatalogReasoningProjectionUsesExactBasetenRecord(t *testing.T) {
 	capturedAt := time.Date(2026, time.July, 26, 12, 0, 0, 0, time.UTC)
+	originalNow := modelCatalogNow
+	modelCatalogNow = func() time.Time { return capturedAt }
+	t.Cleanup(func() { modelCatalogNow = originalNow })
 	p := pricing.New()
 	if err := p.ReplaceModelsDev(
 		[]byte(publicCatalogGatewayFixture),
