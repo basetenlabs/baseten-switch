@@ -19,6 +19,10 @@ const testDoorPort = "8081"
 func testAdapter(t *testing.T) (*claudeAdapter, *bytes.Buffer) {
 	t.Helper()
 	dir := t.TempDir()
+	dir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	settings := filepath.Join(dir, "claude", "settings.json")
 	out := &bytes.Buffer{}
 	return &claudeAdapter{
@@ -68,6 +72,19 @@ func envValue(t *testing.T, path, key string) (string, bool) {
 	return s, ok
 }
 
+func assertClaudeOnValues(t *testing.T, a *claudeAdapter) {
+	t.Helper()
+	for key, want := range map[string]string{
+		claudeManagedEnvKey:     "http://127.0.0.1:8081",
+		claudeAttributionEnvKey: claudeAttributionValue,
+		claudeToolSearchEnvKey:  claudeToolSearchValue,
+	} {
+		if got, ok := envValue(t, a.settingsPath, key); !ok || got != want {
+			t.Errorf("%s = %q, ok=%v, want %q", key, got, ok, want)
+		}
+	}
+}
+
 func fileBytes(t *testing.T, path string) []byte {
 	t.Helper()
 	b, err := os.ReadFile(path)
@@ -82,6 +99,8 @@ func TestClaudeOnOffRoundTripRestoresKeyExactly(t *testing.T) {
 	writeSettingsFile(t, a, `{
   "env": {
     "ANTHROPIC_BASE_URL": "https://corp-proxy.example.com",
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": "custom-attribution",
+    "ENABLE_TOOL_SEARCH": "auto:25",
     "OTHER": "keep"
   },
   "model": "claude-sonnet-4-6",
@@ -94,6 +113,7 @@ func TestClaudeOnOffRoundTripRestoresKeyExactly(t *testing.T) {
 	if v, _ := envValue(t, a.settingsPath, claudeManagedEnvKey); v != "http://127.0.0.1:8081" {
 		t.Fatalf("after on, base url = %q", v)
 	}
+	assertClaudeOnValues(t, a)
 	if _, err := os.Stat(a.backupPath); err != nil {
 		t.Fatalf("backup not written: %v", err)
 	}
@@ -104,6 +124,12 @@ func TestClaudeOnOffRoundTripRestoresKeyExactly(t *testing.T) {
 	env := root["env"].(map[string]any)
 	if env[claudeManagedEnvKey] != "https://corp-proxy.example.com" {
 		t.Errorf("base url not restored: %v", env[claudeManagedEnvKey])
+	}
+	if env[claudeAttributionEnvKey] != "custom-attribution" {
+		t.Errorf("attribution header not restored: %v", env[claudeAttributionEnvKey])
+	}
+	if env[claudeToolSearchEnvKey] != "auto:25" {
+		t.Errorf("tool search not restored: %v", env[claudeToolSearchEnvKey])
 	}
 	if env["OTHER"] != "keep" {
 		t.Errorf("OTHER lost: %v", env["OTHER"])
@@ -280,6 +306,39 @@ func TestClaudeOffDriftRedirectedStaysAWarning(t *testing.T) {
 	}
 }
 
+func TestClaudeOffRedirectedDriftReportsUnrestoredKnobs(t *testing.T) {
+	a, out := testAdapter(t)
+	writeSettingsFile(t, a, `{"env":{"ANTHROPIC_BASE_URL":"https://corp-proxy.example.com","CLAUDE_CODE_ATTRIBUTION_HEADER":"custom-before","ENABLE_TOOL_SEARCH":"auto:25"}}`)
+	if code := a.on(); code != 0 {
+		t.Fatal("on failed")
+	}
+	root := readTree(t, a.settingsPath)
+	root["env"].(map[string]any)[claudeManagedEnvKey] = "https://other-proxy.example.com"
+	b, _ := json.MarshalIndent(root, "", "  ")
+	if err := os.WriteFile(a.settingsPath, append(b, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code := a.off(); code != 0 {
+		t.Fatalf("off = %d (%s)", code, out.String())
+	}
+	if got, _ := envValue(t, a.settingsPath, claudeManagedEnvKey); got != "https://other-proxy.example.com" {
+		t.Errorf("redirected base URL changed: %q", got)
+	}
+	for _, key := range []string{claudeAttributionEnvKey, claudeToolSearchEnvKey} {
+		if _, ok := envValue(t, a.settingsPath, key); ok {
+			t.Errorf("covered Switch value %s not stripped", key)
+		}
+	}
+	for _, want := range []string{
+		"CLAUDE_CODE_ATTRIBUTION_HEADER \"custom-before\" was NOT restored",
+		"ENABLE_TOOL_SEARCH \"auto:25\" was NOT restored",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("missing unrestored-value note %q in %q", want, out.String())
+		}
+	}
+}
+
 func TestClaudeStripOnlyOwnedNeverTouchesUserValues(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -363,8 +422,13 @@ func TestClaudeOnCreatesFileAndOffDeletesIt(t *testing.T) {
 	if bak.Existed {
 		t.Errorf("backup existed=true for a created file")
 	}
-	if len(bak.Missing) != 1 || bak.Missing[0] != claudeManagedEnvKey {
+	if len(bak.Missing) != len(claudeOnEnvKeys) {
 		t.Errorf("backup missing list = %v", bak.Missing)
+	}
+	for _, key := range claudeOnEnvKeys {
+		if !backupCovers(&bak, key) {
+			t.Errorf("backup does not cover missing %s", key)
+		}
 	}
 	if code := a.off(); code != 0 {
 		t.Fatal("off failed")
@@ -374,26 +438,35 @@ func TestClaudeOnCreatesFileAndOffDeletesIt(t *testing.T) {
 	}
 }
 
-func TestClaudeOnDoesNotBackupWhenAlreadyManaged(t *testing.T) {
+func TestClaudeOnUpgradesAlreadyManagedBaseWithoutBackingUpBase(t *testing.T) {
 	// Manually gateway-managed (old port), no backup: on must not
-	// snapshot our own config as the user's original state.
+	// snapshot our own base URL as the user's original state, but must
+	// record the two new keys so the upgrade remains reversible.
 	a, _ := testAdapter(t)
 	writeSettingsFile(t, a, `{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:18081"}}`)
 	if code := a.on(); code != 0 {
 		t.Fatal("on failed")
 	}
-	if _, err := os.Stat(a.backupPath); !os.IsNotExist(err) {
-		t.Errorf("on snapshotted an already gateway-managed state")
+	bak, err := loadClaudeBackup(a.backupPath)
+	if err != nil || bak == nil {
+		t.Fatalf("load upgrade backup: bak=%v err=%v", bak, err)
 	}
-	if v, _ := envValue(t, a.settingsPath, claudeManagedEnvKey); v != "http://127.0.0.1:8081" {
-		t.Errorf("on did not update to the door port: %q", v)
+	if backupCovers(bak, claudeManagedEnvKey) {
+		t.Errorf("on snapshotted an already gateway-managed base URL")
 	}
-	// off falls back to strip-only-owned.
+	for _, key := range []string{claudeAttributionEnvKey, claudeToolSearchEnvKey} {
+		if !backupCovers(bak, key) {
+			t.Errorf("upgrade backup does not cover %s", key)
+		}
+	}
+	assertClaudeOnValues(t, a)
 	if code := a.off(); code != 0 {
 		t.Fatal("off failed")
 	}
-	if _, ok := envValue(t, a.settingsPath, claudeManagedEnvKey); ok {
-		t.Errorf("strip-only-owned did not strip the gateway value")
+	for _, key := range claudeOnEnvKeys {
+		if _, ok := envValue(t, a.settingsPath, key); ok {
+			t.Errorf("off did not strip %s", key)
+		}
 	}
 }
 
@@ -460,7 +533,7 @@ func TestClaudeOnPreservesOtherSettingsContent(t *testing.T) {
 
 func TestClaudeOnOnlyWritesWhenChanged(t *testing.T) {
 	a, out := testAdapter(t)
-	writeSettingsFile(t, a, `{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8081"}}`)
+	writeSettingsFile(t, a, `{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8081","CLAUDE_CODE_ATTRIBUTION_HEADER":"0","ENABLE_TOOL_SEARCH":"true"}}`)
 	before := fileBytes(t, a.settingsPath)
 	if code := a.on(); code != 0 {
 		t.Fatal("on failed")
@@ -494,6 +567,183 @@ func TestClaudeStatusExitCodes(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "http://127.0.0.1:8081") {
 		t.Errorf("status missing base url: %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), claudeAttributionEnvKey) ||
+		!strings.Contains(stdout.String(), claudeToolSearchEnvKey) {
+		t.Errorf("status missing managed env values: %q", stdout.String())
+	}
+}
+
+func TestClaudeStatusBaseOnlyIsIncomplete(t *testing.T) {
+	a, _ := testAdapter(t)
+	writeSettingsFile(t, a, `{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8081"}}`)
+	var stdout bytes.Buffer
+	if code := a.status(&stdout); code != statusExitOff {
+		t.Fatalf("status = %d, want %d", code, statusExitOff)
+	}
+	if !strings.Contains(stdout.String(), "incomplete") ||
+		!strings.Contains(stdout.String(), "claude on") {
+		t.Errorf("partial status does not identify repair: %q", stdout.String())
+	}
+}
+
+func TestClaudeOnRepairsLegacyBaseOnlyBackup(t *testing.T) {
+	a, _ := testAdapter(t)
+	writeSettingsFile(t, a, `{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8081","OTHER":"keep"},"theme":"dark"}`)
+	legacy := &claudeBackup{
+		ConfigPath:  a.settingsPath,
+		Values:      map[string]string{claudeManagedEnvKey: "https://corp-proxy.example.com"},
+		EnvExisted:  true,
+		Existed:     true,
+		WrittenHash: sha256Hex(fileBytes(t, a.settingsPath)),
+	}
+	if err := saveClaudeBackup(a.backupPath, legacy); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := a.on(); code != 0 {
+		t.Fatal("legacy upgrade on failed")
+	}
+	assertClaudeOnValues(t, a)
+	upgraded, err := loadClaudeBackup(a.backupPath)
+	if err != nil || upgraded == nil {
+		t.Fatalf("load upgraded backup: bak=%v err=%v", upgraded, err)
+	}
+	for _, key := range claudeOnEnvKeys {
+		if !backupCovers(upgraded, key) {
+			t.Errorf("upgraded backup does not cover %s", key)
+		}
+	}
+	if code := a.off(); code != 0 {
+		t.Fatal("off after legacy upgrade failed")
+	}
+	if got, _ := envValue(t, a.settingsPath, claudeManagedEnvKey); got != "https://corp-proxy.example.com" {
+		t.Errorf("legacy base URL restore = %q", got)
+	}
+	for _, key := range []string{claudeAttributionEnvKey, claudeToolSearchEnvKey} {
+		if _, ok := envValue(t, a.settingsPath, key); ok {
+			t.Errorf("legacy-missing %s was not removed", key)
+		}
+	}
+	if got, _ := envValue(t, a.settingsPath, "OTHER"); got != "keep" {
+		t.Errorf("unrelated env lost: %q", got)
+	}
+}
+
+func TestClaudeOnRepairsCurrentBaseWithMissingKnobs(t *testing.T) {
+	a, out := testAdapter(t)
+	writeSettingsFile(t, a, `{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8081","OTHER":"keep"}}`)
+	if code := a.on(); code != 0 {
+		t.Fatalf("on = %d (%s)", code, out.String())
+	}
+	assertClaudeOnValues(t, a)
+	if strings.Contains(out.String(), "already on") {
+		t.Errorf("base-only state incorrectly reported already on: %q", out.String())
+	}
+	if got, _ := envValue(t, a.settingsPath, "OTHER"); got != "keep" {
+		t.Errorf("unrelated env lost: %q", got)
+	}
+}
+
+func TestClaudeOffWithoutBackupPreservesMatchingUserKnobs(t *testing.T) {
+	a, _ := testAdapter(t)
+	content := `{"env":{"CLAUDE_CODE_ATTRIBUTION_HEADER":"0","ENABLE_TOOL_SEARCH":"true","OTHER":"keep"}}` + "\n"
+	writeSettingsFile(t, a, content)
+	if code := a.off(); code != 0 {
+		t.Fatal("off failed")
+	}
+	if got := string(fileBytes(t, a.settingsPath)); got != content {
+		t.Errorf("off without ownership proof modified user settings:\n%s", got)
+	}
+}
+
+func TestClaudeDriftReportSkipsValueAlreadyRestoredByUser(t *testing.T) {
+	a, out := testAdapter(t)
+	writeSettingsFile(t, a, `{"env":{"ANTHROPIC_BASE_URL":"https://corp-proxy.example.com","CLAUDE_CODE_ATTRIBUTION_HEADER":"custom-before","ENABLE_TOOL_SEARCH":"auto:25"}}`)
+	if code := a.on(); code != 0 {
+		t.Fatal("on failed")
+	}
+	root := readTree(t, a.settingsPath)
+	root["env"].(map[string]any)[claudeAttributionEnvKey] = "custom-before"
+	root["theme"] = "dark"
+	b, _ := json.MarshalIndent(root, "", "  ")
+	if err := os.WriteFile(a.settingsPath, append(b, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code := a.off(); code != 0 {
+		t.Fatalf("off = %d (%s)", code, out.String())
+	}
+	if strings.Contains(out.String(), `CLAUDE_CODE_ATTRIBUTION_HEADER "custom-before" was NOT restored`) {
+		t.Errorf("reported a false unrestored warning: %q", out.String())
+	}
+	if got, _ := envValue(t, a.settingsPath, claudeAttributionEnvKey); got != "custom-before" {
+		t.Errorf("user-restored value lost: %q", got)
+	}
+}
+
+func TestClaudeDriftPreservesPreexistingMatchingKnob(t *testing.T) {
+	a, out := testAdapter(t)
+	writeSettingsFile(t, a, `{"env":{"ANTHROPIC_BASE_URL":"https://corp-proxy.example.com","ENABLE_TOOL_SEARCH":"true"}}`)
+	if code := a.on(); code != 0 {
+		t.Fatal("on failed")
+	}
+	root := readTree(t, a.settingsPath)
+	root["theme"] = "dark"
+	b, _ := json.MarshalIndent(root, "", "  ")
+	if err := os.WriteFile(a.settingsPath, append(b, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code := a.off(); code != 0 {
+		t.Fatalf("off = %d (%s)", code, out.String())
+	}
+	if got, ok := envValue(t, a.settingsPath, claudeToolSearchEnvKey); !ok || got != claudeToolSearchValue {
+		t.Errorf("preexisting matching tool-search value lost: %q ok=%v", got, ok)
+	}
+	if _, ok := envValue(t, a.settingsPath, claudeAttributionEnvKey); ok {
+		t.Errorf("attribution value added by on was not stripped")
+	}
+	if _, ok := envValue(t, a.settingsPath, claudeManagedEnvKey); ok {
+		t.Errorf("gateway base URL was not stripped")
+	}
+	if strings.Contains(out.String(), `ENABLE_TOOL_SEARCH "true" was NOT restored`) {
+		t.Errorf("preexisting matching value incorrectly reported unrestored: %q", out.String())
+	}
+}
+
+func TestClaudeDriftedManagedKnobsPreserveUserValues(t *testing.T) {
+	a, out := testAdapter(t)
+	writeSettingsFile(t, a, `{"env":{"ANTHROPIC_BASE_URL":"https://corp-proxy.example.com","CLAUDE_CODE_ATTRIBUTION_HEADER":"custom-before","ENABLE_TOOL_SEARCH":"auto:25"}}`)
+	if code := a.on(); code != 0 {
+		t.Fatal("on failed")
+	}
+	root := readTree(t, a.settingsPath)
+	env := root["env"].(map[string]any)
+	env[claudeAttributionEnvKey] = "custom-after"
+	env[claudeToolSearchEnvKey] = "auto"
+	root["theme"] = "dark"
+	b, _ := json.MarshalIndent(root, "", "  ")
+	if err := os.WriteFile(a.settingsPath, append(b, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code := a.off(); code != 0 {
+		t.Fatalf("off = %d (%s)", code, out.String())
+	}
+	if _, ok := envValue(t, a.settingsPath, claudeManagedEnvKey); ok {
+		t.Errorf("gateway base URL not stripped")
+	}
+	if got, _ := envValue(t, a.settingsPath, claudeAttributionEnvKey); got != "custom-after" {
+		t.Errorf("drifted attribution value lost: %q", got)
+	}
+	if got, _ := envValue(t, a.settingsPath, claudeToolSearchEnvKey); got != "auto" {
+		t.Errorf("drifted tool-search value lost: %q", got)
+	}
+	for _, want := range []string{
+		"CLAUDE_CODE_ATTRIBUTION_HEADER \"custom-before\" was NOT restored",
+		"ENABLE_TOOL_SEARCH \"auto:25\" was NOT restored",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("missing unrestored-value note %q in %q", want, out.String())
+		}
 	}
 }
 

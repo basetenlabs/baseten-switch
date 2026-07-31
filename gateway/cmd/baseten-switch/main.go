@@ -297,9 +297,10 @@ Plain doctor is read-only. --fix cannot be combined with --json.
   baseten-switch claude route [<family> <target|default>]
   baseten-switch claude reasoning baseten <model> off|follow-harness|effort <value>|default
 
-on points ANTHROPIC_BASE_URL in ~/.claude/settings.json at the gateway door
-and backs up the prior value. off restores it exactly when possible, or strips
-only gateway-owned values after drift. start and stop alias on and off.
+on sets ANTHROPIC_BASE_URL, CLAUDE_CODE_ATTRIBUTION_HEADER, and
+ENABLE_TOOL_SEARCH in ~/.claude/settings.json, and backs up prior values. off
+restores them exactly when possible, or strips only values proven to have been
+written by Switch after drift. start and stop alias on and off.
 
 subagents selects a configured alias, raw Baseten slug, or native model for
 Task and sidechain requests. "on" re-enables the kept model. "inherit" leaves

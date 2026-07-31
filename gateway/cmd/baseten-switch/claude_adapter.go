@@ -1,17 +1,16 @@
 // claude_adapter.go implements `baseten-switch claude on|off|status` and
 // `baseten-switch claude subagents [<model>|off]`.
 //
-// `on` points ~/.claude/settings.json at the gateway door by setting
-// ANTHROPIC_BASE_URL in the env block and takes a key-level backup of
-// the user's prior values on the FIRST on only, and only when the
-// current state is not already gateway-managed, so a repeated `on`
-// can never snapshot our own config as "the user's original".
-// `subagents <model>` manages CLAUDE_CODE_SUBAGENT_MODEL the same way
-// Both managed keys join the backup
-// ADDITIVELY the first time it becomes managed. `off` restores the
-// backup exactly, or degrades to strip-only-owned when the backup is
-// missing, the file drifted after `on`, or the backup itself is
-// poisoned.
+// `on` configures ~/.claude/settings.json for the gateway by setting
+// ANTHROPIC_BASE_URL, CLAUDE_CODE_ATTRIBUTION_HEADER, and
+// ENABLE_TOOL_SEARCH in the env block. It takes a key-level backup of
+// the user's prior values on the FIRST on only, and never snapshots a
+// gateway-owned base URL as "the user's original".
+// Older versions managed CLAUDE_CODE_SUBAGENT_MODEL in settings.
+// `off` retains cleanup support for that retired state. Backups grow
+// additively as new keys become managed. `off` restores the backup
+// exactly, or degrades to strip-only-owned when the backup is missing,
+// the file drifted after `on`, or the backup itself is poisoned.
 //
 // JSON round-trip note: settings.json is parsed and re-marshaled with
 // two-space indentation; all values (including number literals, via
@@ -39,7 +38,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/fs"
 	"net"
 	"net/url"
 	"os"
@@ -51,22 +49,44 @@ import (
 	"github.com/basetenlabs/baseten-switch/gateway/cmd/gateway"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/config"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/pidfile"
+	"github.com/basetenlabs/baseten-switch/gateway/internal/safefile"
 )
 
 const (
-	claudeManagedEnvKey  = "ANTHROPIC_BASE_URL"
-	claudeSubagentEnvKey = "CLAUDE_CODE_SUBAGENT_MODEL"
-	claudeAliasPrefix    = "claude-baseten-" // the model-discovery contract alias namespace
-	claudeHarnessName    = "claude"
+	claudeManagedEnvKey     = "ANTHROPIC_BASE_URL"
+	claudeAttributionEnvKey = "CLAUDE_CODE_ATTRIBUTION_HEADER"
+	claudeToolSearchEnvKey  = "ENABLE_TOOL_SEARCH"
+	claudeSubagentEnvKey    = "CLAUDE_CODE_SUBAGENT_MODEL"
+	claudeAliasPrefix       = "claude-baseten-" // the model-discovery contract alias namespace
+	claudeHarnessName       = "claude"
+
+	claudeAttributionValue = "0"
+	// Claude Code documents "true" as the always-on tool-search value.
+	// Keep this centralized because accepted values are versioned by the
+	// harness, while the adapter's backup/restore behavior is key-based.
+	claudeToolSearchValue = "true"
 
 	// Status uses 0 = on and 3 = off (1 is reserved for operational
 	// errors, 2 for usage).
 	statusExitOff = 3
 )
 
-// claudeManagedEnvKeys is the complete managed key set. off restores or
-// strips exactly these keys; nothing else in the env block is ours.
-var claudeManagedEnvKeys = []string{claudeManagedEnvKey, claudeSubagentEnvKey}
+// claudeOnEnvKeys is the complete settings env state installed by
+// `claude on`. claudeManagedEnvKeys also includes the retired
+// settings-side subagent key so `off` can still clean up old installs.
+var (
+	claudeOnEnvKeys = []string{
+		claudeManagedEnvKey,
+		claudeAttributionEnvKey,
+		claudeToolSearchEnvKey,
+	}
+	claudeManagedEnvKeys = []string{
+		claudeManagedEnvKey,
+		claudeAttributionEnvKey,
+		claudeToolSearchEnvKey,
+		claudeSubagentEnvKey,
+	}
+)
 
 func cmdClaude(args []string) int {
 	if len(args) == 0 {
@@ -127,6 +147,17 @@ type claudeAdapter struct {
 	gatewayPorts map[string]bool   // every local port we consider "ours" (door binds + router listeners)
 	modelAliases map[string]string // the target client's model_aliases (subagent alias validation)
 	out          io.Writer         // human-readable action/warning output
+}
+
+// claudeBeforeSettingsMutation is a test seam for changes after the adapter
+// has staged recovery state but before safefile revalidates the preimage.
+var claudeBeforeSettingsMutation func()
+
+func (a *claudeAdapter) acquireSettingsMutationLock() (*configMutationLock, error) {
+	if err := os.MkdirAll(filepath.Dir(a.backupPath), 0o700); err != nil {
+		return nil, fmt.Errorf("create backup directory for settings lock: %w", err)
+	}
+	return acquireConfigMutationLock(a.backupPath)
 }
 
 func (a *claudeAdapter) requiresJournaledMutation(_ mutationOptions) (bool, error) {
@@ -296,6 +327,36 @@ func (a *claudeAdapter) desiredURL() string {
 	return "http://127.0.0.1:" + a.desiredPort
 }
 
+func (a *claudeAdapter) desiredClaudeEnvValue(key string) string {
+	switch key {
+	case claudeManagedEnvKey:
+		return a.desiredURL()
+	case claudeAttributionEnvKey:
+		return claudeAttributionValue
+	case claudeToolSearchEnvKey:
+		return claudeToolSearchValue
+	default:
+		return ""
+	}
+}
+
+// claudeOnState reports both the routing ownership state and whether all
+// three `claude on` values exactly match the desired configuration.
+func (a *claudeAdapter) claudeOnState(env map[string]any) (baseManaged, complete bool) {
+	base, baseSet := envString(env, claudeManagedEnvKey)
+	baseManaged = baseSet && a.isGatewayURL(base)
+	if !baseManaged {
+		return false, false
+	}
+	for _, key := range claudeOnEnvKeys {
+		cur, ok := envString(env, key)
+		if !ok || cur != a.desiredClaudeEnvValue(key) {
+			return true, false
+		}
+	}
+	return true, true
+}
+
 // isGatewayURL reports whether a base URL points at a local gateway
 // port (127.0.0.1 or localhost on a door or router port). This is the
 // "we own this value" test used for the managed check, the
@@ -346,10 +407,17 @@ func claudeSubagentOwned(v string) bool {
 // ownedEnvValue dispatches the per-key ownership test used by the
 // strip-only-owned paths and the poisoned-backup guard.
 func (a *claudeAdapter) ownedEnvValue(key, val string) bool {
-	if key == claudeSubagentEnvKey {
+	switch key {
+	case claudeSubagentEnvKey:
 		return claudeSubagentOwned(val)
+	case claudeManagedEnvKey:
+		return a.isGatewayURL(val)
+	default:
+		// Fixed-value Claude Code knobs can legitimately predate
+		// Baseten Switch. They are removable only when a backup proves
+		// this invocation managed them.
+		return false
 	}
-	return a.isGatewayURL(val)
 }
 
 // --- settings.json round-trip ---------------------------------------------
@@ -358,62 +426,50 @@ func (a *claudeAdapter) ownedEnvValue(key, val string) bool {
 // are decoded as json.Number so literals survive the round-trip
 // byte-exactly. An absent file returns existed=false and an empty root.
 func loadClaudeSettings(path string) (root map[string]any, raw []byte, existed bool, err error) {
-	raw, err = os.ReadFile(path)
+	root, snap, err := readClaudeSettings(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return map[string]any{}, nil, false, nil
-		}
-		return nil, nil, false, fmt.Errorf("read %s: %w", path, err)
+		return nil, nil, false, err
 	}
+	return root, snap.Data, snap.Exists, nil
+}
+
+// readClaudeSettings keeps the safe-file snapshot associated with the bytes
+// that were parsed. Mutating callers must commit through this exact snapshot
+// so concurrent edits and link retargeting are detected.
+func readClaudeSettings(path string) (map[string]any, *safefile.Snapshot, error) {
+	snap, err := safefile.Read(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	if !snap.Exists {
+		return map[string]any{}, snap, nil
+	}
+	raw := snap.Data
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
-	root = map[string]any{}
+	root := map[string]any{}
 	if err := dec.Decode(&root); err != nil {
-		return nil, nil, true, fmt.Errorf("parse %s: %w (not touching it)", path, err)
+		return nil, nil, fmt.Errorf("parse %s: %w (not touching it)", path, err)
 	}
-	return root, raw, true, nil
+	return root, snap, nil
 }
 
 // writeClaudeSettings marshals the tree with two-space indentation and
-// writes it atomically (temp file + rename), preserving the existing
-// file mode (0600 for a newly created file since the env block can
-// hold tokens). Returns the bytes written for hashing.
-func writeClaudeSettings(path string, root map[string]any) ([]byte, error) {
+// replaces it through the exact snapshot that was read, preserving the
+// existing file mode (0600 for a newly created file since the env block can
+// hold tokens). The safe-file layer preserves final-component symlinks and
+// rejects stale, dangling, non-regular, or multiply hard-linked targets.
+func writeClaudeSettings(snap *safefile.Snapshot, root map[string]any) ([]byte, *safefile.Snapshot, error) {
 	b, err := json.MarshalIndent(root, "", "  ")
 	if err != nil {
-		return nil, fmt.Errorf("marshal settings: %w", err)
+		return nil, nil, fmt.Errorf("marshal settings: %w", err)
 	}
 	b = append(b, '\n')
-	mode := fs.FileMode(0o600)
-	if st, err := os.Stat(path); err == nil {
-		mode = st.Mode().Perm()
-	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("mkdir %s: %w", dir, err)
-	}
-	tmp, err := os.CreateTemp(dir, ".settings.json.*")
+	committed, err := snap.Replace(b, 0o600)
 	if err != nil {
-		return nil, err
+		return b, committed, err
 	}
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		os.Remove(tmp.Name())
-		return nil, err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmp.Name())
-		return nil, err
-	}
-	if err := os.Chmod(tmp.Name(), mode); err != nil {
-		os.Remove(tmp.Name())
-		return nil, err
-	}
-	if err := os.Rename(tmp.Name(), path); err != nil {
-		os.Remove(tmp.Name())
-		return nil, err
-	}
-	return b, nil
+	return b, committed, nil
 }
 
 // settingsEnv returns the env block as a mutable map, or nil when
@@ -444,18 +500,21 @@ func envString(env map[string]any, key string) (string, bool) {
 // Values/Missing cover the managed env keys only, so user edits to
 // hooks, permissions, and other env between on and off survive off.
 // Model/ModelMissing snapshot the top-level "model" field for the
-// the model-discovery contract persisted-alias trap. WrittenHash is the
-// sha256 of the file exactly as written at `on`; a mismatch at `off`
-// downgrades restore to strip-only-owned.
+// model-discovery contract persisted-alias trap. WrittenHash, ResolvedPath,
+// and WrittenIdentity bind the backup to the file generation written by
+// `on`; a mismatch at `off` downgrades restore to strip-only-owned, while a
+// changed resolved target is refused.
 type claudeBackup struct {
-	ConfigPath   string            `json:"config_path"`
-	Values       map[string]string `json:"values"`
-	Missing      []string          `json:"missing"`
-	EnvExisted   bool              `json:"env_existed"`
-	Model        string            `json:"model,omitempty"`
-	ModelMissing bool              `json:"model_missing"`
-	Existed      bool              `json:"existed"`
-	WrittenHash  string            `json:"written_hash"`
+	ConfigPath      string             `json:"config_path"`
+	ResolvedPath    string             `json:"resolved_path,omitempty"`
+	WrittenIdentity *safefile.Identity `json:"written_identity,omitempty"`
+	Values          map[string]string  `json:"values"`
+	Missing         []string           `json:"missing"`
+	EnvExisted      bool               `json:"env_existed"`
+	Model           string             `json:"model,omitempty"`
+	ModelMissing    bool               `json:"model_missing"`
+	Existed         bool               `json:"existed"`
+	WrittenHash     string             `json:"written_hash"`
 }
 
 // claudeBackupPath keys the backup file by sha256(settings path) so
@@ -528,12 +587,30 @@ func recordBackupKey(bak *claudeBackup, key, cur string, curSet bool) {
 	}
 }
 
-// poisonedBackup reports whether the backup's own values are
-// gateway-owned (per-key test); restoring such a backup would
-// re-manage the harness on `off`, so it is discarded instead.
+func cloneClaudeBackup(bak *claudeBackup) *claudeBackup {
+	if bak == nil {
+		return nil
+	}
+	cloned := *bak
+	cloned.Values = make(map[string]string, len(bak.Values))
+	for key, value := range bak.Values {
+		cloned.Values[key] = value
+	}
+	cloned.Missing = append([]string(nil), bak.Missing...)
+	if bak.WrittenIdentity != nil {
+		identity := *bak.WrittenIdentity
+		cloned.WrittenIdentity = &identity
+	}
+	return &cloned
+}
+
+// poisonedBackup reports whether restoring the backup would route the
+// harness back through the gateway. The fixed attribution/tool-search
+// values do not control routing and can legitimately predate `on`, so
+// they are safe to restore.
 func (a *claudeAdapter) poisonedBackup(bak *claudeBackup) bool {
 	for k, v := range bak.Values {
-		if a.ownedEnvValue(k, v) {
+		if (k == claudeManagedEnvKey || k == claudeSubagentEnvKey) && a.ownedEnvValue(k, v) {
 			return true
 		}
 	}
@@ -545,43 +622,99 @@ func sha256Hex(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func recordClaudeBackupFile(bak *claudeBackup, snap *safefile.Snapshot) {
+	bak.ResolvedPath = snap.ResolvedPath
+	if snap.Exists {
+		identity := snap.Identity
+		bak.WrittenIdentity = &identity
+	} else {
+		bak.WrittenIdentity = nil
+	}
+}
+
+// claudeBackupMatchesFile binds a link-aware backup to the file committed by
+// `on`. Legacy backups remain valid for direct regular paths. A legacy backup
+// is not allowed to clean-restore through a link because it does not identify
+// the target to which its values belong.
+func claudeBackupMatchesFile(bak *claudeBackup, snap *safefile.Snapshot) bool {
+	if bak.ResolvedPath == "" || bak.WrittenIdentity == nil {
+		return !snap.Linked
+	}
+	return bak.ResolvedPath == snap.ResolvedPath &&
+		*bak.WrittenIdentity == snap.Identity
+}
+
+// claudeBackupTargetSafe permits the normal Claude Code rewrite case, where
+// the file generation changes at the same logical target. It refuses a linked
+// path that now resolves somewhere else, and refuses legacy backups through
+// links because those backups have no target provenance.
+func claudeBackupTargetSafe(bak *claudeBackup, snap *safefile.Snapshot) bool {
+	if bak.ResolvedPath == "" || bak.WrittenIdentity == nil {
+		return !snap.Linked
+	}
+	return bak.ResolvedPath == snap.ResolvedPath
+}
+
 // --- on ---------------------------------------------------------------------
 
 func (a *claudeAdapter) on() int {
-	root, raw, existed, err := loadClaudeSettings(a.settingsPath)
+	lock, err := a.acquireSettingsMutationLock()
+	if err != nil {
+		fmt.Fprintf(a.out, "claude on: lock settings mutation: %v\n", err)
+		return 1
+	}
+	defer lock.close()
+
+	root, snap, err := readClaudeSettings(a.settingsPath)
 	if err != nil {
 		fmt.Fprintf(a.out, "claude on: %v\n", err)
 		return 1
 	}
+	raw := snap.Data
+	existed := snap.Exists
 	env, err := settingsEnv(root)
 	if err != nil {
 		fmt.Fprintf(a.out, "claude on: %v\n", err)
 		return 1
 	}
 	envExistedPre := env != nil
-	cur, curSet := envString(env, claudeManagedEnvKey)
-	managed := curSet && a.isGatewayURL(cur)
+	baseManaged, _ := a.claudeOnState(env)
 
 	bak, err := loadClaudeBackup(a.backupPath)
 	if err != nil {
 		fmt.Fprintf(a.out, "claude on: %v\n", err)
 		return 1
 	}
+	originalBackup := cloneClaudeBackup(bak)
+	if bak != nil && !claudeBackupTargetSafe(bak, snap) {
+		fmt.Fprintf(a.out, "claude on: refusing to modify %s because it no longer resolves to the target recorded by the backup; link and backup left intact\n",
+			a.settingsPath)
+		return 1
+	}
 
-	desired := a.desiredURL()
-	changed := !curSet || cur != desired
+	changedKeys := make([]string, 0, len(claudeOnEnvKeys))
+	for _, key := range claudeOnEnvKeys {
+		cur, curSet := envString(env, key)
+		if !curSet || cur != a.desiredClaudeEnvValue(key) {
+			changedKeys = append(changedKeys, key)
+		}
+	}
+	changed := len(changedKeys) > 0
 
 	// Persist the backup BEFORE modifying the settings file, so no
 	// failure or crash window exists in which the file is modified but
 	// the user's original state is not durably recorded. The staged
 	// WrittenHash is the pre-on file hash: if we crash before the
 	// write below, off sees a hash match and its restore is a no-op.
-	// A backup that exists but does not cover the base-URL key (it was
-	// created by `subagents` before the first `on`) is extended
-	// ADDITIVELY: the key's prior state is recorded without touching
-	// the entries already there.
+	//
+	// A legacy backup may cover only ANTHROPIC_BASE_URL. Extend it
+	// additively with both fixed-value keys before upgrading the file.
+	// A gateway-owned base URL is never recorded as an original value,
+	// but the fixed-value keys are backed up even in a base-only legacy
+	// state so custom or manually-added values restore exactly.
 	var nb *claudeBackup
-	if bak == nil && !managed {
+	backupChanged := false
+	if bak == nil && changed {
 		nb = &claudeBackup{
 			ConfigPath:  a.settingsPath,
 			Values:      map[string]string{},
@@ -589,37 +722,103 @@ func (a *claudeAdapter) on() int {
 			Existed:     existed,
 			WrittenHash: sha256Hex(raw),
 		}
-		recordBackupKey(nb, claudeManagedEnvKey, cur, curSet)
+		for _, key := range claudeOnEnvKeys {
+			if key == claudeManagedEnvKey && baseManaged {
+				continue
+			}
+			cur, curSet := envString(env, key)
+			recordBackupKey(nb, key, cur, curSet)
+		}
 		if m, ok := root["model"].(string); ok {
 			nb.Model = m
 		} else {
 			nb.ModelMissing = true
 		}
+		recordClaudeBackupFile(nb, snap)
 		if err := saveClaudeBackup(a.backupPath, nb); err != nil {
 			fmt.Fprintf(a.out, "claude on: write backup: %v (settings untouched)\n", err)
 			return 1
 		}
-	} else if bak != nil && !managed && !backupCovers(bak, claudeManagedEnvKey) {
-		recordBackupKey(bak, claudeManagedEnvKey, cur, curSet)
-		bak.WrittenHash = sha256Hex(raw)
-		if err := saveClaudeBackup(a.backupPath, bak); err != nil {
-			fmt.Fprintf(a.out, "claude on: write backup: %v (settings untouched)\n", err)
-			return 1
+		backupChanged = true
+	} else if bak != nil {
+		for _, key := range claudeOnEnvKeys {
+			if backupCovers(bak, key) || (key == claudeManagedEnvKey && baseManaged) {
+				continue
+			}
+			cur, curSet := envString(env, key)
+			recordBackupKey(bak, key, cur, curSet)
+			backupChanged = true
+		}
+		if backupChanged {
+			bak.WrittenHash = sha256Hex(raw)
+			recordClaudeBackupFile(bak, snap)
+			if err := saveClaudeBackup(a.backupPath, bak); err != nil {
+				fmt.Fprintf(a.out, "claude on: write backup: %v (settings untouched)\n", err)
+				return 1
+			}
 		}
 	}
 
 	newRaw := raw
+	committed := snap
 	if changed {
 		if env == nil {
 			env = map[string]any{}
 			root["env"] = env
 		}
-		env[claudeManagedEnvKey] = desired
-		newRaw, err = writeClaudeSettings(a.settingsPath, root)
+		for _, key := range changedKeys {
+			env[key] = a.desiredClaudeEnvValue(key)
+		}
+		if claudeBeforeSettingsMutation != nil {
+			claudeBeforeSettingsMutation()
+		}
+		newRaw, committed, err = writeClaudeSettings(snap, root)
 		if err != nil {
-			if nb != nil {
-				// Nothing was modified; drop the staged backup.
-				os.Remove(a.backupPath)
+			if !safefile.CommitApplied(err) {
+				switch {
+				case nb != nil:
+					// Nothing was modified; drop the staged backup.
+					_ = os.Remove(a.backupPath)
+				case backupChanged && originalBackup != nil:
+					if restoreErr := saveClaudeBackup(a.backupPath, originalBackup); restoreErr != nil {
+						fmt.Fprintf(a.out, "claude on: warning: settings were untouched, but the prior backup could not be restored: %v\n", restoreErr)
+					}
+				}
+			}
+			if safefile.CommitApplied(err) {
+				hashTarget := nb
+				if hashTarget == nil {
+					hashTarget = bak
+				}
+				if committed == nil {
+					if current, readErr := safefile.Read(a.settingsPath); readErr == nil &&
+						current.Exists && bytes.Equal(current.Data, newRaw) {
+						committed = current
+					}
+				}
+				if hashTarget != nil && committed != nil {
+					hashTarget.WrittenHash = sha256Hex(newRaw)
+					recordClaudeBackupFile(hashTarget, committed)
+					if saveErr := saveClaudeBackup(a.backupPath, hashTarget); saveErr != nil {
+						fmt.Fprintf(a.out, "claude on: warning: could not bind the retained backup to the committed file: %v\n", saveErr)
+					}
+				}
+				fmt.Fprintln(a.out, "claude on: settings changed, but post-commit verification failed; original backup retained")
+			}
+			fmt.Fprintf(a.out, "claude on: %v\n", err)
+			return 1
+		}
+	}
+
+	if !changed && backupChanged {
+		if claudeBeforeSettingsMutation != nil {
+			claudeBeforeSettingsMutation()
+		}
+		if err := snap.Verify(); err != nil {
+			if originalBackup != nil {
+				if restoreErr := saveClaudeBackup(a.backupPath, originalBackup); restoreErr != nil {
+					fmt.Fprintf(a.out, "claude on: warning: settings changed concurrently and the prior backup could not be restored: %v\n", restoreErr)
+				}
 			}
 			fmt.Fprintf(a.out, "claude on: %v\n", err)
 			return 1
@@ -630,21 +829,27 @@ func (a *claudeAdapter) on() int {
 	// here only degrades off to its strip-only-owned drift path (the
 	// original user values above are already durable), so warn rather
 	// than fail.
-	if hashTarget := nb; hashTarget != nil || (bak != nil && changed) {
+	if hashTarget := nb; hashTarget != nil || (bak != nil && (changed || backupChanged)) {
 		if hashTarget == nil {
 			hashTarget = bak
 		}
 		hashTarget.WrittenHash = sha256Hex(newRaw)
+		recordClaudeBackupFile(hashTarget, committed)
 		if err := saveClaudeBackup(a.backupPath, hashTarget); err != nil {
 			fmt.Fprintf(a.out, "claude on: warning: could not refresh the backup drift hash: %v\n", err)
 		}
 	}
 
 	if changed {
-		fmt.Fprintf(a.out, "claude: on (%s -> %s in %s)\n", claudeManagedEnvKey, desired, a.settingsPath)
+		assignments := make([]string, 0, len(claudeOnEnvKeys))
+		for _, key := range claudeOnEnvKeys {
+			assignments = append(assignments, key+"="+a.desiredClaudeEnvValue(key))
+		}
+		fmt.Fprintf(a.out, "claude: on (%s in %s)\n", strings.Join(assignments, ", "), a.settingsPath)
 		fmt.Fprintln(a.out, "restart Claude Code sessions to pick this up; revert with 'baseten-switch claude off'.")
 	} else {
-		fmt.Fprintf(a.out, "claude: already on (%s = %s)\n", claudeManagedEnvKey, desired)
+		fmt.Fprintf(a.out, "claude: already on (%s, %s=%s, %s=%s)\n",
+			a.desiredURL(), claudeAttributionEnvKey, claudeAttributionValue, claudeToolSearchEnvKey, claudeToolSearchValue)
 	}
 	return 0
 }
@@ -652,11 +857,20 @@ func (a *claudeAdapter) on() int {
 // --- off --------------------------------------------------------------------
 
 func (a *claudeAdapter) off() int {
-	root, raw, existed, err := loadClaudeSettings(a.settingsPath)
+	lock, err := a.acquireSettingsMutationLock()
+	if err != nil {
+		fmt.Fprintf(a.out, "claude off: lock settings mutation: %v\n", err)
+		return 1
+	}
+	defer lock.close()
+
+	root, snap, err := readClaudeSettings(a.settingsPath)
 	if err != nil {
 		fmt.Fprintf(a.out, "claude off: %v\n", err)
 		return 1
 	}
+	raw := snap.Data
+	existed := snap.Exists
 	bak, err := loadClaudeBackup(a.backupPath)
 	if err != nil {
 		fmt.Fprintf(a.out, "claude off: %v\n", err)
@@ -678,7 +892,13 @@ func (a *claudeAdapter) off() int {
 	}
 
 	if bak == nil {
-		return a.offStripOnly(root, existed, nil)
+		return a.offStripOnly(root, snap, nil)
+	}
+
+	if !claudeBackupTargetSafe(bak, snap) {
+		fmt.Fprintf(a.out, "claude off: refusing to modify %s because it no longer resolves to the target recorded by 'on'; link and backup left intact\n",
+			a.settingsPath)
+		return 1
 	}
 
 	if !existed {
@@ -686,6 +906,10 @@ func (a *claudeAdapter) off() int {
 		// on, gone is exactly the restored state.
 		if bak.Existed {
 			fmt.Fprintf(a.out, "warning: %s is gone but the backup says it existed before 'on'; original managed values: %v\n", a.settingsPath, bak.Values)
+		}
+		if err := snap.Remove(); err != nil {
+			fmt.Fprintf(a.out, "claude off: verify absent settings %s: %v\n", a.settingsPath, err)
+			return 1
 		}
 		if err := os.Remove(a.backupPath); err != nil {
 			fmt.Fprintf(a.out, "claude off: remove backup: %v\n", err)
@@ -695,7 +919,7 @@ func (a *claudeAdapter) off() int {
 		return 0
 	}
 
-	if sha256Hex(raw) != bak.WrittenHash {
+	if sha256Hex(raw) != bak.WrittenHash || !claudeBackupMatchesFile(bak, snap) {
 		env, envErr := settingsEnv(root)
 		cur, curSet := envString(env, claudeManagedEnvKey)
 		stillManaged := envErr == nil && curSet && a.isGatewayURL(cur)
@@ -707,29 +931,32 @@ func (a *claudeAdapter) off() int {
 			// Present tense: the definitive success line comes from
 			// offStripOnly after the write lands, so nothing is
 			// claimed done before it is.
-			fmt.Fprintf(a.out, "claude off: %s changed since 'on' (normal: Claude Code rewrites it as you work), so stripping only the gateway-owned keys instead of restoring the backup; your edits are kept\n",
-				a.settingsPath)
-			rc := a.offStripOnly(root, existed, bak)
-			// Strip-only DELETES the managed key; it never restores
-			// bak.Values. When a pre-'on' value existed the file now
-			// ends with no base URL at all and Claude Code silently
-			// routes to api.anthropic.com, so say the value was not
-			// put back and how to get it back. A key that was unset
-			// before 'on' needs no note: stripping IS the restore.
+			if sha256Hex(raw) == bak.WrittenHash {
+				fmt.Fprintf(a.out, "claude off: %s no longer resolves to the file generation recorded by 'on', so stripping only the gateway-owned keys instead of restoring the backup\n",
+					a.settingsPath)
+			} else {
+				fmt.Fprintf(a.out, "claude off: %s changed since 'on' (normal: Claude Code rewrites it as you work), so stripping only the gateway-owned keys instead of restoring the backup; your edits are kept\n",
+					a.settingsPath)
+			}
+			rc := a.offStripOnly(root, snap, bak)
+			// Strip-only DELETES gateway-owned values; it never restores
+			// bak.Values. Name every pre-'on' value that was not put
+			// back so the conservative drift behavior is explicit.
 			if rc == 0 {
-				if v, ok := bak.Values[claudeManagedEnvKey]; ok {
-					fmt.Fprintf(a.out, "note: your pre-'on' %s %q was NOT restored on this path; re-add it to %s manually if you still need it\n",
-						claudeManagedEnvKey, v, a.settingsPath)
-				}
+				a.reportUnrestoredBackupValues(root, bak)
 			}
 			return rc
 		}
 		// Genuinely surprising, unlike the drift above: the file no
 		// longer points at the gateway at all, so something other than
 		// this tool redirected the harness. Keep the warning prefix.
-		fmt.Fprintf(a.out, "warning: %s changed since 'on' and no longer points at the gateway; leaving it alone and clearing the backup. Original %s: %s\n",
+		fmt.Fprintf(a.out, "warning: %s changed since 'on' and no longer points at the gateway; preserving user-owned values, stripping covered Switch values, and clearing the backup. Original %s: %s\n",
 			a.settingsPath, claudeManagedEnvKey, backupValueLabel(bak))
-		return a.offStripOnly(root, existed, bak)
+		rc := a.offStripOnly(root, snap, bak)
+		if rc == 0 {
+			a.reportUnrestoredBackupValues(root, bak)
+		}
+		return rc
 	}
 
 	// Clean restore: hash matches the file exactly as written at on.
@@ -763,13 +990,17 @@ func (a *claudeAdapter) off() int {
 	a.fixModelAlias(root, bak)
 
 	if !bak.Existed && len(root) == 0 {
-		if err := os.Remove(a.settingsPath); err != nil && !os.IsNotExist(err) {
+		if snap.FinalLinked {
+			fmt.Fprintf(a.out, "claude off: refusing to remove linked settings target %s; backup retained\n", a.settingsPath)
+			return 1
+		}
+		if err := snap.Remove(); err != nil {
 			fmt.Fprintf(a.out, "claude off: remove %s: %v\n", a.settingsPath, err)
 			return 1
 		}
 		fmt.Fprintf(a.out, "claude: off (%s did not exist before 'on'; removed)\n", a.settingsPath)
 	} else {
-		if _, err := writeClaudeSettings(a.settingsPath, root); err != nil {
+		if _, _, err := writeClaudeSettings(snap, root); err != nil {
 			fmt.Fprintf(a.out, "claude off: %v\n", err)
 			return 1
 		}
@@ -782,13 +1013,18 @@ func (a *claudeAdapter) off() int {
 	return 0
 }
 
-// offStripOnly is the conservative path: delete the managed keys only
-// when their value points at a gateway port; never touch other
-// values, never create a missing file. bak, when non-nil, is consumed
-// (deleted) and used only to resolve a persisted model alias.
-func (a *claudeAdapter) offStripOnly(root map[string]any, existed bool, bak *claudeBackup) int {
-	if !existed {
+// offStripOnly is the conservative path: delete routing values only
+// when they are gateway-owned, and delete fixed-value Claude knobs only
+// when a backup proves `on` changed them and they still match what it
+// wrote. Never touch preexisting matching, drifted, or unproven values,
+// and never create a missing file. bak, when non-nil, is consumed.
+func (a *claudeAdapter) offStripOnly(root map[string]any, snap *safefile.Snapshot, bak *claudeBackup) int {
+	if !snap.Exists {
 		if bak != nil {
+			if err := snap.Remove(); err != nil {
+				fmt.Fprintf(a.out, "claude off: verify absent settings %s: %v\n", a.settingsPath, err)
+				return 1
+			}
 			os.Remove(a.backupPath)
 		}
 		fmt.Fprintf(a.out, "claude: off (no settings file at %s; nothing to do)\n", a.settingsPath)
@@ -802,7 +1038,21 @@ func (a *claudeAdapter) offStripOnly(root map[string]any, existed bool, bak *cla
 	changed := false
 	var strippedKeys []string
 	for _, k := range claudeManagedEnvKeys {
-		if cur, ok := envString(env, k); ok && a.ownedEnvValue(k, cur) {
+		cur, ok := envString(env, k)
+		strip := ok && a.ownedEnvValue(k, cur)
+		prior, priorSet := "", false
+		if bak != nil {
+			prior, priorSet = bak.Values[k]
+		}
+		// A covered prior value equal to the desired value predated
+		// `on`; preserve it during drift instead of claiming ownership.
+		if ok && backupCovers(bak, k) &&
+			(k == claudeAttributionEnvKey || k == claudeToolSearchEnvKey) &&
+			cur == a.desiredClaudeEnvValue(k) &&
+			!(priorSet && prior == cur) {
+			strip = true
+		}
+		if strip {
 			delete(env, k)
 			changed = true
 			strippedKeys = append(strippedKeys, k)
@@ -815,12 +1065,18 @@ func (a *claudeAdapter) offStripOnly(root map[string]any, existed bool, bak *cla
 		changed = true
 	}
 	if changed {
-		if _, err := writeClaudeSettings(a.settingsPath, root); err != nil {
+		if _, _, err := writeClaudeSettings(snap, root); err != nil {
 			fmt.Fprintf(a.out, "claude off: %v\n", err)
 			return 1
 		}
 	}
 	if bak != nil {
+		if !changed {
+			if err := snap.Verify(); err != nil {
+				fmt.Fprintf(a.out, "claude off: settings changed before backup cleanup: %v\n", err)
+				return 1
+			}
+		}
 		if err := os.Remove(a.backupPath); err != nil {
 			fmt.Fprintf(a.out, "claude off: remove backup: %v\n", err)
 			return 1
@@ -835,6 +1091,24 @@ func (a *claudeAdapter) offStripOnly(root map[string]any, existed bool, bak *cla
 		fmt.Fprintf(a.out, "claude: off (noop; %s is not gateway-managed)\n", a.settingsPath)
 	}
 	return 0
+}
+
+// reportUnrestoredBackupValues explains values that the conservative
+// drift path could not safely restore. Do not report a value when the
+// post-strip settings already contain the same value.
+func (a *claudeAdapter) reportUnrestoredBackupValues(root map[string]any, bak *claudeBackup) {
+	afterEnv, _ := settingsEnv(root)
+	for _, key := range claudeManagedEnvKeys {
+		v, ok := bak.Values[key]
+		if !ok {
+			continue
+		}
+		if got, set := envString(afterEnv, key); set && got == v {
+			continue
+		}
+		fmt.Fprintf(a.out, "note: your pre-'on' %s %q was NOT restored on this path; re-add it to %s manually if you still need it\n",
+			key, v, a.settingsPath)
+	}
 }
 
 // fixModelAlias handles the the model-discovery contract persisted-alias
@@ -1659,22 +1933,22 @@ func routeEnvSlotKeys() []string {
 // --- status -----------------------------------------------------------------
 
 func (a *claudeAdapter) status(stdout io.Writer) int {
-	root, _, existed, err := loadClaudeSettings(a.settingsPath)
+	root, snap, err := readClaudeSettings(a.settingsPath)
 	if err != nil {
 		fmt.Fprintf(a.out, "claude status: %v\n", err)
 		return 1
 	}
-	var cur string
-	var curSet bool
+	existed := snap.Exists
+	var env map[string]any
 	if existed {
-		env, envErr := settingsEnv(root)
+		var envErr error
+		env, envErr = settingsEnv(root)
 		if envErr != nil {
 			fmt.Fprintf(a.out, "claude status: %v\n", envErr)
 			return 1
 		}
-		cur, curSet = envString(env, claudeManagedEnvKey)
 	}
-	managed := curSet && a.isGatewayURL(cur)
+	baseManaged, complete := a.claudeOnState(env)
 	backupPresent := false
 	if _, err := os.Stat(a.backupPath); err == nil {
 		backupPresent = true
@@ -1690,19 +1964,37 @@ func (a *claudeAdapter) status(stdout io.Writer) int {
 		}
 	}
 	state := "off (not gateway-managed)"
-	if managed {
+	if complete {
 		state = "on (gateway-managed)"
+	} else if baseManaged {
+		state = "incomplete (base URL is gateway-managed; run 'baseten-switch claude on' to repair settings)"
 	}
 	fmt.Fprintf(stdout, "claude: %s\n", state)
-	fmt.Fprintf(stdout, "  settings:            %s%s\n", a.settingsPath, map[bool]string{true: "", false: " (absent)"}[existed])
-	fmt.Fprintf(stdout, "  %s:  %s\n", claudeManagedEnvKey, orDash(cur))
+	fmt.Fprintf(stdout, "  settings:            %s (%s)\n", a.settingsPath, safefileTopologyLabel(snap))
+	for _, key := range claudeOnEnvKeys {
+		cur, _ := envString(env, key)
+		fmt.Fprintf(stdout, "  %-21s %s\n", key+":", orDash(cur))
+	}
 	fmt.Fprintf(stdout, "  subagents:           %s\n", subLabel)
 	fmt.Fprintf(stdout, "  door port:           %s (target %s)\n", a.desiredPort, a.desiredURL())
 	fmt.Fprintf(stdout, "  backup:              %s\n", map[bool]string{true: "present (" + a.backupPath + ")", false: "none"}[backupPresent])
-	if managed {
+	if complete {
 		return 0
 	}
 	return statusExitOff
+}
+
+func safefileTopologyLabel(snap *safefile.Snapshot) string {
+	if snap == nil {
+		return "unresolved"
+	}
+	if !snap.Exists {
+		return "absent"
+	}
+	if snap.Linked {
+		return "linked -> " + snap.ResolvedPath
+	}
+	return "direct regular file"
 }
 
 // backupValueLabel renders the backed-up managed values for warnings.

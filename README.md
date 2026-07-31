@@ -89,9 +89,10 @@ baseten-switch pi uninstall
 
 ## Claude Code
 
-`baseten-switch claude on` saves the previous Claude Code setting and points
-new sessions at Baseten Switch. Restart Claude Code after enabling or
-disabling the integration.
+`baseten-switch claude on` saves the previous Claude Code environment values,
+points new sessions at Baseten Switch, enables deferred tool loading, and
+omits Claude Code's attribution block to improve gateway prompt-cache hit
+rates. Restart Claude Code after enabling or disabling the integration.
 
 Useful controls:
 
