@@ -107,7 +107,7 @@ jobs:
           GITLEAKS_MAX_ARCHIVE_DEPTH: "2"
         run: scripts/security/run-gitleaks.sh dist
 
-      - name: Render checksum-pinned Homebrew formula and patch
+      - name: Render checksum-pinned Homebrew formula
         id: formula
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
@@ -125,17 +125,14 @@ jobs:
 
           tap_stage="$GITHUB_WORKSPACE/dist/homebrew-tap"
           formula="$tap_stage/Formula/baseten-switch.rb"
-          patch="dist/baseten-switch_${version}_homebrew.patch"
           scripts/release/render-formula.sh \
             --tag "$RELEASE_TAG" \
             --sha256 "$artifact_sha256" \
             --approved-license-spdx "$APPROVED_LICENSE_SPDX" \
-            --output "$formula" \
-            --patch-output "$patch"
+            --output "$formula"
           {
             printf 'artifact=%s\n' "$artifact"
             printf 'formula=%s\n' "$formula"
-            printf 'patch=%s\n' "$patch"
           } >>"$GITHUB_OUTPUT"
 
       - name: Attest the exact final ZIP
@@ -143,15 +140,29 @@ jobs:
         with:
           subject-path: ${{ steps.formula.outputs.artifact }}
 
-      - name: Preserve formula and tap patch as workflow artifacts
+      - name: Preserve formula and checksums as workflow artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: baseten-switch-${{ inputs.release_tag }}-homebrew
           path: |
             ${{ steps.formula.outputs.formula }}
-            ${{ steps.formula.outputs.patch }}
+            dist/checksums.txt
           if-no-files-found: error
           retention-days: 30
+
+      - name: Require immutable releases before publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          immutable_releases_enabled="$(
+            gh api \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              repos/basetenlabs/baseten-switch/immutable-releases \
+              --jq '.enabled == true'
+          )"
+          [[ "$immutable_releases_enabled" == true ]] \
+            || { printf 'repository immutable releases must be enabled before publication\n' >&2; exit 1; }
 
       - name: Create public beta prerelease without replacing assets
         env:
@@ -179,3 +190,253 @@ jobs:
           rm -f \
             "$RUNNER_TEMP/release-tag-signing-key.pub" \
             "$RUNNER_TEMP/release-tag-allowed-signers"
+
+  homebrew:
+    name: Open protected Homebrew tap update
+    needs: prepare
+    runs-on: macos-15
+    environment: release
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    steps:
+      - name: Download the generated formula handoff
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: baseten-switch-${{ inputs.release_tag }}-homebrew
+          path: ${{ runner.temp }}/baseten-switch-homebrew
+
+      - name: Verify the immutable release and exact formula handoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          handoff="$RUNNER_TEMP/baseten-switch-homebrew"
+          formula_path="Formula/baseten-switch.rb"
+          generated_formula="$handoff/homebrew-tap/$formula_path"
+          checksums="$handoff/checksums.txt"
+          published_release="$RUNNER_TEMP/published-release"
+          release_json="$RUNNER_TEMP/published-release.json"
+          version="${RELEASE_TAG#v}"
+          artifact_name="baseten-switch_${version}_darwin_universal.zip"
+          expected_url="https://github.com/basetenlabs/baseten-switch/releases/download/${RELEASE_TAG}/${artifact_name}"
+
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { printf 'release tag must match v<major>.<minor>.<patch>\n' >&2; exit 1; }
+          gh api \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/basetenlabs/baseten-switch/releases/tags/$RELEASE_TAG" \
+            >"$release_json"
+          asset_digest="$(
+            ruby -rjson -e '
+              release = JSON.parse(File.read(ARGV.fetch(0)))
+              tag = ARGV.fetch(1)
+              archive = ARGV.fetch(2)
+              abort "published release tag does not match" unless release.fetch("tag_name") == tag
+              abort "published release is a draft" unless release.fetch("draft") == false
+              abort "published release is not a prerelease" unless release.fetch("prerelease") == true
+              abort "published release is not immutable" unless release.fetch("immutable") == true
+              assets = release.fetch("assets")
+              expected_names = [archive, "checksums.txt"]
+              abort "published release must contain exactly the ZIP and checksums" unless
+                assets.map { |asset| asset.fetch("name") }.sort == expected_names.sort
+              selected = assets.find { |asset| asset.fetch("name") == archive }
+              digest = selected.fetch("digest")
+              abort "published release ZIP has no SHA-256 digest" unless
+                digest.is_a?(String) && digest.match?(/\Asha256:[0-9a-f]{64}\z/)
+              puts digest
+            ' "$release_json" "$RELEASE_TAG" "$artifact_name"
+          )"
+          [[ -f "$generated_formula" && -f "$checksums" ]] \
+            || { printf 'Homebrew handoff artifact is incomplete\n' >&2; exit 1; }
+          install -d -m 0755 "$published_release"
+          gh release download "$RELEASE_TAG" \
+            --repo basetenlabs/baseten-switch \
+            --dir "$published_release" \
+            --pattern "$artifact_name" \
+            --pattern checksums.txt
+          cmp -s "$checksums" "$published_release/checksums.txt" \
+            || { printf 'published checksums do not match the formula handoff\n' >&2; exit 1; }
+          checksum_entries="$(
+            awk -v artifact="$artifact_name" '$2 == artifact { count++ } END { print count + 0 }' \
+              "$checksums"
+          )"
+          [[ "$checksum_entries" == 1 ]] \
+            || { printf 'release archive must have exactly one checksum entry\n' >&2; exit 1; }
+          expected_sha256="$(
+            awk -v artifact="$artifact_name" '$2 == artifact { print $1 }' "$checksums"
+          )"
+          [[ "$expected_sha256" =~ ^[[:xdigit:]]{64}$ ]] \
+            || { printf 'release checksum is missing or invalid\n' >&2; exit 1; }
+          published_sha256="$(shasum -a 256 "$published_release/$artifact_name" | awk '{print $1}')"
+          [[ "$published_sha256" == "$expected_sha256" ]] \
+            || { printf 'published release archive does not match checksums.txt\n' >&2; exit 1; }
+          [[ "$asset_digest" == "sha256:$expected_sha256" ]] \
+            || { printf 'published release asset digest does not match checksums.txt\n' >&2; exit 1; }
+          [[ "$(grep -Fxc "  url \"$expected_url\"" "$generated_formula")" == 1 ]] \
+            || { printf 'generated formula does not contain the exact release URL\n' >&2; exit 1; }
+          [[ "$(grep -Fxc "  sha256 \"$expected_sha256\"" "$generated_formula")" == 1 ]] \
+            || { printf 'generated formula does not contain the exact release checksum\n' >&2; exit 1; }
+          [[ "$(grep -Ec '^[[:space:]]*url ' "$generated_formula")" == 1 \
+            && "$(grep -Ec '^[[:space:]]*sha256 ' "$generated_formula")" == 1 ]] \
+            || { printf 'generated formula has an ambiguous URL or checksum\n' >&2; exit 1; }
+          ruby -c "$generated_formula" >/dev/null \
+            || { printf 'generated formula failed Ruby syntax validation\n' >&2; exit 1; }
+          derived_version="$(
+            brew ruby -e \
+              'require "formulary"; path = Pathname(ARGV.fetch(0)); puts Formulary.from_contents("baseten-switch", path, path.read).version' \
+              "$generated_formula"
+          )"
+          [[ "$derived_version" == "$version" ]] \
+            || { printf 'Homebrew derived version %s instead of %s\n' "$derived_version" "$version" >&2; exit 1; }
+          brew style "$generated_formula"
+          gh attestation verify "$published_release/$artifact_name" \
+            --repo basetenlabs/baseten-switch \
+            --signer-workflow basetenlabs/baseten-switch/.github/workflows/release.yml
+
+      - name: Generate a token scoped to homebrew-baseten
+        id: tap-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.APP_HOMEBREW_UPDATER_CLIENT_ID }}
+          private-key: ${{ secrets.APP_HOMEBREW_UPDATER_PRIVATE_KEY }}
+          owner: basetenlabs
+          repositories: homebrew-baseten
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Open or reuse the Homebrew formula pull request
+        env:
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          tap_repository="basetenlabs/homebrew-baseten"
+          tap_branch="baseten-switch-${RELEASE_TAG}"
+          formula_path="Formula/baseten-switch.rb"
+          handoff="$RUNNER_TEMP/baseten-switch-homebrew"
+          generated_formula="$handoff/homebrew-tap/$formula_path"
+          checksums="$handoff/checksums.txt"
+          tap_checkout="$RUNNER_TEMP/homebrew-baseten"
+          version="${RELEASE_TAG#v}"
+
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { printf 'release tag must match v<major>.<minor>.<patch>\n' >&2; exit 1; }
+          [[ -f "$generated_formula" && -f "$checksums" ]] \
+            || { printf 'Homebrew handoff artifact is incomplete\n' >&2; exit 1; }
+
+          gh auth setup-git
+          gh repo clone "$tap_repository" "$tap_checkout" -- --branch main --single-branch
+          cd "$tap_checkout"
+
+          if cmp -s "$generated_formula" "$formula_path"; then
+            printf 'Homebrew tap main already contains Baseten Switch %s\n' "$RELEASE_TAG"
+            exit 0
+          fi
+
+          tap_main_version="$(
+            brew ruby -e \
+              'require "formulary"; path = Pathname(ARGV.fetch(0)); puts Formulary.from_contents("baseten-switch", path, path.read).version' \
+              "$formula_path"
+          )"
+          version_order="$(
+            ruby -e '
+              desired = ARGV.fetch(0).split(".").map { |value| Integer(value, 10) }
+              current = ARGV.fetch(1).split(".").map { |value| Integer(value, 10) }
+              puts desired <=> current
+            ' "$version" "$tap_main_version"
+          )"
+          [[ "$version_order" == 1 ]] \
+            || { printf 'refusing tap downgrade or conflicting version: release %s, tap main %s\n' \
+              "$version" "$tap_main_version" >&2; exit 1; }
+
+          remote_branch="$(git ls-remote --heads origin "refs/heads/$tap_branch")"
+          open_pr_count="$(
+            gh pr list \
+              --repo "$tap_repository" \
+              --state open \
+              --head "$tap_branch" \
+              --json number \
+              --jq 'length'
+          )"
+          all_pr_count="$(
+            gh pr list \
+              --repo "$tap_repository" \
+              --state all \
+              --head "$tap_branch" \
+              --json number \
+              --jq 'length'
+          )"
+
+          if [[ -n "$remote_branch" ]]; then
+            git fetch --no-tags origin \
+              "refs/heads/$tap_branch:refs/remotes/origin/$tap_branch"
+            existing_formula="$RUNNER_TEMP/existing-baseten-switch.rb"
+            git show "origin/$tap_branch:$formula_path" >"$existing_formula" \
+              || { printf 'existing tap branch does not contain %s\n' "$formula_path" >&2; exit 1; }
+            cmp -s "$generated_formula" "$existing_formula" \
+              || { printf 'existing tap branch %s contains a conflicting formula\n' "$tap_branch" >&2; exit 1; }
+            changed_paths="$(git diff --name-only "origin/main...origin/$tap_branch")"
+            [[ "$changed_paths" == "$formula_path" ]] \
+              || { printf 'existing tap branch %s changes files outside the generated formula\n' "$tap_branch" >&2; exit 1; }
+          elif [[ "$all_pr_count" != 0 ]]; then
+            printf 'tap branch %s is missing but a prior pull request uses that branch\n' \
+              "$tap_branch" >&2
+            exit 1
+          else
+            git switch --create "$tap_branch" origin/main
+            install -m 0644 "$generated_formula" "$formula_path"
+            cmp -s "$generated_formula" "$formula_path" \
+              || { printf 'copied tap formula does not match the generated formula\n' >&2; exit 1; }
+            changed_paths="$(git diff --name-only)"
+            [[ "$changed_paths" == "$formula_path" ]] \
+              || { printf 'tap checkout contains changes outside the generated formula\n' >&2; exit 1; }
+            git diff --check
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -- "$formula_path"
+            git commit -m "Update Baseten Switch to $RELEASE_TAG"
+            git push origin "HEAD:refs/heads/$tap_branch"
+          fi
+
+          if [[ "$open_pr_count" == 1 ]]; then
+            pr_url="$(
+              gh pr list \
+                --repo "$tap_repository" \
+                --state open \
+                --head "$tap_branch" \
+                --base main \
+                --json url \
+                --jq '.[0].url // empty'
+            )"
+            [[ -n "$pr_url" ]] \
+              || { printf 'existing tap pull request does not target main\n' >&2; exit 1; }
+            printf 'Reusing Homebrew tap pull request %s\n' "$pr_url"
+          elif [[ "$open_pr_count" != 0 || "$all_pr_count" != 0 ]]; then
+            printf 'conflicting pull request state exists for tap branch %s\n' \
+              "$tap_branch" >&2
+            exit 1
+          else
+            pr_body="$RUNNER_TEMP/homebrew-tap-pr.md"
+            {
+              printf '## Summary\n\n'
+              printf -- "- Update \`baseten-switch\` to \`%s\`.\n" "$RELEASE_TAG"
+              printf -- '- Pin the formula to the immutable release archive and checksum.\n\n'
+              printf '## Verification\n\n'
+              printf -- '- Generated formula matches the release URL and checksum.\n'
+              printf -- '- Ruby syntax, Homebrew version derivation, and Homebrew style passed.\n'
+            } >"$pr_body"
+            pr_url="$(
+              gh pr create \
+                --repo "$tap_repository" \
+                --base main \
+                --head "$tap_branch" \
+                --title "Update Baseten Switch to $RELEASE_TAG" \
+                --body-file "$pr_body"
+            )"
+            printf 'Opened Homebrew tap pull request %s\n' "$pr_url"
+          fi

@@ -12,27 +12,17 @@ fail() {
 }
 
 formula="$TMP_ROOT/Formula/baseten-switch.rb"
-patch="$TMP_ROOT/baseten-switch_1.2.3_homebrew.patch"
 checksum="0123456789abcdef0123456789abcdef0123456789abcdef0123456789ABCDEF"
 "$RENDERER" \
     --tag v1.2.3 \
     --sha256 "$checksum" \
     --approved-license-spdx MIT \
-    --output "$formula" \
-    --patch-output "$patch" >/dev/null
+    --output "$formula" >/dev/null
 
 [[ -f "$formula" ]] || fail "renderer did not create the formula"
-[[ -f "$patch" ]] || fail "renderer did not create the tap patch"
 [[ "$(stat -f '%Lp' "$formula" 2>/dev/null || stat -c '%a' "$formula")" == 644 ]] \
     || fail "formula mode is not 0644"
 ruby -c "$formula" >/dev/null || fail "formula is not valid Ruby syntax"
-tap_checkout="$TMP_ROOT/tap-checkout"
-mkdir -p "$tap_checkout"
-git -C "$tap_checkout" init -q
-git -C "$tap_checkout" apply "$patch" \
-    || fail "rendered tap patch does not apply to a clean checkout"
-cmp "$formula" "$tap_checkout/Formula/baseten-switch.rb" \
-    || fail "tap patch does not produce the rendered formula"
 
 grep -Fqx '# typed: strict' "$formula" \
     || fail "formula omitted the Homebrew Sorbet sigil"
@@ -90,8 +80,7 @@ failure_log="$TMP_ROOT/failure.log"
 if "$RENDERER" \
     --tag v1.2.3 \
     --sha256 "$checksum" \
-    --output "$TMP_ROOT/no-license.rb" \
-    --patch-output "$TMP_ROOT/no-license.patch" >"$failure_log" 2>&1; then
+    --output "$TMP_ROOT/no-license.rb" >"$failure_log" 2>&1; then
     fail "renderer accepted a missing approved SPDX license"
 fi
 grep -Fq -- '--approved-license-spdx' "$failure_log" \
@@ -101,8 +90,7 @@ if "$RENDERER" \
     --tag 1.2.3 \
     --sha256 "$checksum" \
     --approved-license-spdx MIT \
-    --output "$TMP_ROOT/bad-tag.rb" \
-    --patch-output "$TMP_ROOT/bad-tag.patch" >"$failure_log" 2>&1; then
+    --output "$TMP_ROOT/bad-tag.rb" >"$failure_log" 2>&1; then
     fail "renderer accepted a tag without the required v prefix"
 fi
 
@@ -110,8 +98,7 @@ if "$RENDERER" \
     --tag v1.2.3 \
     --sha256 not-a-checksum \
     --approved-license-spdx MIT \
-    --output "$TMP_ROOT/bad-checksum.rb" \
-    --patch-output "$TMP_ROOT/bad-checksum.patch" >"$failure_log" 2>&1; then
+    --output "$TMP_ROOT/bad-checksum.rb" >"$failure_log" 2>&1; then
     fail "renderer accepted an invalid checksum"
 fi
 
@@ -119,8 +106,7 @@ if "$RENDERER" \
     --tag v1.2.3 \
     --sha256 "$checksum" \
     --approved-license-spdx 'Apache-2.0"; system("id")' \
-    --output "$TMP_ROOT/injected.rb" \
-    --patch-output "$TMP_ROOT/injected.patch" >"$failure_log" 2>&1; then
+    --output "$TMP_ROOT/injected.rb" >"$failure_log" 2>&1; then
     fail "renderer accepted an unsafe license value"
 fi
 
@@ -128,8 +114,7 @@ if "$RENDERER" \
     --tag v1.2.3 \
     --sha256 "$checksum" \
     --approved-license-spdx MIT \
-    --output "$formula" \
-    --patch-output "$TMP_ROOT/overwrite.patch" >"$failure_log" 2>&1; then
+    --output "$formula" >"$failure_log" 2>&1; then
     fail "renderer replaced an existing formula"
 fi
 grep -Fq 'refusing to replace existing output' "$failure_log" \
