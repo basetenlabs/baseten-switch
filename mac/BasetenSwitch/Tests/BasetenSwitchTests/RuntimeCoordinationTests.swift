@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import ServiceManagement
 import XCTest

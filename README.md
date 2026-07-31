@@ -257,9 +257,11 @@ See [TESTING.md](TESTING.md) for test layers and isolation requirements.
 ## Nix source build
 
 The Nix flake is an alternate source build of the `baseten-switch` CLI and
-gateway for Linux (x86_64 and aarch64) and Apple Silicon macOS. It does not
-include the signed Mac app or install the Baseten CLI dependency. Homebrew
-is the supported path for the complete macOS product.
+gateway for Linux (x86_64 and aarch64) and Apple Silicon macOS. On Apple
+Silicon macOS the default package also builds and installs the menu bar
+app (a single-arch, ad-hoc-signed dev build — not the signed universal
+release bundle). The flake does not install the Baseten CLI dependency.
+Homebrew is the supported path for the complete macOS product.
 
 ### Home Manager
 
@@ -277,7 +279,12 @@ home.packages = [
 ];
 ```
 
-Alternatively, apply the overlay to make `pkgs.baseten-switch` available:
+On Apple Silicon macOS this installs the gateway CLI and the menu bar app
+together; Home Manager surfaces the app in `~/Applications/Home Manager
+Apps`. Use `packages.${pkgs.system}.baseten-switch` for the CLI alone.
+
+Alternatively, apply the overlay to make `pkgs.baseten-switch` (and, on
+Apple Silicon macOS, `pkgs.baseten-switch-menubar`) available:
 
 ```nix
 nixpkgs.overlays = [ inputs.baseten-switch.overlays.default ];
@@ -301,8 +308,12 @@ baseten-switch up
 The imperative install without Home Manager:
 
 ```sh
-nix profile install github:basetenlabs/baseten-switch#baseten-switch
+nix profile install github:basetenlabs/baseten-switch
 ```
+
+On Apple Silicon macOS this includes the menu bar app at
+`~/.nix-profile/Applications/Baseten Switch.app`; install
+`...baseten-switch#baseten-switch` instead for the CLI alone.
 
 Upgrade and restart the locally running components:
 
@@ -311,13 +322,29 @@ nix profile upgrade --refresh baseten-switch
 baseten-switch up
 ```
 
+### Menu bar app (Apple Silicon macOS)
+
+The menu bar app is part of the default darwin package and also builds on
+its own with the nixpkgs Swift toolchain — no Xcode required:
+
+```sh
+nix build .#menubar
+open "result/Applications/Baseten Switch.app"
+```
+
+The result is a single-arch dev build with an ad hoc signature (the same
+identity a local `scripts/build-menubar.sh` run produces). Universal,
+release-signed bundles remain the job of `scripts/build-menubar.sh` with
+the Xcode toolchain.
+
 ### Development shells
 
 `nix develop` provides the Go toolchain for gateway development on every
 supported system. On Apple Silicon macOS, `nix develop .#menubar` provides
-an experimental nixpkgs Swift toolchain for building the menu bar app
-without Xcode; `scripts/build-menubar.sh` with the Xcode toolchain remains
-the supported app build.
+the nixpkgs Swift toolchain for the menu bar app: `swift build` and
+`swift build --build-tests` work without Xcode. `swift test` does not —
+nixpkgs swiftpm cannot run XCTest on macOS — so running the suite stays
+with the Xcode toolchain via `scripts/check.sh`.
 
 ## License
 
