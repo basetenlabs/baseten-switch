@@ -19,7 +19,7 @@ on:
 permissions: read-all
 
 concurrency:
-  group: release-${{ inputs.release_tag }}
+  group: release
   cancel-in-progress: false
 
 jobs:
@@ -82,10 +82,77 @@ jobs:
           git config gpg.format ssh
           git config gpg.ssh.allowedSignersFile "$allowed_signers"
           git verify-tag "$RELEASE_TAG"
+          git fetch --no-tags origin \
+            +refs/heads/main:refs/remotes/origin/main
           [[ "$(git rev-parse "HEAD^{commit}")" == "$(git rev-parse "${RELEASE_TAG}^{commit}")" ]] \
             || { printf 'checkout is not the selected tag commit\n' >&2; exit 1; }
+          [[ "$(git rev-parse "${RELEASE_TAG}^{commit}")" == "$(git rev-parse "origin/main^{commit}")" ]] \
+            || { printf 'release tag is not the current origin/main commit\n' >&2; exit 1; }
           [[ "$(git describe --tags --exact-match HEAD)" == "$RELEASE_TAG" ]] \
             || { printf 'HEAD is not exactly the selected tag\n' >&2; exit 1; }
+
+      - name: Require an unused version newer than every public release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          published_releases="$RUNNER_TEMP/published-releases.json"
+          tap_formula="$RUNNER_TEMP/public-tap-baseten-switch.rb"
+          gh api --paginate --slurp \
+            'repos/basetenlabs/baseten-switch/releases?per_page=100' \
+            >"$published_releases"
+          curl --fail --silent --show-error --location \
+            https://raw.githubusercontent.com/basetenlabs/homebrew-baseten/main/Formula/baseten-switch.rb \
+            >"$tap_formula"
+
+          ruby -rjson -e '
+            parse = lambda do |tag|
+              match = /\Av([0-9]+)\.([0-9]+)\.([0-9]+)\z/.match(tag)
+              abort "release tag is not strict SemVer: #{tag}" unless match
+              components = match.captures
+              abort "release tag is not strict SemVer: #{tag}" if
+                components.any? { |component| component.length > 1 && component.start_with?("0") }
+              components.map { |component| Integer(component, 10) }
+            end
+            candidate_tag = ARGV.fetch(1)
+            candidate = parse.call(candidate_tag)
+            pages = JSON.parse(File.read(ARGV.fetch(0)))
+            releases = pages.flatten.reject { |release| release.fetch("draft") }
+            releases.each do |release|
+              published_tag = release.fetch("tag_name")
+              abort "release tag is already published: #{candidate_tag}" if published_tag == candidate_tag
+              published = parse.call(published_tag)
+              abort "release tag #{candidate_tag} is not newer than #{published_tag}" unless
+                (candidate <=> published) == 1
+            end
+          ' "$published_releases" "$RELEASE_TAG"
+
+          tap_tag="$(
+            ruby -e '
+              text = File.read(ARGV.fetch(0))
+              pattern = %r{^\s*url "https://github\.com/basetenlabs/baseten-switch/releases/download/(v([0-9]+\.[0-9]+\.[0-9]+))/baseten-switch_([0-9]+\.[0-9]+\.[0-9]+)_darwin_universal\.zip"$}
+              matches = text.scan(pattern)
+              abort "tap formula must contain exactly one canonical release URL" unless matches.length == 1
+              tag, tag_version, archive_version = matches.fetch(0)
+              abort "tap formula release URL has mismatched versions" unless tag_version == archive_version
+              puts tag
+            ' "$tap_formula"
+          )"
+          ruby -e '
+            parse = lambda do |tag|
+              match = /\Av([0-9]+)\.([0-9]+)\.([0-9]+)\z/.match(tag)
+              abort "version is not strict SemVer: #{tag}" unless match
+              components = match.captures
+              abort "version is not strict SemVer: #{tag}" if
+                components.any? { |component| component.length > 1 && component.start_with?("0") }
+              components.map { |component| Integer(component, 10) }
+            end
+            candidate_tag, tap_tag = ARGV
+            abort "release tag #{candidate_tag} is not newer than tap main #{tap_tag}" unless
+              (parse.call(candidate_tag) <=> parse.call(tap_tag)) == 1
+          ' "$RELEASE_TAG" "$tap_tag"
 
       - name: Run repository release gate
         run: scripts/check.sh --offline
@@ -135,6 +202,23 @@ jobs:
             printf 'formula=%s\n' "$formula"
           } >>"$GITHUB_OUTPUT"
 
+      - name: Validate the generated formula before publication
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          GENERATED_FORMULA: ${{ steps.formula.outputs.formula }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          ruby -c "$GENERATED_FORMULA" >/dev/null
+          derived_version="$(
+            brew ruby -e \
+              'require "formulary"; path = Pathname(ARGV.fetch(0)); puts Formulary.from_contents("baseten-switch", path, path.read).version' \
+              "$GENERATED_FORMULA"
+          )"
+          [[ "$derived_version" == "$version" ]] \
+            || { printf 'Homebrew derived version %s instead of %s\n' "$derived_version" "$version" >&2; exit 1; }
+          brew style "$GENERATED_FORMULA"
+
       - name: Attest the exact final ZIP
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
@@ -150,9 +234,19 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Generate a token scoped to release settings
+        id: release-settings-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.APP_RELEASE_SETTINGS_READER_CLIENT_ID }}
+          private-key: ${{ secrets.APP_RELEASE_SETTINGS_READER_PRIVATE_KEY }}
+          owner: basetenlabs
+          repositories: baseten-switch
+          permission-administration: read
+
       - name: Require immutable releases before publication
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.release-settings-token.outputs.token }}
         run: |
           set -euo pipefail
           immutable_releases_enabled="$(
@@ -170,11 +264,24 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            printf 'release already exists for %s; refusing to replace or add assets\n' \
-              "$RELEASE_TAG" >&2
-            exit 1
-          fi
+          releases="$RUNNER_TEMP/releases-before-publication.json"
+          gh api --paginate --slurp \
+            'repos/basetenlabs/baseten-switch/releases?per_page=100' \
+            >"$releases"
+          ruby -rjson -e '
+            tag = ARGV.fetch(1)
+            matches = JSON.parse(File.read(ARGV.fetch(0))).flatten.select do |release|
+              release.fetch("tag_name") == tag
+            end
+            abort "multiple releases already use #{tag}" if matches.length > 1
+            unless matches.empty?
+              release = matches.fetch(0)
+              if release.fetch("draft")
+                abort "unpublished draft exists for #{tag}; inspect and remove only that draft before retrying"
+              end
+              abort "published release already exists for #{tag}; refusing to replace or add assets"
+            end
+          ' "$releases" "$RELEASE_TAG"
           version="${RELEASE_TAG#v}"
           gh release create "$RELEASE_TAG" \
             "dist/baseten-switch_${version}_darwin_universal.zip" \
@@ -297,81 +404,69 @@ jobs:
             --repo basetenlabs/baseten-switch \
             --signer-workflow basetenlabs/baseten-switch/.github/workflows/release.yml
 
-      - name: Generate a token scoped to homebrew-baseten
-        id: tap-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ secrets.APP_HOMEBREW_UPDATER_CLIENT_ID }}
-          private-key: ${{ secrets.APP_HOMEBREW_UPDATER_PRIVATE_KEY }}
-          owner: basetenlabs
-          repositories: homebrew-baseten
-          permission-contents: write
-          permission-pull-requests: write
-
-      - name: Open or reuse the Homebrew formula pull request
+      - name: Prepare the exact tap commit without credentials
+        id: tap-prepare
         env:
-          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
 
-          tap_repository="basetenlabs/homebrew-baseten"
+          [[ -z "${GH_TOKEN:-}" ]] \
+            || { printf 'tap preparation must not have a GitHub token\n' >&2; exit 1; }
           tap_branch="baseten-switch-${RELEASE_TAG}"
           formula_path="Formula/baseten-switch.rb"
           handoff="$RUNNER_TEMP/baseten-switch-homebrew"
           generated_formula="$handoff/homebrew-tap/$formula_path"
-          checksums="$handoff/checksums.txt"
           tap_checkout="$RUNNER_TEMP/homebrew-baseten"
-          version="${RELEASE_TAG#v}"
 
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
             || { printf 'release tag must match v<major>.<minor>.<patch>\n' >&2; exit 1; }
-          [[ -f "$generated_formula" && -f "$checksums" ]] \
-            || { printf 'Homebrew handoff artifact is incomplete\n' >&2; exit 1; }
+          [[ -f "$generated_formula" ]] \
+            || { printf 'Homebrew formula handoff is missing\n' >&2; exit 1; }
 
-          gh auth setup-git
-          gh repo clone "$tap_repository" "$tap_checkout" -- --branch main --single-branch
+          git clone --branch main --single-branch \
+            https://github.com/basetenlabs/homebrew-baseten.git \
+            "$tap_checkout"
           cd "$tap_checkout"
 
           if cmp -s "$generated_formula" "$formula_path"; then
+            {
+              printf 'operation=noop\n'
+              printf 'tap_branch=%s\n' "$tap_branch"
+              printf 'tap_checkout=%s\n' "$tap_checkout"
+              printf 'expected_commit=\n'
+              printf 'expected_remote=\n'
+            } >>"$GITHUB_OUTPUT"
             printf 'Homebrew tap main already contains Baseten Switch %s\n' "$RELEASE_TAG"
             exit 0
           fi
 
-          tap_main_version="$(
-            brew ruby -e \
-              'require "formulary"; path = Pathname(ARGV.fetch(0)); puts Formulary.from_contents("baseten-switch", path, path.read).version' \
-              "$formula_path"
-          )"
-          version_order="$(
+          tap_tag="$(
             ruby -e '
-              desired = ARGV.fetch(0).split(".").map { |value| Integer(value, 10) }
-              current = ARGV.fetch(1).split(".").map { |value| Integer(value, 10) }
-              puts desired <=> current
-            ' "$version" "$tap_main_version"
+              text = File.read(ARGV.fetch(0))
+              pattern = %r{^\s*url "https://github\.com/basetenlabs/baseten-switch/releases/download/(v([0-9]+\.[0-9]+\.[0-9]+))/baseten-switch_([0-9]+\.[0-9]+\.[0-9]+)_darwin_universal\.zip"$}
+              matches = text.scan(pattern)
+              abort "tap formula must contain exactly one canonical release URL" unless matches.length == 1
+              tag, tag_version, archive_version = matches.fetch(0)
+              abort "tap formula release URL has mismatched versions" unless tag_version == archive_version
+              puts tag
+            ' "$formula_path"
           )"
-          [[ "$version_order" == 1 ]] \
-            || { printf 'refusing tap downgrade or conflicting version: release %s, tap main %s\n' \
-              "$version" "$tap_main_version" >&2; exit 1; }
+          ruby -e '
+            parse = lambda do |tag|
+              match = /\Av([0-9]+)\.([0-9]+)\.([0-9]+)\z/.match(tag)
+              abort "version is not strict SemVer: #{tag}" unless match
+              components = match.captures
+              abort "version is not strict SemVer: #{tag}" if
+                components.any? { |component| component.length > 1 && component.start_with?("0") }
+              components.map { |component| Integer(component, 10) }
+            end
+            candidate_tag, tap_tag = ARGV
+            abort "refusing tap downgrade or conflicting version: release #{candidate_tag}, tap main #{tap_tag}" unless
+              (parse.call(candidate_tag) <=> parse.call(tap_tag)) == 1
+          ' "$RELEASE_TAG" "$tap_tag"
 
           remote_branch="$(git ls-remote --heads origin "refs/heads/$tap_branch")"
-          open_pr_count="$(
-            gh pr list \
-              --repo "$tap_repository" \
-              --state open \
-              --head "$tap_branch" \
-              --json number \
-              --jq 'length'
-          )"
-          all_pr_count="$(
-            gh pr list \
-              --repo "$tap_repository" \
-              --state all \
-              --head "$tap_branch" \
-              --json number \
-              --jq 'length'
-          )"
-
           if [[ -n "$remote_branch" ]]; then
             git fetch --no-tags origin \
               "refs/heads/$tap_branch:refs/remotes/origin/$tap_branch"
@@ -383,10 +478,8 @@ jobs:
             changed_paths="$(git diff --name-only "origin/main...origin/$tap_branch")"
             [[ "$changed_paths" == "$formula_path" ]] \
               || { printf 'existing tap branch %s changes files outside the generated formula\n' "$tap_branch" >&2; exit 1; }
-          elif [[ "$all_pr_count" != 0 ]]; then
-            printf 'tap branch %s is missing but a prior pull request uses that branch\n' \
-              "$tap_branch" >&2
-            exit 1
+            expected_commit="$(git rev-parse "origin/$tap_branch^{commit}")"
+            expected_remote="$expected_commit"
           else
             git switch --create "$tap_branch" origin/main
             install -m 0644 "$generated_formula" "$formula_path"
@@ -400,15 +493,92 @@ jobs:
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add -- "$formula_path"
             git commit -m "Update Baseten Switch to $RELEASE_TAG"
-            git push origin "HEAD:refs/heads/$tap_branch"
+            expected_commit="$(git rev-parse "HEAD^{commit}")"
+            expected_remote=""
           fi
+
+          {
+            printf 'operation=publish\n'
+            printf 'tap_branch=%s\n' "$tap_branch"
+            printf 'tap_checkout=%s\n' "$tap_checkout"
+            printf 'expected_commit=%s\n' "$expected_commit"
+            printf 'expected_remote=%s\n' "$expected_remote"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Generate a token scoped to homebrew-baseten
+        if: steps.tap-prepare.outputs.operation == 'publish'
+        id: tap-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.APP_HOMEBREW_UPDATER_CLIENT_ID }}
+          private-key: ${{ secrets.APP_HOMEBREW_UPDATER_PRIVATE_KEY }}
+          owner: basetenlabs
+          repositories: homebrew-baseten
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Push the prepared commit and open or reuse its pull request
+        if: steps.tap-prepare.outputs.operation == 'publish'
+        env:
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          TAP_BRANCH: ${{ steps.tap-prepare.outputs.tap_branch }}
+          TAP_CHECKOUT: ${{ steps.tap-prepare.outputs.tap_checkout }}
+          EXPECTED_COMMIT: ${{ steps.tap-prepare.outputs.expected_commit }}
+          EXPECTED_REMOTE: ${{ steps.tap-prepare.outputs.expected_remote }}
+        run: |
+          set -euo pipefail
+
+          tap_repository="basetenlabs/homebrew-baseten"
+          cd "$TAP_CHECKOUT"
+          [[ -n "$EXPECTED_COMMIT" && "$(git rev-parse "$EXPECTED_COMMIT^{commit}")" == "$EXPECTED_COMMIT" ]] \
+            || { printf 'prepared tap commit is missing or changed\n' >&2; exit 1; }
+          [[ -z "$(git status --porcelain)" ]] \
+            || { printf 'prepared tap checkout changed after validation\n' >&2; exit 1; }
+
+          open_pr_count="$(
+            gh pr list \
+              --repo "$tap_repository" \
+              --state open \
+              --head "$TAP_BRANCH" \
+              --json number \
+              --jq 'length'
+          )"
+          all_pr_count="$(
+            gh pr list \
+              --repo "$tap_repository" \
+              --state all \
+              --head "$TAP_BRANCH" \
+              --json number \
+              --jq 'length'
+          )"
+          if [[ "$open_pr_count" == 0 && "$all_pr_count" != 0 ]]; then
+            printf 'conflicting closed pull request exists for tap branch %s\n' \
+              "$TAP_BRANCH" >&2
+            exit 1
+          fi
+          [[ "$open_pr_count" == 0 || "$open_pr_count" == 1 ]] \
+            || { printf 'multiple open pull requests use tap branch %s\n' "$TAP_BRANCH" >&2; exit 1; }
+
+          gh auth setup-git
+          remote_ref="$(git ls-remote --heads origin "refs/heads/$TAP_BRANCH")"
+          remote_commit="${remote_ref%%$'\t'*}"
+          [[ "$remote_commit" == "$EXPECTED_REMOTE" ]] \
+            || { printf 'tap branch changed after credentialless validation\n' >&2; exit 1; }
+          if [[ -z "$EXPECTED_REMOTE" ]]; then
+            git push origin "$EXPECTED_COMMIT:refs/heads/$TAP_BRANCH"
+          fi
+          remote_ref="$(git ls-remote --heads origin "refs/heads/$TAP_BRANCH")"
+          remote_commit="${remote_ref%%$'\t'*}"
+          [[ "$remote_commit" == "$EXPECTED_COMMIT" ]] \
+            || { printf 'published tap branch does not match the prepared commit\n' >&2; exit 1; }
 
           if [[ "$open_pr_count" == 1 ]]; then
             pr_url="$(
               gh pr list \
                 --repo "$tap_repository" \
                 --state open \
-                --head "$tap_branch" \
+                --head "$TAP_BRANCH" \
                 --base main \
                 --json url \
                 --jq '.[0].url // empty'
@@ -416,10 +586,6 @@ jobs:
             [[ -n "$pr_url" ]] \
               || { printf 'existing tap pull request does not target main\n' >&2; exit 1; }
             printf 'Reusing Homebrew tap pull request %s\n' "$pr_url"
-          elif [[ "$open_pr_count" != 0 || "$all_pr_count" != 0 ]]; then
-            printf 'conflicting pull request state exists for tap branch %s\n' \
-              "$tap_branch" >&2
-            exit 1
           else
             pr_body="$RUNNER_TEMP/homebrew-tap-pr.md"
             {
@@ -434,7 +600,7 @@ jobs:
               gh pr create \
                 --repo "$tap_repository" \
                 --base main \
-                --head "$tap_branch" \
+                --head "$TAP_BRANCH" \
                 --title "Update Baseten Switch to $RELEASE_TAG" \
                 --body-file "$pr_body"
             )"

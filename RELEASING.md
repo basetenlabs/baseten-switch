@@ -16,12 +16,21 @@ these variables:
 
 It must also provide these GitHub App secrets:
 
+- `APP_RELEASE_SETTINGS_READER_CLIENT_ID`
+- `APP_RELEASE_SETTINGS_READER_PRIVATE_KEY`
 - `APP_HOMEBREW_UPDATER_CLIENT_ID`
 - `APP_HOMEBREW_UPDATER_PRIVATE_KEY`
 
-The GitHub App token is scoped to `basetenlabs/homebrew-baseten`. The app needs
-permission to write repository contents and pull requests in that repository.
-Do not give it access to other repositories.
+The release-settings reader app must be scoped only to
+`basetenlabs/baseten-switch`, with repository Administration permission set to
+read. The workflow mints its token immediately before checking the immutable
+release setting. It must not share credentials with the Homebrew updater.
+
+The Homebrew updater app must be scoped only to
+`basetenlabs/homebrew-baseten`, with permission to write repository contents
+and pull requests. The workflow does not mint this token until it has cloned,
+inspected, and prepared the public tap update without credentials. Do not give
+either app access to other repositories or broader permissions.
 
 Enable [immutable releases][github-immutable-releases] in the
 `basetenlabs/baseten-switch` repository settings before dispatching the
@@ -30,9 +39,10 @@ publication.
 
 ## Prepare the release
 
-1. Choose an unused tag that matches `v<major>.<minor>.<patch>`. Keep the
-   `v` prefix and do not add a prerelease suffix. The workflow marks the
-   GitHub release as a beta prerelease.
+1. Choose an unused tag that matches `v<major>.<minor>.<patch>`. It must be
+   newer than every published Baseten Switch release and the version currently
+   on the public tap. Keep the `v` prefix and do not add a prerelease suffix.
+   The workflow marks the GitHub release as a beta prerelease.
 2. Choose a numeric macOS build number. Each component must contain digits,
    separated by periods. Increase it from every previous public build. The
    workflow rejects other formats.
@@ -94,10 +104,12 @@ gh workflow run release.yml \
 
 Approve the protected `release` environment when prompted. The release job
 verifies that repository immutable releases are enabled, verifies the signed
-tag, runs `scripts/check.sh --offline`, checks the release contracts, builds
-and scans the universal archive, creates an attestation, and publishes a
-GitHub beta prerelease. It refuses to replace an existing release or its
-assets.
+tag is the current `origin/main` commit, and confirms the candidate version is
+unused and newer than every published release and the current tap formula. It
+then runs `scripts/check.sh --offline`, checks the release contracts, builds
+and scans the universal archive, validates the generated formula, creates an
+attestation, and publishes a GitHub beta prerelease. It refuses to replace an
+existing release or its assets.
 
 After the job succeeds, verify all of the following on GitHub:
 
@@ -111,11 +123,14 @@ After the job succeeds, verify all of the following on GitHub:
 
 ## Review and merge the Homebrew pull request
 
-After the release job succeeds, the separate `homebrew` job creates a
-short-lived GitHub App token scoped to the public tap. It creates the branch
-`baseten-switch-<release_tag>`, replaces only
-`Formula/baseten-switch.rb`, and opens a pull request against `main`. For
-example, release `v0.2.0` uses branch `baseten-switch-v0.2.0`.
+After the release job succeeds, the separate `homebrew` job downloads and
+verifies the handoff, clones the public tap without credentials, treats the
+current tap formula as inert text, and prepares the exact local commit. Only
+then does it create a short-lived GitHub App token scoped to the public tap.
+The credentialed step pushes the prepared branch
+`baseten-switch-<release_tag>` and creates or reuses its pull request against
+`main`. For example, release `v0.2.0` uses branch
+`baseten-switch-v0.2.0`.
 
 The workflow never pushes directly to the tap's `main` branch and never merges
 the pull request. Its formula validation must confirm that:
@@ -134,20 +149,34 @@ A human reviewer must confirm that the formula changes no unrelated
 installation or lifecycle behavior, and that the tap's required review and
 repository rules pass.
 
-Before merging, rehearse the upgrade from `v0.1.0` on a disposable release
-test Mac. The tap's `main` branch still provides `v0.1.0` at this point:
+Before merging, derive the previous tag from the current tap formula and
+rehearse the upgrade on a disposable release test Mac. The pull request must
+still be unmerged when deriving `previous_tag`:
 
 ```sh
 release_tag=vX.Y.Z
 brew update
+brew tap basetenlabs/baseten
+tap_repo="$(brew --repo basetenlabs/baseten)"
+tap_formula="$tap_repo/Formula/baseten-switch.rb"
+previous_tag="$(
+  ruby -e '
+    text = File.read(ARGV.fetch(0))
+    pattern = %r{^\s*url "https://github\.com/basetenlabs/baseten-switch/releases/download/(v([0-9]+\.[0-9]+\.[0-9]+))/baseten-switch_([0-9]+\.[0-9]+\.[0-9]+)_darwin_universal\.zip"$}
+    matches = text.scan(pattern)
+    abort "expected one canonical Baseten Switch release URL" unless matches.length == 1
+    tag, tag_version, archive_version = matches.fetch(0)
+    abort "formula URL versions do not match" unless tag_version == archive_version
+    puts tag
+  ' "$tap_formula"
+)"
 brew install basetenlabs/baseten/baseten-switch
-test "$(baseten-switch --version)" = "baseten-switch v0.1.0"
+test "$(baseten-switch --version)" = "baseten-switch $previous_tag"
 baseten-switch setup
 baseten-switch up --install
 baseten-switch claude on
 baseten-switch doctor
 
-tap_repo="$(brew --repo basetenlabs/baseten)"
 git -C "$tap_repo" fetch origin "baseten-switch-$release_tag"
 git -C "$tap_repo" switch --detach FETCH_HEAD
 HOMEBREW_NO_AUTO_UPDATE=1 brew upgrade basetenlabs/baseten/baseten-switch
@@ -205,6 +234,24 @@ Preserve published tags, releases, assets, and checksums.
 - If the release job fails before publication because of a transient service
   or protected-configuration problem, correct the problem and rerun it with
   the same tag.
+- `gh release create` can leave an unpublished draft if asset upload or final
+  publication fails. Before retrying, list releases through the GitHub API and
+  inspect the matching entry's `draft`, `published_at`, and assets. A
+  maintainer may delete it only after confirming it is a never-published draft
+  for this failed attempt. Never delete or mutate a published release.
+
+  ```sh
+  gh api --paginate repos/basetenlabs/baseten-switch/releases \
+    --jq '.[] | {id, tag_name, draft, published_at, assets: [.assets[].name]}'
+
+  release_tag=vX.Y.Z
+  draft_id=N
+  draft_url="repos/basetenlabs/baseten-switch/releases/$draft_id"
+  test "$(gh api "$draft_url" --jq .tag_name)" = "$release_tag"
+  test "$(gh api "$draft_url" --jq '.draft and (.published_at == null)')" = true
+  gh api --method DELETE "$draft_url"
+  ```
+
 - If tagged source or release content must change, merge the correction and
   prepare a new version with a new signed tag. Never move the old tag.
 - If the GitHub prerelease succeeds but the `homebrew` job fails, correct the
