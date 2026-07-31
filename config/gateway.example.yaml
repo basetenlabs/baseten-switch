@@ -7,7 +7,8 @@ global:
   # One global switch. Off is absolute native passthrough; On applies saved routing policy.
   routing_enabled: true
 
-  # Upstream auth; baseten is OPTIONAL with OAuth ('baseten auth login'), see schema.md for the API-key path.
+  # The selected Baseten CLI profile supplies OAuth or API-key auth automatically.
+  # baseten below is only the explicit environment fallback; see schema.md.
   auth:
     baseten:   ${BASETEN_API_KEY}
     anthropic: ${ANTHROPIC_API_KEY}

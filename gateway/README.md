@@ -38,6 +38,11 @@ The generated configuration lives at
 `~/.config/baseten-switch/gateway.yaml`. Runtime state, logs, and telemetry
 use the same configuration directory.
 
+The gateway reads the current Baseten CLI profile. It supports both OAuth and
+API-key profiles and reports the active type through
+`GET /v1/admin/auth/status`. The separate `BASETEN_API_KEY` fallback requires
+`BASETEN_SWITCH_API_KEY_FALLBACK=1`; a selected profile takes precedence.
+
 ## Main commands
 
 ```text

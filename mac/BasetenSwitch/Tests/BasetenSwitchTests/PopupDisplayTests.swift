@@ -47,12 +47,15 @@ final class PopupDisplayTests: XCTestCase {
 
     private func auth(signedIn: Bool, profile: String,
                       fallbackInUse: Bool, health: String = "",
-                      lastError: String = "") -> AuthStatus {
-        AuthStatus(dict: ["signed_in": signedIn, "profile": profile,
-                          "fallback_enabled": true,
-                          "fallback_in_use": fallbackInUse,
-                          "health": health,
-                          "last_refresh_error": lastError])
+                      lastError: String = "",
+                      authType: String? = nil) -> AuthStatus {
+        var dict: [String: Any] = ["signed_in": signedIn, "profile": profile,
+                                   "fallback_enabled": true,
+                                   "fallback_in_use": fallbackInUse,
+                                   "health": health,
+                                   "last_refresh_error": lastError]
+        if let authType { dict["auth_type"] = authType }
+        return AuthStatus(dict: dict)
     }
 
     func testAuthLineLabel() {
@@ -77,6 +80,16 @@ final class PopupDisplayTests: XCTestCase {
             authLineLabel(auth: auth(signedIn: false, profile: "",
                                      fallbackInUse: false)),
             "Auth: not signed in")
+        XCTAssertEqual(
+            authLineLabel(auth: auth(signedIn: true, profile: "example-profile",
+                                     fallbackInUse: false,
+                                     authType: "api_key")),
+            "Auth: example-profile API key")
+        // An omitted auth_type is the mixed-version OAuth default.
+        XCTAssertEqual(
+            authLineLabel(auth: auth(signedIn: true, profile: "example-profile",
+                                     fallbackInUse: false)),
+            "Auth: example-profile OAuth")
     }
 
     // Health-driven auth line states (oauth-expiry spike).

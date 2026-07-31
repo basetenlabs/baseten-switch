@@ -356,6 +356,7 @@ final class ModelCatalogTests: XCTestCase {
             .loading,
             .signedOut(.notSignedIn),
             .signedOut(.sessionExpired),
+            .signedOut(.credentialRejected),
             .error("unavailable"),
         ] {
             let projection = projectModelCatalog(
@@ -430,6 +431,9 @@ final class ModelCatalogTests: XCTestCase {
         XCTAssertEqual(
             liveModelCatalogSignedOutMessage(.sessionExpired),
             "Your Baseten session expired. Sign in again to load Model APIs.")
+        XCTAssertEqual(
+            liveModelCatalogSignedOutMessage(.credentialRejected),
+            "Your Baseten API key was rejected. Update it and try again.")
 
         let backendErrorState = makeState(modelCatalogReader:
             FixedModelCatalogReader(.success(catalogSnapshot(

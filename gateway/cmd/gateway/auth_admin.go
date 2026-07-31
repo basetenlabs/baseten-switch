@@ -17,12 +17,13 @@ func (g *Gateway) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 		g.reject(w, 405, "method not allowed")
 		return
 	}
-	signedIn, fallbackInUse := g.authState()
+	signedIn, authType, fallbackInUse := g.authState()
 	email, expiresAt := g.authEmailAndExpiry()
 	ah := g.authHealth()
 	cfg := g.runtimeConfig()
 	writeJSON(w, 200, map[string]any{
 		"signed_in":             signedIn,
+		"auth_type":             authType,
 		"health":                ah.Health,
 		"last_refresh_error":    ah.LastError,
 		"last_refresh_error_at": rfc3339OrEmpty(ah.LastErrorAt),

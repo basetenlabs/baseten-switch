@@ -38,13 +38,13 @@ func catalogTestGateway(server *httptest.Server) *Gateway {
 	}
 }
 
-func TestCatalogRefreshPublishesLiveSnapshotWithBearer(t *testing.T) {
+func TestCatalogRefreshPublishesLiveSnapshotWithAPIKey(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/v1/models" {
 			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
 		}
-		if got := r.Header.Get("Authorization"); got != "Bearer catalog-key" {
-			t.Fatalf("Authorization = %q, want Bearer catalog-key", got)
+		if got := r.Header.Get("Authorization"); got != "Api-Key catalog-key" {
+			t.Fatalf("Authorization = %q, want Api-Key catalog-key", got)
 		}
 		if got := r.Header.Get("Accept"); got != "application/json" {
 			t.Fatalf("Accept = %q", got)
@@ -108,6 +108,25 @@ func TestCatalogRefreshPublishesLiveSnapshotWithBearer(t *testing.T) {
 			"cache-restored catalog health = %+v",
 			restoredHealth,
 		)
+	}
+}
+
+func TestCatalogRefreshSelectedProfilePrecedesEnvironmentFallback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Api-Key selected-profile-key" {
+			t.Fatalf("Authorization = %q, want selected profile API key", got)
+		}
+		_, _ = w.Write([]byte(liveCatalogFixture))
+	}))
+	defer server.Close()
+
+	g := catalogTestGateway(server)
+	g.cfg.BasetenKey = "environment-fallback-must-not-win"
+	g.cliProfileAPIKey = "selected-profile-key"
+	g.refreshCatalogOnce(context.Background())
+
+	if metadata := g.pricing.Capture().BasetenMetadata(); metadata.Source != "baseten_v1_models" || metadata.ModelCount != 1 {
+		t.Fatalf("metadata = %+v", metadata)
 	}
 }
 

@@ -20,7 +20,7 @@ SIGHUP. The native Mac app edits the same file through `baseten-switch`.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `routing_enabled` | bool | `true` in new configs | The one global routing gate. It must be explicitly present. Off is absolute: native requests use the protocol-native provider, and aliases, raw Baseten slugs, Baseten model mappings, dedicated Baseten subagents, fallback, and Baseten credentials are not consulted by request resolution. Saved policy remains editable and becomes active again when On. |
-| `auth` | map[route] -> secret ref | (empty) | Backend credentials per upstream route. `${VAR}` resolves from env or `~/.config/baseten-switch/env`. |
+| `auth` | map[route] -> secret ref | (empty) | Environment fallback credentials per upstream route. The selected Baseten CLI profile supplies its OAuth or API-key credential automatically. `${VAR}` resolves from env or `~/.config/baseten-switch/env`. |
 | `telemetry_dir` | string | `~/.config/baseten-switch/telemetry` | Private directory containing versioned, monthly JSONL request segments. |
 | `telemetry_enabled` | bool | `true` | Toggle per-request telemetry collection. Disabling collection preserves existing history. |
 | `telemetry_retention_days` | int | `90` | Retention window for closed telemetry segments. The active segment is never deleted. |
@@ -148,6 +148,29 @@ substituted at gateway startup from:
 Resolved values are never written back to disk. The Tauri UI never
 displays resolved secrets; it shows the `${VAR_NAME}` placeholder
 verbatim and lets the user edit only the variable name.
+
+### Baseten authentication precedence
+
+Switch reads the selected profile created by `baseten auth login`. A selected
+OAuth profile or API-key profile takes precedence over `global.auth.baseten`.
+API keys remain opaque; Baseten enforces their permissions and resource
+access.
+
+`global.auth.baseten` expands to `BASETEN_API_KEY`, which is a separate
+environment fallback. Switch uses it only when
+`BASETEN_SWITCH_API_KEY_FALLBACK=1` and the selected CLI profile has no usable
+credential. Store both values in the mode-0600 Switch environment file when
+you need this fallback:
+
+```text
+BASETEN_SWITCH_API_KEY_FALLBACK=1
+BASETEN_API_KEY=...
+```
+
+`GET /v1/admin/auth/status` and the `auth` block in `GET /v1/admin/status`
+report `auth_type` as `oauth`, `api_key`, or `none`. An environment-only
+credential reports `auth_type: api_key` with `signed_in: false` and
+`fallback_in_use: true`; it does not become a selected CLI profile.
 
 ## Reload semantics
 

@@ -762,6 +762,146 @@ func TestBasetenRouteAPIKeyFallbackForwardsAPIKeyHeader(t *testing.T) {
 	}
 }
 
+func TestBasetenCLIAPIKeyProfileAuthenticatesGatewaySurfaces(t *testing.T) {
+	var mu sync.Mutex
+	seen := map[string]int{}
+	profileKey := "synthetic-profile-key"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Api-Key "+profileKey {
+			t.Errorf("%s Authorization = %q, want selected profile API key", r.URL.Path, got)
+		}
+		if got := r.Header.Get("X-Api-Key"); got != "" {
+			t.Errorf("%s forwarded inbound X-Api-Key = %q", r.URL.Path, got)
+		}
+		mu.Lock()
+		seen[r.URL.Path]++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/messages":
+			_, _ = io.WriteString(w, `{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"example/model","usage":{"input_tokens":1,"output_tokens":1}}`)
+		case "/v1/responses":
+			_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+		case "/v1/models":
+			_, _ = io.WriteString(w, `{"data":[]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	cfg := testConfig(t, server.URL, server.URL)
+	cfg.BasetenKey = "environment-key-must-not-win"
+	cfg.APIKeyFallback = true
+	cfg.OAuthProfile = "p"
+	writeAPIKeyProfile(t, profileKey)
+	claude := resolvedAnthropicBaseten(t)
+	codex := resolvedOpenAIBaseten(t, "codex", "baseten")
+	g, adminL, _ := newGateway(t, cfg, claude, codex)
+	defer adminL.Close()
+	stop := start(t, g)
+	defer stop()
+
+	requests := []struct {
+		method string
+		url    string
+		body   string
+	}{
+		{http.MethodPost, clientURL(g, claude.Name, "/v1/messages"), `{"model":"alias","messages":[{"role":"user","content":"ping"}]}`},
+		{http.MethodPost, clientURL(g, codex.Name, "/v1/responses"), `{"model":"alias","input":"ping"}`},
+		{http.MethodGet, clientURL(g, codex.Name, "/v1/models"), ""},
+	}
+	for _, test := range requests {
+		req, err := http.NewRequest(test.method, test.url, strings.NewReader(test.body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer harness-secret")
+		req.Header.Set("X-Api-Key", "harness-api-secret")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s %s status = %d", test.method, test.url, resp.StatusCode)
+		}
+	}
+
+	resp, err := http.Get(adminURL(g, "/v1/admin/auth/status"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var status map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if status["signed_in"] != true || status["auth_type"] != "api_key" || status["fallback_in_use"] != false {
+		t.Fatalf("auth status = %+v", status)
+	}
+	encoded, _ := json.Marshal(status)
+	if bytes.Contains(encoded, []byte(profileKey)) {
+		t.Fatal("admin auth status leaked selected API key")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, path := range []string{"/v1/messages", "/v1/responses", "/v1/models"} {
+		if seen[path] == 0 {
+			t.Errorf("upstream did not receive %s", path)
+		}
+	}
+}
+
+func TestBasetenAuthorizationFailuresDoNotPromoteNativeFallback(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var nativeHits atomic.Int32
+			baseten := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(status)
+				_, _ = io.WriteString(w, `{"error":"authorization failed"}`)
+			}))
+			defer baseten.Close()
+			native := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				nativeHits.Add(1)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer native.Close()
+
+			cfg := testConfig(t, baseten.URL, native.URL)
+			cfg.BasetenKey = ""
+			cfg.APIKeyFallback = false
+			cfg.OAuthProfile = "p"
+			writeAPIKeyProfile(t, "synthetic-restricted-key")
+			rc := resolvedAnthropicBaseten(t)
+			rc.FallbackRoute = "anthropic"
+			g, adminL, _ := newGateway(t, cfg, rc)
+			defer adminL.Close()
+			stop := start(t, g)
+			defer stop()
+
+			req, _ := http.NewRequest(http.MethodPost, clientURL(g, rc.Name, "/v1/messages"), strings.NewReader(`{"model":"alias","messages":[]}`))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != status {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, status)
+			}
+			if nativeHits.Load() != 0 {
+				t.Fatalf("native fallback received %d requests", nativeHits.Load())
+			}
+		})
+	}
+}
+
 func TestAdminAuthStatusReportsNotSignedIn(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer srv.Close()

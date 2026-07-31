@@ -245,7 +245,7 @@ func TestPrintStatusExitCodes(t *testing.T) {
 			0,
 			[]string{"Router:  up", "claude-code", "switch ON", "codex", "switch OFF",
 				"Door:    up", "not tripped", "3 fallback rules",
-				"Auth:    signed in (OAuth, user@example.com)"},
+				"Auth:    user@example.com OAuth"},
 		},
 		{
 			"router down",
@@ -292,6 +292,32 @@ func TestPrintStatusExitCodes(t *testing.T) {
 			}
 			if strings.Contains(buf.String(), "parked") {
 				t.Fatalf("disabled client rendered:\n%s", buf.String())
+			}
+		})
+	}
+}
+
+func TestAuthLineCredentialLabels(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		want    string
+	}{
+		{"oauth profile", `{"signed_in":true,"auth_type":"oauth","profile":"example-profile"}`, "example-profile OAuth"},
+		{"api key profile", `{"signed_in":true,"auth_type":"api_key","profile":"example-profile"}`, "example-profile API key"},
+		{"environment fallback", `{"signed_in":false,"auth_type":"api_key","fallback_in_use":true}`, "API-key fallback in use"},
+		{"signed out", `{"signed_in":false,"auth_type":"none"}`, "not signed in"},
+		{"older router defaults to oauth", `{"signed_in":true,"profile":"example-profile"}`, "example-profile OAuth"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				fmt.Fprint(w, tc.payload)
+			}))
+			defer srv.Close()
+			got := authLine(hostPort(t, srv.URL), true)
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("authLine() = %q, want it to contain %q", got, tc.want)
 			}
 		})
 	}
