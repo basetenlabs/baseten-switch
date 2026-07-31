@@ -166,7 +166,7 @@ fi
 printf '%s\n' "$api_key" |
     env HOME="$scratch_dir/home" \
         BASETEN_CONFIG_DIR="$baseten_config_dir" \
-        BASETEN_REMOTE_URL="https://api.baseten.co" \
+        BASETEN_REMOTE_URL="https://app.baseten.co" \
         baseten auth login \
             --with-api-key \
             --profile "$profile" \
