@@ -12,11 +12,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
 
 	"github.com/basetenlabs/baseten-switch/gateway/internal/auth"
+	"github.com/basetenlabs/baseten-switch/gateway/internal/proxy"
 
 	"golang.org/x/oauth2"
 	"time"
@@ -426,4 +428,66 @@ func TestAuthTickSignedOutWatchesForFirstLogin(t *testing.T) {
 	if auth := adminAuthBlock(t, g); auth["signed_in"] != true {
 		t.Fatalf("signed_in = %v after first login, want true", auth["signed_in"])
 	}
+}
+
+func TestAuthTickAPIKeyCredentialTransitions(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer upstream.Close()
+	tokenSrv := newDeadTokenServer(t)
+	tokenSrv.dead.Store(false)
+
+	cfg := testConfig(t, upstream.URL, upstream.URL)
+	cfg.BasetenKey = ""
+	cfg.APIKeyFallback = false
+	cfg.OAuthProfile = "p"
+
+	assertSelection := func(t *testing.T, g *Gateway, wantMode proxy.UpstreamAuthMode, wantKey string, wantOK bool) {
+		t.Helper()
+		mode, key, _, ok := g.buildUpstreamClient("baseten")
+		if ok != wantOK || (ok && (mode != wantMode || key != wantKey)) {
+			t.Fatalf("auth selection = (%v, %q, %t), want (%v, %q, %t)", mode, key, ok, wantMode, wantKey, wantOK)
+		}
+	}
+
+	t.Run("first login unreadable recovery rotation and logout", func(t *testing.T) {
+		g, adminL, _ := newGateway(t, cfg, resolvedAnthropicBaseten(t))
+		defer adminL.Close()
+		assertSelection(t, g, 0, "", false)
+
+		writeAPIKeyProfile(t, "")
+		g.authTickOnce()
+		assertSelection(t, g, 0, "", false)
+
+		writeAPIKeyProfile(t, "api-key-one")
+		g.authTickOnce()
+		assertSelection(t, g, proxy.UpstreamModeAPIKey, "api-key-one", true)
+
+		writeAPIKeyProfile(t, "api-key-two")
+		g.authTickOnce()
+		assertSelection(t, g, proxy.UpstreamModeAPIKey, "api-key-two", true)
+
+		if err := os.Remove(os.Getenv("BASETEN_SWITCH_AUTH_FILE")); err != nil {
+			t.Fatal(err)
+		}
+		g.authTickOnce()
+		assertSelection(t, g, 0, "", false)
+		if signedIn, authType, _ := g.authState(); signedIn || authType != "none" {
+			t.Fatalf("auth after logout = signed_in %t auth_type %q", signedIn, authType)
+		}
+	})
+
+	t.Run("OAuth to API key and back", func(t *testing.T) {
+		writeOAuthProfileExpiry(t, tokenSrv.srv.URL, "oauth-one", time.Now().Add(time.Hour))
+		g, adminL, _ := newGateway(t, cfg, resolvedAnthropicBaseten(t))
+		defer adminL.Close()
+		assertSelection(t, g, proxy.UpstreamModeOAuth, "", true)
+
+		writeAPIKeyProfile(t, "api-key-replacement")
+		g.authTickOnce()
+		assertSelection(t, g, proxy.UpstreamModeAPIKey, "api-key-replacement", true)
+
+		writeOAuthProfileExpiry(t, tokenSrv.srv.URL, "oauth-two", time.Now().Add(time.Hour))
+		g.authTickOnce()
+		assertSelection(t, g, proxy.UpstreamModeOAuth, "", true)
+	})
 }

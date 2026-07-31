@@ -361,4 +361,24 @@ grep -q 'Router:  DOWN' "$UP_DIR/status-down.out" \
     || { cat "$UP_DIR/status-down.out"; fail "status missing 'Router:  DOWN' after down"; }
 echo "ok (up -> status 0 -> idempotent up -> down -> status nonzero)"
 
+# -------------------------------- opt-in: API-key profile live contract
+# The script always runs in dry-run mode so its public entrypoint is covered.
+# The networked contract requires both an explicit opt-in and a caller-supplied
+# test key. It creates a separate CLI store and starts only scratch processes.
+step "API-key profile live contract"
+"$REPO_DIR/scripts/tests/test_api_key_profile_live.sh" --dry-run \
+    > "$TMPDIR_CHECK/api-key-profile-live-dry-run.out" \
+    || fail "API-key profile live contract dry run"
+if [[ "$OFFLINE" == 1 ]]; then
+    echo "skipped (--offline; dry run passed)"
+elif [[ "${BASETEN_SWITCH_RUN_API_KEY_PROFILE_LIVE:-}" == "1" ]]; then
+    [[ -n "${BASETEN_SWITCH_TEST_API_KEY:-}" ]] \
+        || fail "BASETEN_SWITCH_TEST_API_KEY is required for the opted-in live contract"
+    env BASETEN_SWITCH_TEST_BINARY="$GW_DIR/bin/baseten-switch" \
+        "$REPO_DIR/scripts/tests/test_api_key_profile_live.sh" \
+        || fail "API-key profile live contract"
+else
+    echo "skipped (set BASETEN_SWITCH_RUN_API_KEY_PROFILE_LIVE=1 and BASETEN_SWITCH_TEST_API_KEY to opt in; dry run passed)"
+fi
+
 printf '\nALL CHECKS PASSED\n'

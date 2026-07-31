@@ -113,7 +113,7 @@ final class StatsTests: XCTestCase {
           "uptime_seconds": 12, "version": "v0.2.1",
           "config_path": "/tmp/live/gateway.yaml",
           "global_routing_enabled": true,
-          "auth": {"signed_in": true, "profile": "user@example",
+          "auth": {"signed_in": true, "auth_type": "api_key", "profile": "example-profile",
                    "fallback_enabled": true, "fallback_in_use": false,
                    "health": "ok", "last_refresh_error": "",
                    "last_refresh_error_at": "", "last_refresh_ok_at": ""},
@@ -124,7 +124,8 @@ final class StatsTests: XCTestCase {
         XCTAssertEqual(snap.configPath, "/tmp/live/gateway.yaml")
         XCTAssertTrue(snap.globalRoutingEnabled)
         XCTAssertEqual(snap.auth?.signedIn, true)
-        XCTAssertEqual(snap.auth?.profile, "user@example")
+        XCTAssertEqual(snap.auth?.authType, "api_key")
+        XCTAssertEqual(snap.auth?.profile, "example-profile")
         XCTAssertEqual(snap.auth?.fallbackEnabled, true)
         XCTAssertEqual(snap.auth?.fallbackInUse, false)
         XCTAssertEqual(snap.auth?.health, "ok")
@@ -252,6 +253,7 @@ final class StatsTests: XCTestCase {
 
         // Absent fields decode to empty strings, not nil.
         let old = AdminStatusSnapshot(dict: decode(#"{"auth": {"signed_in": true}}"#))
+        XCTAssertEqual(old.auth?.authType, "")
         XCTAssertEqual(old.auth?.health, "")
         XCTAssertEqual(old.auth?.lastRefreshError, "")
 

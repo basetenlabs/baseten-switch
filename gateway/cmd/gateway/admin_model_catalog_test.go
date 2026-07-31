@@ -469,6 +469,71 @@ func TestAdminModelCatalogSignedOutDoesNotUseAPIKeyFallback(t *testing.T) {
 	}
 }
 
+func TestAdminModelCatalogUsesSelectedAPIKeyProfile(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Api-Key selected-profile-key" {
+			t.Fatalf("Authorization = %q, want selected API-key profile", got)
+		}
+		_, _ = io.WriteString(w, `{"items":[{"name":"example/model","display_name":"Example"}],"pagination":{"has_more":false,"cursor":null}}`)
+	}))
+	defer upstream.Close()
+
+	g := &Gateway{
+		cfg: Config{
+			OAuthHost:      upstream.URL,
+			BasetenKey:     "environment-fallback-must-not-win",
+			APIKeyFallback: true,
+		},
+		client:           upstream.Client(),
+		pricing:          pricing.New(),
+		cliProfileAPIKey: "selected-profile-key",
+	}
+	mux := http.NewServeMux()
+	g.registerAdmin(mux)
+	g.adminServer = &http.Server{Handler: mux}
+
+	recorder, response := modelCatalogRequest(t, g, http.MethodGet, nil)
+	if recorder.Code != http.StatusOK || response.State != "ready" || len(response.Models) != 1 {
+		t.Fatalf("status = %d response = %+v, want ready catalog", recorder.Code, response)
+	}
+}
+
+func TestAdminModelCatalogAPIKeyAuthorizationOutcomes(t *testing.T) {
+	for _, test := range []struct {
+		status int
+		state  string
+		reason string
+		error  string
+	}{
+		{http.StatusUnauthorized, "signed_out", modelCatalogSignedOutReasonRejected, ""},
+		{http.StatusForbidden, "error", "", "The selected Baseten credential does not have access to the model catalog"},
+	} {
+		t.Run(http.StatusText(test.status), func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, "synthetic upstream secret", test.status)
+			}))
+			defer upstream.Close()
+			g := &Gateway{
+				cfg:              Config{OAuthHost: upstream.URL},
+				client:           upstream.Client(),
+				pricing:          pricing.New(),
+				cliProfileAPIKey: "selected-profile-key",
+			}
+			mux := http.NewServeMux()
+			g.registerAdmin(mux)
+			g.adminServer = &http.Server{Handler: mux}
+
+			recorder, response := modelCatalogRequest(t, g, http.MethodGet, nil)
+			if response.State != test.state || response.SignedOutReason != test.reason || response.Error != test.error {
+				t.Fatalf("response = %+v", response)
+			}
+			if strings.Contains(recorder.Body.String(), "synthetic upstream secret") || strings.Contains(recorder.Body.String(), "selected-profile-key") {
+				t.Fatal("catalog response leaked credential or upstream body")
+			}
+		})
+	}
+}
+
 func TestAdminModelCatalogUnauthorizedMeansExpiredSession(t *testing.T) {
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "token=upstream-secret", http.StatusUnauthorized)
@@ -645,7 +710,13 @@ func TestAdminModelCatalogSanitizesUpstreamFailures(t *testing.T) {
 			if response.State != "error" {
 				t.Fatalf("response = %+v, want error", response)
 			}
-			assertEmptyModelCatalogError(t, response)
+			if tt.name == "non-success response" {
+				if response.Error != "The selected Baseten credential does not have access to the model catalog" {
+					t.Fatalf("error = %q, want stable access-denied guidance", response.Error)
+				}
+			} else {
+				assertEmptyModelCatalogError(t, response)
+			}
 			if containsAny(recorder.Body.String(), "upstream-secret", "token=", "401") {
 				t.Fatalf("response leaked upstream details: %s", recorder.Body.String())
 			}

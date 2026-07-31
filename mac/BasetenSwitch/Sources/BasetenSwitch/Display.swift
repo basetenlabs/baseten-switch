@@ -89,6 +89,8 @@ func liveModelCatalogSignedOutMessage(
         return "Sign in to Baseten to load Model APIs."
     case .sessionExpired:
         return "Your Baseten session expired. Sign in again to load Model APIs."
+    case .credentialRejected:
+        return "Your Baseten API key was rejected. Update it and try again."
     }
 }
 

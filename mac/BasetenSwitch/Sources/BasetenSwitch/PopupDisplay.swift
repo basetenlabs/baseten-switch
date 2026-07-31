@@ -48,7 +48,7 @@ func versionSkewNote(routerVersion: String, cliVersion: String) -> String? {
 }
 
 /// Auth line from the admin status auth block. Signed in shows the
-/// OAuth profile; fallback-in-use is appended (or shown alone when not
+/// selected profile and credential type; fallback-in-use is appended (or shown alone when not
 /// signed in) so degraded auth is visible where the controls are.
 /// Health overlays (oauth-expiry spike): "refresh_failed" means the
 /// token endpoint rejected the stored credential, so every
@@ -63,10 +63,13 @@ func authLineLabel(auth: AuthStatus?) -> String {
         return "Auth: reauthentication required"
     }
     // signed_in is store presence; health "signed_out" is the gateway
-    // holding no OAuth client. Either signal renders the
+    // holding no usable selected-profile credential. Either signal renders the
     // not-signed-in presentation.
     if auth.signedIn && auth.health != "signed_out" {
-        let who = auth.profile.isEmpty ? "OAuth" : "\(auth.profile) OAuth"
+        // Routers predating auth_type only supported OAuth profiles, so an
+        // omitted or unknown value retains the mixed-version OAuth label.
+        let kind = auth.authType == "api_key" ? "API key" : "OAuth"
+        let who = auth.profile.isEmpty ? kind : "\(auth.profile) \(kind)"
         if auth.fallbackInUse {
             return "Auth: \(who), API-key fallback in use"
         }

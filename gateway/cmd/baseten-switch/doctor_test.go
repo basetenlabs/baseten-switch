@@ -66,6 +66,11 @@ type doctorFixtureCfg struct {
 	// authHealth sets the health field the fake admin serves at
 	// /v1/admin/auth/status ("-" omits the required field).
 	authHealth string
+	// apiKeyProfile makes the selected local profile a readable API-key
+	// profile. routerSignedOut independently models a stale router that has
+	// not loaded that credential.
+	apiKeyProfile   bool
+	routerSignedOut bool
 	// authLastError sets last_refresh_error alongside authHealth.
 	authLastError string
 	// basetenVersions writes one fake baseten CLI per entry (each in
@@ -85,8 +90,11 @@ type doctorFixtureCfg struct {
 	// client, requested model, and status), emulating the router's
 	// write. Empty probeTelRoute = no row (door-fallback case, or the
 	// no-row skip case).
-	probeTelRoute     string
-	probeTelEffective string
+	probeTelRoute        string
+	probeTelEffective    string
+	probeFallbackTrigger string
+	probeStatus          int
+	probeError           string
 	// probeConcurrentModel, when non-empty, makes the fake door append a
 	// second v1 event AFTER the probe's event: a concurrent harness
 	// request completing just behind the probe, the misattribution
@@ -228,7 +236,8 @@ func newDoctorFixture(t *testing.T, mut func(*doctorFixtureCfg)) *doctorFixture 
 				healthPart = fmt.Sprintf(`"health":%q,"last_refresh_error":%s,"last_refresh_error_at":"2026-07-13T09:55:00Z",`,
 					cfg.authHealth, errJSON)
 			}
-			fmt.Fprintf(w, `{"signed_in":true,%s"profile":"doc","fallback_enabled":false,"fallback_in_use":false,"email":"doc@example.com"}`, healthPart)
+			signedIn := !cfg.routerSignedOut
+			fmt.Fprintf(w, `{"signed_in":%t,%s"profile":"doc","fallback_enabled":false,"fallback_in_use":false,"email":"doc@example.com"}`, signedIn, healthPart)
 		})
 		srv := httptest.NewServer(mux)
 		t.Cleanup(srv.Close)
@@ -254,18 +263,27 @@ func newDoctorFixture(t *testing.T, mut func(*doctorFixtureCfg)) *doctorFixture 
 			if cfg.doorProbe != "" && r.Method == http.MethodPost && r.URL.Path == "/v1/messages" {
 				// Emulate the router's telemetry write for the probe,
 				// then answer with the door's serving marker header.
+				probeStatus := cfg.probeStatus
+				if probeStatus == 0 {
+					probeStatus = http.StatusOK
+				}
 				if cfg.probeTelRoute != "" {
 					completedAt := time.Now()
-					events := []telemetry.EventV1{doctorTestTelemetryEvent(
+					probeEvent := doctorTestTelemetryEvent(
 						completedAt,
 						1,
 						"claude-code",
 						cfg.probeTelRoute,
 						cfg.probeTelEffective,
 						doctorProbeRequestModel("anthropic"),
-						http.StatusOK,
+						probeStatus,
 						false,
-					)}
+					)
+					if cfg.probeFallbackTrigger != "" {
+						trigger := cfg.probeFallbackTrigger
+						probeEvent.Fallback = telemetry.FallbackV1{Attempted: true, Count: 1, Trigger: &trigger}
+					}
+					events := []telemetry.EventV1{probeEvent}
 					if cfg.probeConcurrentModel != "" {
 						events = append(events, doctorTestTelemetryEvent(
 							completedAt.Add(time.Nanosecond),
@@ -286,7 +304,12 @@ func newDoctorFixture(t *testing.T, mut func(*doctorFixtureCfg)) *doctorFixture 
 					w.Header().Set("X-Baseten-Switch-Door", cfg.doorProbe)
 				}
 				w.Header().Set("Content-Type", "application/json")
-				fmt.Fprint(w, `{"model":"probe-model"}`)
+				w.WriteHeader(probeStatus)
+				if probeStatus >= http.StatusBadRequest {
+					fmt.Fprint(w, cfg.probeError)
+				} else {
+					fmt.Fprint(w, `{"model":"probe-model"}`)
+				}
 				return
 			}
 			http.NotFound(w, r)
@@ -387,7 +410,19 @@ func newDoctorFixture(t *testing.T, mut func(*doctorFixtureCfg)) *doctorFixture 
 	}
 
 	// Auth store.
-	if cfg.signedIn {
+	if cfg.apiKeyProfile {
+		writeAuthJSON(t, `{
+  "version": 1,
+  "current": "example-profile",
+  "profiles": {
+    "example-profile": {
+      "remote_url": "https://api.example.com",
+      "auth_type": "api_key",
+      "api_key": "synthetic-doctor-key"
+    }
+  }
+}`)
+	} else if cfg.signedIn {
 		expiry := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
 		writeAuthJSON(t, fmt.Sprintf(`{
   "version": 1,
@@ -1319,6 +1354,25 @@ func TestDoctorUnresolvedAPIKeyNoOAuth(t *testing.T) {
 	}
 }
 
+func TestDoctorReadableAPIKeyProfileRouterSignedOutFails(t *testing.T) {
+	newDoctorFixture(t, func(c *doctorFixtureCfg) {
+		c.apiKeyProfile = true
+		c.routerSignedOut = true
+		c.authHealth = "signed_out"
+	})
+	rep := runDoctor(doctorOpts{})
+	if c := findCheck(t, rep, "auth", "signin"); c.Status != docOK || !strings.Contains(c.Finding, "API key") {
+		t.Fatalf("signin = %+v, want readable API-key profile", c)
+	}
+	c := findCheck(t, rep, "auth", "health")
+	if c.Status != docFail || !strings.Contains(c.Finding, "example-profile") || !strings.Contains(c.Finding, "router reports signed out") {
+		t.Fatalf("health = %+v, want profile/router inconsistency failure", c)
+	}
+	if rep.FirstFailure != "auth/health" {
+		t.Fatalf("first failure = %q, want auth/health", rep.FirstFailure)
+	}
+}
+
 func TestDoctorJSONShape(t *testing.T) {
 	newDoctorFixture(t, func(c *doctorFixtureCfg) {
 		c.settingsJSON = `{"permissions":{}}`
@@ -1984,6 +2038,62 @@ func TestDoctorProbeDoorFallbackFails(t *testing.T) {
 	}
 	if rep.ExitCode != 1 {
 		t.Errorf("exit = %d, want 1 (a fallback-served probe must fail the chain)", rep.ExitCode)
+	}
+}
+
+func TestDoctorFailedProbeNamesDoorFallback(t *testing.T) {
+	fx := newDoctorFixture(t, func(c *doctorFixtureCfg) {
+		c.doorProbe = "fallback"
+		c.probeStatus = http.StatusUnauthorized
+		c.probeError = `{"type":"error","error":{"message":"x-api-key header is required"}}`
+	})
+	rep := runDoctor(doctorOpts{probe: true, yes: true, timeoutSec: 5})
+	probe := findCheck(t, rep, "e2e", "probe:"+fx.doorPort)
+	if probe.Status != docFail || !strings.Contains(probe.Finding, "status 401, served via fallback") {
+		t.Fatalf("probe = %+v, want failed fallback attribution", probe)
+	}
+	routeCheck := findCheck(t, rep, "e2e", "route:"+fx.doorPort)
+	if routeCheck.Status != docFail || !strings.Contains(routeCheck.Finding, "native failover served it") || !strings.Contains(routeCheck.Finding, `"baseten"`) {
+		t.Fatalf("route = %+v, want configured-versus-fallback attribution", routeCheck)
+	}
+}
+
+func TestDoctorFailedProbeUsesRouterTelemetry(t *testing.T) {
+	fx := newDoctorFixture(t, func(c *doctorFixtureCfg) {
+		c.doorProbe = "router"
+		c.probeStatus = http.StatusServiceUnavailable
+		c.probeError = `{"error":"synthetic upstream failure"}`
+		c.probeTelRoute = "baseten"
+		c.probeTelEffective = "anthropic"
+		c.probeFallbackTrigger = "http_503\nunsafe-detail"
+	})
+	rep := runDoctor(doctorOpts{probe: true, yes: true, timeoutSec: 5})
+	probe := findCheck(t, rep, "e2e", "probe:"+fx.doorPort)
+	if probe.Status != docFail || !strings.Contains(probe.Finding, "status 503, served via router") {
+		t.Fatalf("probe = %+v, want failed router attribution", probe)
+	}
+	routeCheck := findCheck(t, rep, "e2e", "route:"+fx.doorPort)
+	for _, want := range []string{`route "anthropic"`, `configured route is "baseten"`, `fallback trigger "http_503 unsafe-detail"`} {
+		if routeCheck.Status != docFail || !strings.Contains(routeCheck.Finding, want) {
+			t.Fatalf("route = %+v, want safe telemetry detail %q", routeCheck, want)
+		}
+	}
+	if strings.Contains(routeCheck.Finding, "\n") {
+		t.Fatalf("route finding contains unsafe newline: %q", routeCheck.Finding)
+	}
+}
+
+func TestDoctorFailedProbeReachedConfiguredRoute(t *testing.T) {
+	fx := newDoctorFixture(t, func(c *doctorFixtureCfg) {
+		c.doorProbe = "router"
+		c.probeStatus = http.StatusUnauthorized
+		c.probeError = `{"error":"credential rejected"}`
+		c.probeTelRoute = "baseten"
+	})
+	rep := runDoctor(doctorOpts{probe: true, yes: true, timeoutSec: 5})
+	routeCheck := findCheck(t, rep, "e2e", "route:"+fx.doorPort)
+	if routeCheck.Status != docOK || !strings.Contains(routeCheck.Finding, "failed probe reached the configured route (baseten), status 401") {
+		t.Fatalf("route = %+v, want successful attribution of failed probe", routeCheck)
 	}
 }
 

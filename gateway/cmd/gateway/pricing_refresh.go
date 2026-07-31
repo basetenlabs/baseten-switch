@@ -196,7 +196,7 @@ func (g *Gateway) stopCatalogRefresh() {
 // holding configuration, auth, routing, or pricing publication locks.
 func (g *Gateway) refreshCatalogOnce(parent context.Context) {
 	cfg := g.runtimeConfig()
-	client, authorization, ok := g.catalogRequestClient(cfg)
+	client, authorization, ok := g.catalogRequestClient()
 	if !ok {
 		return
 	}
@@ -243,15 +243,9 @@ func (g *Gateway) refreshCatalogOnce(parent context.Context) {
 		metadata.ModelCount, metadata.PricedModelCount, metadata.Revision)
 }
 
-func (g *Gateway) catalogRequestClient(cfg Config) (*http.Client, string, bool) {
-	g.authMu.Lock()
-	oauthClient := g.oauthClient
-	g.authMu.Unlock()
-	if oauthClient != nil {
-		return oauthClient, "", true
-	}
-	if cfg.APIKeyFallback && cfg.BasetenKey != "" {
-		return g.client, "Bearer " + cfg.BasetenKey, true
+func (g *Gateway) catalogRequestClient() (*http.Client, string, bool) {
+	if selected, ok := g.basetenAuth(); ok {
+		return selected.client, selected.authorization(), true
 	}
 	return nil, "", false
 }

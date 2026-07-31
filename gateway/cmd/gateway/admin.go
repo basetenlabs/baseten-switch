@@ -551,7 +551,7 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 			globalEnabled = *state.file.Global.RoutingEnabled
 		}
 	}
-	signedIn, fallbackInUse := g.authState()
+	signedIn, authType, fallbackInUse := g.authState()
 	ah := g.authHealth()
 	writeJSON(w, 200, map[string]any{
 		"router_pid":          os.Getpid(),
@@ -579,6 +579,7 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 		"model_catalog": g.modelCatalogHealthJSON(),
 		"auth": map[string]any{
 			"signed_in":             signedIn,
+			"auth_type":             authType,
 			"health":                ah.Health,
 			"last_refresh_error":    ah.LastError,
 			"last_refresh_error_at": rfc3339OrEmpty(ah.LastErrorAt),
