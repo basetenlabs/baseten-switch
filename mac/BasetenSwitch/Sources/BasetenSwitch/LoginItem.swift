@@ -178,18 +178,47 @@ enum LoginItem {
 
 // MARK: - Headless CLI one-shot mode
 
-/// Whether a post-unregister status counts as removed for the CLI
+/// Whether an unregister attempt counts as removed for the CLI
 /// uninstall path. Pure so the decision table is unit-testable; the
 /// SMAppService calls stay in LoginItemCLI.run (the LoginItem pattern).
-/// Only .notRegistered confirms the desired end state. Apple's public
-/// contract describes .notFound as an error in which the service could
-/// not be found, not as confirmation that unregister completed, so the
-/// destructive uninstall path must fail closed on that status.
-func loginItemUnregisterAccepted(_ status: SMAppService.Status) -> Bool {
-    switch status {
+///
+/// Only .notRegistered confirms unregistration completed. Apple's
+/// public contract describes .notFound as an error in which the service
+/// could not be found, not as confirmation, so a registration that was
+/// live or pending before the call and reads .notFound after it fails
+/// closed: something went wrong and deleting the bundle could strand a
+/// login item macOS still tries to launch.
+///
+/// .notFound is accepted only when the status before the call already
+/// ruled out a live registration, which is the separate never-resolvable
+/// case. Beta builds are ad-hoc signed (scripts/build-menubar.sh), so an
+/// upgrade gives the bundle a new code identity and macOS stops
+/// resolving any registration for it. No unregister() this bundle can
+/// make will ever move that status, so failing closed does not protect
+/// the user — it strands the app bundle on disk on top of a registration
+/// we already cannot reach, and `uninstall` can never succeed. Removing
+/// a bundle that had no live registration going in cannot take down a
+/// login item that was reachable in the first place.
+func loginItemUnregisterAccepted(before: SMAppService.Status, after: SMAppService.Status) -> Bool {
+    switch after {
     case .notRegistered:
         return true
-    case .enabled, .requiresApproval, .notFound:
+    case .notFound:
+        return loginItemRegistrationAbsent(before)
+    case .enabled, .requiresApproval:
+        return false
+    @unknown default:
+        return false
+    }
+}
+
+/// Whether a status rules out a live or pending login-item registration.
+/// An unknown future status does not, so it fails closed.
+func loginItemRegistrationAbsent(_ status: SMAppService.Status) -> Bool {
+    switch status {
+    case .notRegistered, .notFound:
+        return true
+    case .enabled, .requiresApproval:
         return false
     @unknown default:
         return false
@@ -210,23 +239,22 @@ enum LoginItemCLI {
         CommandLine.arguments.contains(flag)
     }
 
-    /// Unregisters and exits: 0 only when the post-call status confirms
-    /// .notRegistered, 1 when removal is not confirmed. Never returns.
+    /// Unregisters and exits: 0 when the status pair confirms no live
+    /// registration is left behind, 1 when removal is not confirmed.
+    /// Never returns.
     static func run() -> Never {
         let before = LoginItem.status
         do {
             try SMAppService.mainApp.unregister()
         } catch {
-            // The status re-read below decides the outcome. A thrown
-            // call followed by .notFound is not accepted because
-            // neither result confirms that unregistration completed.
+            // The status pair below decides the outcome, not the throw.
             FileHandle.standardError.write(Data(
                 "[BasetenSwitch] unregister threw (deciding by status): \(error)\n".utf8))
         }
         let after = LoginItem.status
-        guard loginItemUnregisterAccepted(after) else {
+        guard loginItemUnregisterAccepted(before: before, after: after) else {
             FileHandle.standardError.write(Data(
-                "[BasetenSwitch] Start at Login still \(loginItemStatusName(after)) after unregister\n".utf8))
+                "[BasetenSwitch] Start at Login \(loginItemStatusName(before)) -> \(loginItemStatusName(after)); removal not confirmed\n".utf8))
             exit(1)
         }
         FileHandle.standardOutput.write(Data(
