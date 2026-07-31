@@ -256,8 +256,49 @@ See [TESTING.md](TESTING.md) for test layers and isolation requirements.
 
 ## Nix source build
 
-The Nix flake is an alternate source build for Linux and Apple Silicon macOS.
-It does not include the signed Mac app or install the Baseten CLI dependency:
+The Nix flake is an alternate source build of the `baseten-switch` CLI and
+gateway for Linux (x86_64 and aarch64) and Apple Silicon macOS. It does not
+include the signed Mac app or install the Baseten CLI dependency. Homebrew
+is the supported path for the complete macOS product.
+
+### Home Manager
+
+The preferred Nix install is declarative. Add the flake input:
+
+```nix
+inputs.baseten-switch.url = "github:basetenlabs/baseten-switch";
+```
+
+Then reference the package in your Home Manager configuration:
+
+```nix
+home.packages = [
+  inputs.baseten-switch.packages.${pkgs.system}.default
+];
+```
+
+Alternatively, apply the overlay to make `pkgs.baseten-switch` available:
+
+```nix
+nixpkgs.overlays = [ inputs.baseten-switch.overlays.default ];
+home.packages = [ pkgs.baseten-switch ];
+```
+
+The same input and overlay work in NixOS and nix-darwin configurations. The
+flake pins its own `nixpkgs`; adding
+`inputs.baseten-switch.inputs.nixpkgs.follows = "nixpkgs"` avoids a second
+nixpkgs download, but the followed nixpkgs must carry the Go toolchain
+required by `gateway/go.mod`.
+
+After a switch to a new version, restart the locally running components:
+
+```sh
+baseten-switch up
+```
+
+### nix profile
+
+The imperative install without Home Manager:
 
 ```sh
 nix profile install github:basetenlabs/baseten-switch#baseten-switch
@@ -270,7 +311,13 @@ nix profile upgrade --refresh baseten-switch
 baseten-switch up
 ```
 
-Homebrew is the supported path for the complete macOS product.
+### Development shells
+
+`nix develop` provides the Go toolchain for gateway development on every
+supported system. On Apple Silicon macOS, `nix develop .#menubar` provides
+an experimental nixpkgs Swift toolchain for building the menu bar app
+without Xcode; `scripts/build-menubar.sh` with the Xcode toolchain remains
+the supported app build.
 
 ## License
 

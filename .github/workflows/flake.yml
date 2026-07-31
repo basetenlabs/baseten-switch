@@ -33,6 +33,11 @@ jobs:
       - name: Build and test
         run: nix build -L .#baseten-switch
 
+      # Builds the flake checks: the package plus the full gateway test
+      # suite (the package alone only tests cmd/baseten-switch).
+      - name: Flake checks
+        run: nix flake check -L
+
       - name: Version stamp
         run: ./result/bin/baseten-switch --version
 
@@ -49,6 +54,9 @@ jobs:
 
       - name: Build and test
         run: nix build -L .#baseten-switch
+
+      - name: Flake checks
+        run: nix flake check -L
 
       - name: Version stamp
         run: ./result/bin/baseten-switch --version
