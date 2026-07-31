@@ -109,15 +109,13 @@ final class LoginItemTests: XCTestCase {
 
     // MARK: - CLI uninstall acceptance
 
-    // The headless --unregister-login-item mode exits 0 exactly when no
-    // live registration can remain: never-registered and the stale
-    // .notFound both qualify (nothing points at the about-to-be-deleted
-    // bundle), while a live or pending registration fails the run so
-    // the CLI keeps the bundle and prints the manual path. An unknown
-    // future status fails closed.
+    // The headless --unregister-login-item mode exits 0 only when
+    // .notRegistered confirms removal. Apple's public contract defines
+    // .notFound as a lookup error, not successful unregistration, so it
+    // fails closed along with live, pending, and unknown future states.
     func testLoginItemUnregisterAccepted() throws {
         XCTAssertTrue(loginItemUnregisterAccepted(.notRegistered))
-        XCTAssertTrue(loginItemUnregisterAccepted(.notFound))
+        XCTAssertFalse(loginItemUnregisterAccepted(.notFound))
         XCTAssertFalse(loginItemUnregisterAccepted(.enabled))
         XCTAssertFalse(loginItemUnregisterAccepted(.requiresApproval))
         let future = try XCTUnwrap(SMAppService.Status(rawValue: 999))

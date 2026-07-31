@@ -1472,11 +1472,16 @@ func doctorE2EChecks(add addCheck, o doctorOpts, doorSpecs []door.Config, doorUp
 // the harness path end to end. The probe deliberately carries no
 // provider credential, so on a native-configured route (routing off, or
 // a model_routes native pin for the probe's model) the provider's own
-// 401/403 is the expected answer: it could only have come back through
-// a working door→router→provider relay. Only an HTTP response from the
-// far end qualifies — a transport error (status 0) still fails.
+// 401/403 is the expected answer when the door confirms that the router
+// served it. The explicit router stamp prevents the door's native
+// failover from making a broken router path look healthy. Only an HTTP
+// response from the far end qualifies; a transport error (status 0)
+// still fails.
 func doctorProbeNativeAuthOK(f *config.File, routerTarget, shape string, p *doctorProbeResult) bool {
 	if p.Status != http.StatusUnauthorized && p.Status != http.StatusForbidden {
+		return false
+	}
+	if p.DoorVia != "router" {
 		return false
 	}
 	cli, ok := doctorClientFor(f, routerTarget, shape)
