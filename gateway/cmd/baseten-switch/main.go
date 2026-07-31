@@ -104,6 +104,8 @@ func dispatch(args []string) int {
 		return cmdClaude(args[1:])
 	case "codex":
 		return cmdCodex(args[1:])
+	case "pi":
+		return cmdPi(args[1:])
 	case "menubar":
 		return cmdMenubar(args[1:])
 	default:
@@ -295,9 +297,10 @@ Plain doctor is read-only. --fix cannot be combined with --json.
   baseten-switch claude route [<family> <target|default>]
   baseten-switch claude reasoning baseten <model> off|follow-harness|effort <value>|default
 
-on points ANTHROPIC_BASE_URL in ~/.claude/settings.json at the gateway door
-and backs up the prior value. off restores it exactly when possible, or strips
-only gateway-owned values after drift. start and stop alias on and off.
+on sets ANTHROPIC_BASE_URL, CLAUDE_CODE_ATTRIBUTION_HEADER, and
+ENABLE_TOOL_SEARCH in ~/.claude/settings.json, and backs up prior values. off
+restores them exactly when possible, or strips only values proven to have been
+written by Switch after drift. start and stop alias on and off.
 
 subagents selects a configured alias, raw Baseten slug, or native model for
 Task and sidechain requests. "on" re-enables the kept model. "inherit" leaves
@@ -332,6 +335,24 @@ active profiled sessions use the new target without a Codex restart.
 
 reasoning configures a catalog-validated, Codex-only reasoning policy for the
 final Baseten model.
+`},
+	{"pi", "Install the direct Baseten provider for Pi", `Usage:
+  baseten-switch pi install
+  baseten-switch pi status
+  baseten-switch pi uninstall
+
+install adds the direct Baseten provider to Pi using the account-visible model
+catalog from "baseten model-api list --output json". Exact model IDs are
+enriched with reasoning and text/image input capabilities from models.dev.
+Unmatched models use conservative defaults and are reported. The command
+requires BASETEN_API_KEY in Pi's environment, but writes only the literal
+$BASETEN_API_KEY reference. It does not start the gateway, install services,
+open the macOS app, or change any other harness configuration.
+
+status reports whether the managed provider is installed and healthy.
+uninstall removes only the managed Baseten provider. The default Pi agent
+directory is ~/.pi/agent. A nonempty PI_CODING_AGENT_DIR overrides it and may
+begin with ~.
 `},
 }
 

@@ -837,6 +837,11 @@ func TestClaudeOffRestoresBaseURLStripsSubagent(t *testing.T) {
 	}
 	bak := loadBackup(t, a)
 	bak.WrittenHash = sha256Hex(newRaw)
+	_, snap, err := readClaudeSettings(a.settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordClaudeBackupFile(bak, snap)
 	if err := saveClaudeBackup(a.backupPath, bak); err != nil {
 		t.Fatal(err)
 	}

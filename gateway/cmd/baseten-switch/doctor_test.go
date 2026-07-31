@@ -386,7 +386,7 @@ func newDoctorFixture(t *testing.T, mut func(*doctorFixtureCfg)) *doctorFixture 
 				modelEnvPart += fmt.Sprintf(`,%q:%q`, k, v)
 			}
 		}
-		settingsJSON = fmt.Sprintf(`{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:%s"%s%s}}`, fx.doorPort, subagentEnvPart, modelEnvPart)
+		settingsJSON = fmt.Sprintf(`{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:%s","CLAUDE_CODE_ATTRIBUTION_HEADER":"0","ENABLE_TOOL_SEARCH":"true"%s%s}}`, fx.doorPort, subagentEnvPart, modelEnvPart)
 	}
 	if err := os.WriteFile(fx.settings, []byte(settingsJSON), 0o600); err != nil {
 		t.Fatal(err)
@@ -567,7 +567,8 @@ func TestDoctorAllGreen(t *testing.T) {
 	for _, want := range [][2]string{
 		{"config", "load"}, {"auth", "signin"}, {"router", "client:claude-code"},
 		{"door", "doorz:" + fx.doorPort}, {"door", "wiring:" + fx.doorPort},
-		{"claude", "base_url"}, {"claude", "subagents"}, {"claude", "subagent_env"},
+		{"claude", "base_url"}, {"claude", "attribution_header"}, {"claude", "tool_search"},
+		{"claude", "subagents"}, {"claude", "subagent_env"},
 		{"claude", "model_routes"}, {"claude", "model_env"},
 		{"claude", "backup"}, {"telemetry", "log"}, {"telemetry", "freshness"}, {"telemetry", "logs"},
 	} {
@@ -637,6 +638,51 @@ func TestDoctorClaudeWrongPort(t *testing.T) {
 	if rep.FirstFailure != "claude/base_url" {
 		t.Errorf("first_failure = %q", rep.FirstFailure)
 	}
+}
+
+func TestDoctorClaudeManagedEnvKnobsRequireExactValues(t *testing.T) {
+	t.Run("missing", func(t *testing.T) {
+		fx := newDoctorFixture(t, nil)
+		root := readTree(t, fx.settings)
+		env := root["env"].(map[string]any)
+		delete(env, claudeAttributionEnvKey)
+		delete(env, claudeToolSearchEnvKey)
+		b, _ := json.Marshal(root)
+		if err := os.WriteFile(fx.settings, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		rep := runDoctor(doctorOpts{})
+		for _, name := range []string{"attribution_header", "tool_search"} {
+			c := findCheck(t, rep, "claude", name)
+			if c.Status != docFail || !strings.Contains(c.Finding, "missing") {
+				t.Errorf("%s = %+v, want missing failure", name, c)
+			}
+			if len(c.fixArgv) != 2 || c.fixArgv[0] != "claude" || c.fixArgv[1] != "on" {
+				t.Errorf("%s fixArgv = %v, want [claude on]", name, c.fixArgv)
+			}
+		}
+	})
+	t.Run("wrong values", func(t *testing.T) {
+		fx := newDoctorFixture(t, nil)
+		root := readTree(t, fx.settings)
+		env := root["env"].(map[string]any)
+		env[claudeAttributionEnvKey] = "1"
+		env[claudeToolSearchEnvKey] = "auto"
+		b, _ := json.Marshal(root)
+		if err := os.WriteFile(fx.settings, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		rep := runDoctor(doctorOpts{})
+		for name, want := range map[string]string{
+			"attribution_header": `"0"`,
+			"tool_search":        `"true"`,
+		} {
+			c := findCheck(t, rep, "claude", name)
+			if c.Status != docFail || !strings.Contains(c.Finding, "want "+want) {
+				t.Errorf("%s = %+v, want exact-value failure for %s", name, c, want)
+			}
+		}
+	})
 }
 
 func TestDoctorShellEnvOverridesSettings(t *testing.T) {
@@ -1170,7 +1216,7 @@ func TestDoctorClaudeEarlyExitShapes(t *testing.T) {
 		// fails inside doctorClaudeChecks.
 		t.Setenv("BASETEN_SWITCH_CONFIG_PATH", filepath.Join(t.TempDir(), "missing.yaml"))
 		rep := runDoctor(doctorOpts{})
-		for _, name := range []string{"settings", "base_url", "shell_env", "subagents", "model_routes", "model_env", "backup"} {
+		for _, name := range []string{"settings", "base_url", "attribution_header", "tool_search", "shell_env", "subagents", "model_routes", "model_env", "backup"} {
 			if c := findCheck(t, rep, "claude", name); c.Status != docSkip {
 				t.Errorf("claude/%s = %+v, want skip on the adapter-error path", name, c)
 			}
@@ -1443,8 +1489,8 @@ func TestDoctorFixLoopCap(t *testing.T) {
 	fx := newDoctorFixture(t, nil)
 	liveAdmin := os.Getenv("BASETEN_SWITCH_ADMIN_ADDR")
 	closedAdmin := closedPortAddr(t)
-	goodSettings := fmt.Sprintf(`{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:%s"}}`, fx.doorPort)
-	badSettings := `{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:1"}}`
+	goodSettings := fmt.Sprintf(`{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:%s","CLAUDE_CODE_ATTRIBUTION_HEADER":"0","ENABLE_TOOL_SEARCH":"true"}}`, fx.doorPort)
+	badSettings := `{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:1","CLAUDE_CODE_ATTRIBUTION_HEADER":"0","ENABLE_TOOL_SEARCH":"true"}}`
 	if err := os.WriteFile(fx.settings, []byte(badSettings), 0o600); err != nil {
 		t.Fatal(err)
 	}

@@ -779,9 +779,9 @@ func doctorDoorChecks(add addCheck, doorSpecs []door.Config, haveStatus bool, bo
 }
 
 // doctorClaudeChecks verifies the Claude Code wiring through the
-// adapter's own seams: settings parse, the settings ANTHROPIC_BASE_URL
-// targets the claude door port, the shell environment does not
-// override it wrongly (sessions inherit the shell env, which wins over
+// adapter's own seams: settings parse, the three `claude on` env
+// values are complete, the shell environment does not override the
+// base URL wrongly (sessions inherit the shell env, which wins over
 // settings), the subagent split-routing config is valid, and the
 // on-state backup is intact. f is the parsed gateway config (nil when
 // it failed to load); telPath is the pre-resolved telemetry store path
@@ -790,7 +790,7 @@ func doctorClaudeChecks(add addCheck, f *config.File, telPath string) {
 	a, err := newClaudeAdapterFromEnv()
 	if err != nil {
 		reason := fmt.Sprintf("cannot resolve the claude door port: %v", err)
-		for _, name := range []string{"settings", "base_url", "shell_env", "subagents", "model_routes", "model_env", "backup"} {
+		for _, name := range []string{"settings", "base_url", "attribution_header", "tool_search", "shell_env", "subagents", "model_routes", "model_env", "backup"} {
 			add("claude", name, docSkip, reason, "")
 		}
 		return
@@ -798,7 +798,7 @@ func doctorClaudeChecks(add addCheck, f *config.File, telPath string) {
 	root, _, existed, err := loadClaudeSettings(a.settingsPath)
 	if err != nil {
 		add("claude", "settings", docFail, err.Error(), "fix the JSON in "+a.settingsPath+" by hand")
-		for _, name := range []string{"base_url", "shell_env", "subagents"} {
+		for _, name := range []string{"base_url", "attribution_header", "tool_search", "shell_env", "subagents"} {
 			add("claude", name, docSkip, "settings unreadable", "")
 		}
 		// The model_routes/model_env checks still run: the config-validity
@@ -811,11 +811,13 @@ func doctorClaudeChecks(add addCheck, f *config.File, telPath string) {
 	}
 	var cur string
 	var curSet bool
+	var env map[string]any
 	if existed {
-		env, envErr := settingsEnv(root)
+		var envErr error
+		env, envErr = settingsEnv(root)
 		if envErr != nil {
 			add("claude", "settings", docFail, envErr.Error(), "fix the env block in "+a.settingsPath+" by hand")
-			for _, name := range []string{"base_url", "shell_env", "subagents"} {
+			for _, name := range []string{"base_url", "attribution_header", "tool_search", "shell_env", "subagents"} {
 				add("claude", name, docSkip, "settings env block unreadable", "")
 			}
 			// As above: config validity needs only gateway.yaml, and the
@@ -846,6 +848,28 @@ func doctorClaudeChecks(add addCheck, f *config.File, telPath string) {
 		add("claude", "base_url", docOK, "settings point at the door ("+cur+")", "")
 	} else {
 		add("claude", "base_url", docFail, "claude "+fnd, "baseten-switch claude on", claudeOnArgv...)
+	}
+	for _, check := range []struct {
+		name string
+		key  string
+	}{
+		{name: "attribution_header", key: claudeAttributionEnvKey},
+		{name: "tool_search", key: claudeToolSearchEnvKey},
+	} {
+		got, ok := envString(env, check.key)
+		want := a.desiredClaudeEnvValue(check.key)
+		switch {
+		case !ok:
+			add("claude", check.name, docFail,
+				fmt.Sprintf("%s is missing from %s", check.key, a.settingsPath),
+				"baseten-switch claude on", claudeOnArgv...)
+		case got != want:
+			add("claude", check.name, docFail,
+				fmt.Sprintf("%s=%q in %s, want %q", check.key, got, a.settingsPath, want),
+				"baseten-switch claude on", claudeOnArgv...)
+		default:
+			add("claude", check.name, docOK, fmt.Sprintf("%s=%q", check.key, got), "")
+		}
 	}
 
 	shell := os.Getenv(claudeManagedEnvKey)

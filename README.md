@@ -57,11 +57,42 @@ the app from the current Homebrew package.
 The app and CLI update the same configuration. You can use either interface
 without maintaining separate state.
 
+## Pi
+
+Install the direct Baseten provider for
+[Pi](https://github.com/badlogic/pi-mono) without starting Baseten Switch:
+
+```sh
+brew install basetenlabs/baseten/baseten-switch
+export BASETEN_API_KEY="<your-api-key>"
+baseten-switch pi install
+pi --provider baseten --model <model-slug>
+```
+
+`pi install` reads the visible model catalog through the Baseten CLI and adds
+only the direct `baseten` provider to Pi. It joins exact model IDs with the
+public [models.dev](https://models.dev/) catalog for reasoning and text/image
+input capabilities. Models without an exact capability match use conservative
+defaults and are reported during installation. The API key remains in the
+environment; Pi's configuration contains only a `$BASETEN_API_KEY` reference.
+The command does not create gateway configuration, install launch agents,
+start the router or front door, or change another harness profile.
+
+The Homebrew formula contains the optional Mac app archive, but this flow does
+not install the app in `~/Applications` or open it. Manage the direct provider
+without running local services:
+
+```sh
+baseten-switch pi status
+baseten-switch pi uninstall
+```
+
 ## Claude Code
 
-`baseten-switch claude on` saves the previous Claude Code setting and points
-new sessions at Baseten Switch. Restart Claude Code after enabling or
-disabling the integration.
+`baseten-switch claude on` saves the previous Claude Code environment values,
+points new sessions at Baseten Switch, enables deferred tool loading, and
+omits Claude Code's attribution block to improve gateway prompt-cache hit
+rates. Restart Claude Code after enabling or disabling the integration.
 
 Useful controls:
 

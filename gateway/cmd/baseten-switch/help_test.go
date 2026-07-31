@@ -29,6 +29,7 @@ var expectedAdvertisedCommands = []string{
 	"doctor",
 	"claude",
 	"codex",
+	"pi",
 }
 
 func TestRootHelpUsesOneLinePerAdvertisedCommand(t *testing.T) {
@@ -175,6 +176,7 @@ func TestCommandHelpRecognizesUnsafeNestedPaths(t *testing.T) {
 		{"config", "reset", "--preview-root", "--help"},
 		{"claude", "on", "--help"},
 		{"codex", "on", "-h"},
+		{"pi", "install", "--help"},
 		{"healthz", "--help"},
 		{"mutation", "reconcile", "--operation-id", "--help"},
 	} {

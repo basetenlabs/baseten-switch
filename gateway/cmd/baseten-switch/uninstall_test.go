@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -38,7 +39,7 @@ func TestUninstallDryRunIsReadOnlyAndEnumeratesActions(t *testing.T) {
 
 func TestUninstallHarnessStepsRestoreOnlyManagedState(t *testing.T) {
 	claude, claudeOut := testAdapter(t)
-	writeSettingsFile(t, claude, `{"env":{"ANTHROPIC_BASE_URL":"https://corp-proxy.example.com","OTHER":"keep"}}`)
+	writeSettingsFile(t, claude, `{"env":{"ANTHROPIC_BASE_URL":"https://corp-proxy.example.com","CLAUDE_CODE_ATTRIBUTION_HEADER":"custom-before","ENABLE_TOOL_SEARCH":"auto:25","OTHER":"keep"}}`)
 	if code := claude.on(); code != 0 {
 		t.Fatalf("claude on = %d (%s)", code, claudeOut.String())
 	}
@@ -69,6 +70,12 @@ func TestUninstallHarnessStepsRestoreOnlyManagedState(t *testing.T) {
 	if got, _ := envValue(t, claude.settingsPath, claudeManagedEnvKey); got != "https://corp-proxy.example.com" {
 		t.Errorf("Claude original value = %q", got)
 	}
+	if got, _ := envValue(t, claude.settingsPath, claudeAttributionEnvKey); got != "custom-before" {
+		t.Errorf("Claude original attribution value = %q", got)
+	}
+	if got, _ := envValue(t, claude.settingsPath, claudeToolSearchEnvKey); got != "auto:25" {
+		t.Errorf("Claude original tool-search value = %q", got)
+	}
 	if got := string(fileBytes(t, codex.overlayPath)); got != codexTestStaleOverlay {
 		t.Errorf("Codex original overlay not restored exactly:\n%s", got)
 	}
@@ -82,7 +89,7 @@ func TestUninstallHarnessStepsRestoreOnlyManagedState(t *testing.T) {
 	}
 
 	foreignClaude, _ := testAdapter(t)
-	foreignClaudeRaw := `{"env":{"ANTHROPIC_BASE_URL":"https://another.example.com"}}` + "\n"
+	foreignClaudeRaw := `{"env":{"ANTHROPIC_BASE_URL":"https://another.example.com","CLAUDE_CODE_ATTRIBUTION_HEADER":"0","ENABLE_TOOL_SEARCH":"true"}}` + "\n"
 	writeSettingsFile(t, foreignClaude, foreignClaudeRaw)
 	if code := foreignClaude.off(); code != 0 {
 		t.Fatalf("foreign claude off = %d", code)
@@ -98,6 +105,47 @@ func TestUninstallHarnessStepsRestoreOnlyManagedState(t *testing.T) {
 	}
 	if got := string(fileBytes(t, foreignCodex.overlayPath)); got != codexTestForeignOverlay {
 		t.Errorf("unowned Codex overlay changed:\n%s", got)
+	}
+}
+
+func TestUninstallClaudeRestoresThroughLinkedSettings(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symbolic-link test requires link privileges")
+	}
+	env := newRouteTestEnv(t, false)
+	target := env.settings + ".shared"
+	original := `{"env":{"ANTHROPIC_BASE_URL":"https://proxy.example.com","CLAUDE_CODE_ATTRIBUTION_HEADER":"custom-before","ENABLE_TOOL_SEARCH":"auto:25","OTHER":"keep"}}`
+	if err := os.WriteFile(target, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(env.settings); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, env.settings); err != nil {
+		t.Fatal(err)
+	}
+	linkText, err := os.Readlink(env.settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code, _, stderr := runClaudeCaptured(t, []string{"on"}); code != 0 {
+		t.Fatalf("claude on = %d (%s)", code, stderr)
+	}
+	if err := uninstallClaude(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.Readlink(env.settings); err != nil || got != linkText {
+		t.Fatalf("uninstall changed settings link: text=%q err=%v", got, err)
+	}
+	for key, want := range map[string]string{
+		claudeManagedEnvKey:     "https://proxy.example.com",
+		claudeAttributionEnvKey: "custom-before",
+		claudeToolSearchEnvKey:  "auto:25",
+		"OTHER":                 "keep",
+	} {
+		if got, ok := envValue(t, target, key); !ok || got != want {
+			t.Errorf("%s after uninstall = %q, ok=%v, want %q", key, got, ok, want)
+		}
 	}
 }
 
