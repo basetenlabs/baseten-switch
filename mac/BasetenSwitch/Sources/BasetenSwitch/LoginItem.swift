@@ -181,14 +181,15 @@ enum LoginItem {
 /// Whether a post-unregister status counts as removed for the CLI
 /// uninstall path. Pure so the decision table is unit-testable; the
 /// SMAppService calls stay in LoginItemCLI.run (the LoginItem pattern).
-/// .notFound qualifies: macOS reports it when no live registration can
-/// be tied to this bundle (never registered, or a superseded signing
-/// identity), which is exactly the desired end state for uninstall.
+/// Only .notRegistered confirms the desired end state. Apple's public
+/// contract describes .notFound as an error in which the service could
+/// not be found, not as confirmation that unregister completed, so the
+/// destructive uninstall path must fail closed on that status.
 func loginItemUnregisterAccepted(_ status: SMAppService.Status) -> Bool {
     switch status {
-    case .notRegistered, .notFound:
+    case .notRegistered:
         return true
-    case .enabled, .requiresApproval:
+    case .enabled, .requiresApproval, .notFound:
         return false
     @unknown default:
         return false
@@ -209,17 +210,16 @@ enum LoginItemCLI {
         CommandLine.arguments.contains(flag)
     }
 
-    /// Unregisters and exits: 0 when no live registration remains
-    /// (never-registered and stale .notFound both qualify), 1 when a
-    /// live or pending registration survives. Never returns.
+    /// Unregisters and exits: 0 only when the post-call status confirms
+    /// .notRegistered, 1 when removal is not confirmed. Never returns.
     static func run() -> Never {
         let before = LoginItem.status
         do {
             try SMAppService.mainApp.unregister()
         } catch {
-            // unregister() throws when no entry can be tied to this
-            // bundle; that is the desired end state, so the status
-            // re-read below — not the throw — decides the outcome.
+            // The status re-read below decides the outcome. A thrown
+            // call followed by .notFound is not accepted because
+            // neither result confirms that unregistration completed.
             FileHandle.standardError.write(Data(
                 "[BasetenSwitch] unregister threw (deciding by status): \(error)\n".utf8))
         }

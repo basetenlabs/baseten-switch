@@ -328,6 +328,12 @@ func uninstallManagedApp() error {
 	if out, err := runManagedAppCLI(appPath, menubarLoginItemCLIFlag); err != nil {
 		return manualAppRemovalError(appPath, fmt.Sprintf("the app's login-item unregister failed (%v %s)", err, out))
 	}
+	// The executable we just ran is part of the bundle being removed.
+	// Revalidate after it exits so a modified bundle is never deleted
+	// under the managed-app identity established before execution.
+	if err := verifyManagedAppBundle(appPath); err != nil {
+		return err
+	}
 	if err := os.RemoveAll(appPath); err != nil {
 		return fmt.Errorf("remove %s: %w", appPath, err)
 	}
@@ -339,25 +345,14 @@ func manualAppRemovalError(appPath, reason string) error {
 	return fmt.Errorf("manual action required: %s; open %s, turn off Start at Login, quit the app, then remove it by hand", reason, appPath)
 }
 
-// verifyManagedAppBundle proves the bundle at appPath is the Baseten
-// Switch app before the CLI drives its executable or removes it: the
-// identity fields must match the managed install (the same contract
-// validateMaterializedMenubarApp enforces at install time). Anything
-// else at the managed path is left for manual removal.
+// verifyManagedAppBundle proves the bundle at appPath satisfies the
+// same complete integrity contract used at install time before the CLI
+// drives its executable or removes it. Anything else at the managed
+// path is left for manual removal.
 func verifyManagedAppBundle(appPath string) error {
-	plistPath := filepath.Join(appPath, "Contents", "Info.plist")
-	fields := []struct {
-		key, want string
-	}{
-		{"CFBundleIdentifier", menubarBundleID},
-		{"CFBundleExecutable", menubarProcName},
-	}
-	for _, field := range fields {
-		out, err := runCmd("/usr/bin/plutil", "-extract", field.key, "raw", plistPath)
-		if err != nil || out != field.want {
-			return manualAppRemovalError(appPath,
-				fmt.Sprintf("%s does not present the managed identity (%s is %q)", appPath, field.key, out))
-		}
+	if err := validateMaterializedMenubarApp(appPath); err != nil {
+		return manualAppRemovalError(appPath,
+			fmt.Sprintf("%s does not pass managed app validation (%v)", appPath, err))
 	}
 	return nil
 }

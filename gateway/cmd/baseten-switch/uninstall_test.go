@@ -209,28 +209,46 @@ func TestUninstallLeavesAppWhenLoginItemCannotBeSafelyUnregistered(t *testing.T)
 	}
 }
 
-// stubManagedAppPlist points the runCmd seam at a plutil answer table
-// for the bundle's Info.plist keys (missing keys error, like plutil on
-// an absent entry); pgrep finds no running menubar process.
-func stubManagedAppPlist(t *testing.T, plist map[string]string) {
+// stubManagedAppCommands points the runCmd seam at a plutil answer
+// table, a code-signature result, and a pgrep result that finds no
+// running menubar process.
+func stubManagedAppCommands(t *testing.T, plist map[string]string, codesignErr error) {
 	t.Helper()
+	fields := map[string]string{
+		"CFBundleIdentifier":         menubarBundleID,
+		"CFBundleDisplayName":        "Baseten Switch",
+		"CFBundleExecutable":         menubarProcName,
+		"CFBundleShortVersionString": "0.2.0",
+	}
+	for key, value := range plist {
+		fields[key] = value
+	}
 	old := runCmd
 	runCmd = func(name string, args ...string) (string, error) {
 		switch {
 		case strings.HasSuffix(name, "plutil"):
 			// plutil -extract <key> raw <path>
 			if len(args) >= 4 {
-				if v, ok := plist[args[1]]; ok {
+				if v, ok := fields[args[1]]; ok {
 					return v, nil
 				}
 			}
 			return "", errors.New("plist key not found")
+		case strings.HasSuffix(name, "codesign"):
+			return "", codesignErr
 		case strings.HasSuffix(name, "pgrep"):
 			return "", errors.New("no processes matched")
 		}
 		return "", fmt.Errorf("unexpected command %s %v", name, args)
 	}
 	t.Cleanup(func() { runCmd = old })
+}
+
+// stubManagedAppPlist installs the valid command results shared by
+// the managed-app removal tests.
+func stubManagedAppPlist(t *testing.T, plist map[string]string) {
+	t.Helper()
+	stubManagedAppCommands(t, plist, nil)
 }
 
 func managedAppFixture(t *testing.T) string {
@@ -241,7 +259,13 @@ func managedAppFixture(t *testing.T) string {
 	menubarGOOS = "darwin"
 	t.Cleanup(func() { menubarGOOS = oldGOOS })
 	app := filepath.Join(home, "Applications", menubarAppName)
-	if err := os.MkdirAll(app, 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(app, "Contents", "MacOS"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(app, "Contents", "Info.plist"), "plist\n")
+	executable := filepath.Join(app, "Contents", "MacOS", menubarProcName)
+	writeTestFile(t, executable, "executable\n")
+	if err := os.Chmod(executable, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	return app
@@ -329,6 +353,120 @@ func TestUninstallAppManualRemovalWhenUnregisterFails(t *testing.T) {
 	}
 	if _, statErr := os.Stat(app); statErr != nil {
 		t.Fatalf("app was removed despite the failed unregister: %v", statErr)
+	}
+}
+
+func TestUninstallAppRefusesInvalidBundleBeforeExecution(t *testing.T) {
+	tests := []struct {
+		name        string
+		codesignErr error
+		breakBundle func(*testing.T, string)
+	}{
+		{
+			name:        "invalid code signature",
+			codesignErr: errors.New("code object is not signed at all"),
+		},
+		{
+			name: "symlink executable",
+			breakBundle: func(t *testing.T, app string) {
+				t.Helper()
+				executable := filepath.Join(app, "Contents", "MacOS", menubarProcName)
+				if err := os.Remove(executable); err != nil {
+					t.Fatal(err)
+				}
+				target := filepath.Join(t.TempDir(), "replacement")
+				writeTestFile(t, target, "replacement\n")
+				if err := os.Symlink(target, executable); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app := managedAppFixture(t)
+			if tt.breakBundle != nil {
+				tt.breakBundle(t, app)
+			}
+			stubManagedAppCommands(t, map[string]string{
+				"BasetenSwitchLoginItemCLI": "true",
+			}, tt.codesignErr)
+			driven := false
+			oldCLI := runManagedAppCLI
+			runManagedAppCLI = func(appPath string, args ...string) (string, error) {
+				driven = true
+				return "", nil
+			}
+			t.Cleanup(func() { runManagedAppCLI = oldCLI })
+
+			err := uninstallManagedApp()
+			if err == nil || !strings.Contains(err.Error(), "manual action required") ||
+				!strings.Contains(err.Error(), "managed app validation") {
+				t.Fatalf("app cleanup error = %v", err)
+			}
+			if driven {
+				t.Error("an invalid bundle must never be exec'd")
+			}
+			if _, statErr := os.Lstat(app); statErr != nil {
+				t.Fatalf("invalid bundle was removed: %v", statErr)
+			}
+		})
+	}
+}
+
+func TestUninstallAppRevalidatesBundleBeforeRemoval(t *testing.T) {
+	app := managedAppFixture(t)
+	fields := map[string]string{
+		"CFBundleIdentifier":         menubarBundleID,
+		"CFBundleDisplayName":        "Baseten Switch",
+		"CFBundleExecutable":         menubarProcName,
+		"CFBundleShortVersionString": "0.2.0",
+		"BasetenSwitchLoginItemCLI":  "true",
+	}
+	codesignCalls := 0
+	oldRunCmd := runCmd
+	runCmd = func(name string, args ...string) (string, error) {
+		switch {
+		case strings.HasSuffix(name, "plutil"):
+			if len(args) >= 4 {
+				if value, ok := fields[args[1]]; ok {
+					return value, nil
+				}
+			}
+			return "", errors.New("plist key not found")
+		case strings.HasSuffix(name, "codesign"):
+			codesignCalls++
+			if codesignCalls == 2 {
+				return "", errors.New("bundle changed after execution")
+			}
+			return "", nil
+		case strings.HasSuffix(name, "pgrep"):
+			return "", errors.New("no processes matched")
+		}
+		return "", fmt.Errorf("unexpected command %s %v", name, args)
+	}
+	t.Cleanup(func() { runCmd = oldRunCmd })
+	driven := false
+	oldCLI := runManagedAppCLI
+	runManagedAppCLI = func(appPath string, args ...string) (string, error) {
+		driven = true
+		return "Start at Login enabled -> notRegistered", nil
+	}
+	t.Cleanup(func() { runManagedAppCLI = oldCLI })
+
+	err := uninstallManagedApp()
+	if err == nil || !strings.Contains(err.Error(), "manual action required") ||
+		!strings.Contains(err.Error(), "code signature is invalid") {
+		t.Fatalf("app cleanup error = %v", err)
+	}
+	if !driven {
+		t.Fatal("the login-item CLI was not driven")
+	}
+	if codesignCalls != 2 {
+		t.Fatalf("codesign validation calls = %d, want 2", codesignCalls)
+	}
+	if _, statErr := os.Lstat(app); statErr != nil {
+		t.Fatalf("bundle was removed after failing revalidation: %v", statErr)
 	}
 }
 
