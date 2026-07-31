@@ -513,6 +513,13 @@ type Gateway struct {
 	// Shared auth state across all baseten-routed listeners.
 	oauthClient     *http.Client
 	oauthProfileErr error
+	// profileAPIKey holds the readable key of an api_key-type baseten
+	// CLI profile ('baseten auth login' with an API key). It is a
+	// first-class credential: served after OAuth and before the
+	// BASETEN_API_KEY env fallback. Guarded by authMu; profileAPIKeyName
+	// is the resolved profile name for status surfaces.
+	profileAPIKey     string
+	profileAPIKeyName string
 	// Credential-health state (all guarded by authMu). signed_in has
 	// always meant "a credential exists in the store"; these fields
 	// track whether that credential actually WORKS, fed by
@@ -814,21 +821,35 @@ func (g *Gateway) refreshAuth() {
 		g.oauthClient = client
 		g.authTick = tick
 		g.oauthProfileErr = nil
+		g.profileAPIKey = ""
+		g.profileAPIKeyName = ""
 	case errors.Is(err, auth.ErrNotSignedIn):
 		g.oauthClient = nil
 		g.authTick = nil
 		g.oauthProfileErr = err
+		g.profileAPIKey = ""
+		g.profileAPIKeyName = ""
 	case errors.Is(err, auth.ErrAPIKeyProfile):
 		// The baseten CLI profile authenticates with an API key, not
-		// OAuth: a valid state, served via the API-key fallback path
-		// when configured, so no failure log.
+		// OAuth. A readable key is a first-class credential ('baseten
+		// auth login' with an API key was the explicit opt-in), served
+		// after OAuth and before the BASETEN_API_KEY env fallback.
 		g.oauthClient = nil
 		g.authTick = nil
 		g.oauthProfileErr = err
+		g.profileAPIKey = ""
+		g.profileAPIKeyName = ""
+		var ak *auth.APIKeyProfileError
+		if errors.As(err, &ak) {
+			g.profileAPIKey = ak.Key
+			g.profileAPIKeyName = ak.Profile
+		}
 	default:
 		g.oauthClient = nil
 		g.authTick = nil
 		g.oauthProfileErr = err
+		g.profileAPIKey = ""
+		g.profileAPIKeyName = ""
 		fmt.Fprintf(os.Stderr, "[gateway] auth refresh failed: %v\n", err)
 	}
 	// Re-login detection: if the credential was marked dead but the
@@ -957,7 +978,11 @@ func (g *Gateway) runAuthTick(ctx context.Context) {
 func (g *Gateway) authTickPeriod() time.Duration {
 	g.authMu.Lock()
 	defer g.authMu.Unlock()
-	if g.authDead || errors.Is(g.oauthProfileErr, auth.ErrNotSignedIn) {
+	if g.authDead || errors.Is(g.oauthProfileErr, auth.ErrNotSignedIn) ||
+		errors.Is(g.oauthProfileErr, auth.ErrAPIKeyProfile) {
+		// All three states tick with a local store read only (no
+		// network), so the tight interval costs nothing and keeps
+		// login/rotation pickup fast.
 		return authTickDeadInterval
 	}
 	return authTickInterval
@@ -975,6 +1000,8 @@ func (g *Gateway) authTickOnce() {
 	tick := g.authTick
 	profile := cfg.OAuthProfile
 	signedOut := errors.Is(g.oauthProfileErr, auth.ErrNotSignedIn)
+	apiKeyProfile := errors.Is(g.oauthProfileErr, auth.ErrAPIKeyProfile)
+	curProfileKey := g.profileAPIKey
 	g.authMu.Unlock()
 	if dead {
 		// A dead credential never comes back on its own; replaying the
@@ -997,12 +1024,43 @@ func (g *Gateway) authTickOnce() {
 		// A FIRST login is otherwise invisible: with no credential at
 		// boot there is no client and no tick to notice one appearing,
 		// and auth login's SIGHUP fallback promises the router picks it
-		// up on its own. Local store read, no network.
+		// up on its own. Local store read, no network. A login can also
+		// land as an api_key-type profile (auth.Load then returns
+		// *APIKeyProfileError, not a token): that too is a credential
+		// appearing, so reload for it as well.
 		tok, _, err := auth.Load(profile)
-		if err != nil || tok == nil {
+		if err != nil {
+			var ak *auth.APIKeyProfileError
+			if errors.As(err, &ak) && ak.Key != "" {
+				fmt.Fprintf(os.Stderr, "[gateway] auth: API-key profile appeared in the store; loading it (login detected, no SIGHUP needed)\n")
+				g.refreshAuth()
+			}
+			return
+		}
+		if tok == nil {
 			return
 		}
 		fmt.Fprintf(os.Stderr, "[gateway] auth: credential appeared in the store; loading it (login detected, no SIGHUP needed)\n")
+		g.refreshAuth()
+		return
+	}
+	if apiKeyProfile {
+		// Serving with an api_key-type profile's key. Watch the store
+		// (local read, no network) for a change: a switch to OAuth, a
+		// rotated key, or a logout. Reload through the same path SIGHUP
+		// uses so the served credential tracks the store.
+		if _, _, err := auth.Load(profile); err != nil {
+			var ak *auth.APIKeyProfileError
+			if errors.As(err, &ak) && ak.Key == curProfileKey {
+				return
+			}
+			fmt.Fprintf(os.Stderr, "[gateway] auth: stored API-key profile changed; reloading credential (no SIGHUP needed)\n")
+			g.refreshAuth()
+			return
+		}
+		// err == nil: the store now holds an OAuth credential (or
+		// nothing at all after a logout); either way this key is stale.
+		fmt.Fprintf(os.Stderr, "[gateway] auth: stored credential changed from API-key profile; reloading (no SIGHUP needed)\n")
 		g.refreshAuth()
 		return
 	}
@@ -1016,13 +1074,16 @@ func (g *Gateway) authTickOnce() {
 }
 
 // authHealthLocked derives the health enum. Caller holds authMu.
-//   - signed_out:     no OAuth credential in the store
+//   - signed_out:     no credential in the store
 //   - refresh_failed: credential present but the token endpoint rejected
 //     it (dead until re-login)
 //   - error:          last refresh attempt failed transiently
-//   - ok:             credential present, no known problem
+//   - ok:             credential present, no known problem (an api_key-type
+//     profile's key counts: it has no refresh lifecycle to fail)
 func (g *Gateway) authHealthLocked() string {
 	switch {
+	case g.oauthClient == nil && g.profileAPIKey != "":
+		return "ok"
 	case g.oauthClient == nil:
 		return "signed_out"
 	case g.authDead:
@@ -1066,23 +1127,50 @@ func (g *Gateway) authState() (signedIn bool, fallbackInUse bool) {
 	g.authMu.Lock()
 	defer g.authMu.Unlock()
 	signedIn = g.oauthClient != nil
-	if !signedIn && cfg.APIKeyFallback && cfg.BasetenKey != "" {
+	if !signedIn && g.profileAPIKey == "" && cfg.APIKeyFallback && cfg.BasetenKey != "" {
 		fallbackInUse = true
 	}
 	return
 }
 
-func (g *Gateway) basetenAuthClient() (useOAuth bool, client *http.Client, fallback bool) {
+// authMode names the credential the baseten route would serve with right
+// now: "oauth", "api_key_profile" (api_key-type CLI profile),
+// "api_key_env" (BASETEN_API_KEY + BASETEN_SWITCH_API_KEY_FALLBACK), or
+// "none". Mirrors basetenAuthClient's priority order.
+func (g *Gateway) authMode() (mode string, profileName string) {
+	cfg := g.runtimeConfig()
+	g.authMu.Lock()
+	defer g.authMu.Unlock()
+	switch {
+	case g.oauthClient != nil:
+		return "oauth", ""
+	case g.profileAPIKey != "":
+		return "api_key_profile", g.profileAPIKeyName
+	case cfg.APIKeyFallback && cfg.BasetenKey != "":
+		return "api_key_env", ""
+	}
+	return "none", ""
+}
+
+// basetenAuthClient picks the credential for a baseten-routed request:
+// OAuth when signed in, else the api_key-type CLI profile's key, else the
+// env fallback key. apiKey is non-empty exactly when the request must
+// carry "Authorization: Api-Key <apiKey>". client == nil means no
+// credential at all.
+func (g *Gateway) basetenAuthClient() (useOAuth bool, client *http.Client, apiKey string) {
 	cfg := g.runtimeConfig()
 	g.authMu.Lock()
 	defer g.authMu.Unlock()
 	if g.oauthClient != nil {
-		return true, g.oauthClient, false
+		return true, g.oauthClient, ""
+	}
+	if g.profileAPIKey != "" {
+		return false, g.client, g.profileAPIKey
 	}
 	if cfg.APIKeyFallback && cfg.BasetenKey != "" {
-		return false, g.client, true
+		return false, g.client, cfg.BasetenKey
 	}
-	return false, nil, false
+	return false, nil, ""
 }
 
 func defaultTransport() *http.Transport {
@@ -1398,12 +1486,12 @@ func (g *Gateway) forwardModelsGet(cl *clientListener, w http.ResponseWriter, r 
 	req.Header.Set("Accept", "application/json")
 	var upClient *http.Client
 	if rt == "baseten" {
-		useOAuth, c, fallback := g.basetenAuthClient()
+		useOAuth, c, apiKey := g.basetenAuthClient()
 		if useOAuth {
 			upClient = c
-		} else if fallback {
+		} else if apiKey != "" {
 			upClient = c
-			req.Header.Set("Authorization", "Api-Key "+cfg.BasetenKey)
+			req.Header.Set("Authorization", "Api-Key "+apiKey)
 		} else {
 			g.rejectNeedsLogin(w)
 			return
@@ -1708,12 +1796,12 @@ func upstreamResponsesEndpoint(baseURL string) string {
 // to use for forwarding to the given route.
 func (g *Gateway) buildUpstreamClient(rt string) (mode proxy.UpstreamAuthMode, basetenKey string, upClient *http.Client, ok bool) {
 	if rt == "baseten" {
-		useOAuth, c, fallback := g.basetenAuthClient()
+		useOAuth, c, apiKey := g.basetenAuthClient()
 		if useOAuth {
 			return proxy.UpstreamModeOAuth, "", c, true
 		}
-		if fallback {
-			return proxy.UpstreamModeAPIKey, g.runtimeConfig().BasetenKey, c, true
+		if apiKey != "" {
+			return proxy.UpstreamModeAPIKey, apiKey, c, true
 		}
 		return 0, "", nil, false
 	}

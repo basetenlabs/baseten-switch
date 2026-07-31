@@ -34,6 +34,7 @@ type doctorFixtureCfg struct {
 	adminForeign     bool              // a non-router process owns the admin addr
 	doorRouter       string            // /doorz-reported router addr ("" = the bound client listener)
 	signedIn         bool              // set by newDoctorFixture default; false = empty auth store
+	apiKeyProfile    bool              // store holds an api_key-type profile instead (overrides signedIn)
 	globalAuth       string            // extra global.auth yaml block ("" = none)
 	settingsJSON     string            // claude settings content ("" = pointing at the door)
 	subagentModel    string            // sets subagent_model on the claude-code client in gateway.yaml
@@ -387,7 +388,19 @@ func newDoctorFixture(t *testing.T, mut func(*doctorFixtureCfg)) *doctorFixture 
 	}
 
 	// Auth store.
-	if cfg.signedIn {
+	if cfg.apiKeyProfile {
+		writeAuthJSON(t, `{
+  "version": 1,
+  "current": "key@example.com",
+  "profiles": {
+    "key@example.com": {
+      "remote_url": "https://app.example.com",
+      "auth_type": "api_key",
+      "api_key": "doc-profile-key"
+    }
+  }
+}`)
+	} else if cfg.signedIn {
 		expiry := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
 		writeAuthJSON(t, fmt.Sprintf(`{
   "version": 1,
@@ -1821,6 +1834,45 @@ func TestDoctorAuthHealthCheck(t *testing.T) {
 		rep := runDoctor(doctorOpts{})
 		if c := findCheck(t, rep, "auth", "health"); c.Status != docOK {
 			t.Fatalf("auth/health = %s (%s), want ok", c.Status, c.Finding)
+		}
+	})
+
+	t.Run("signed_out with an api_key profile in the store is a broken link", func(t *testing.T) {
+		// The store says "signed in with API key" (signin passes) while
+		// the running router loaded nothing: every baseten-routed request
+		// fails though plain doctor would otherwise look green. Must be
+		// the first failure, naming the restart fix.
+		newDoctorFixture(t, func(c *doctorFixtureCfg) {
+			c.apiKeyProfile = true
+			c.authHealth = "signed_out"
+		})
+		rep := runDoctor(doctorOpts{})
+		c := findCheck(t, rep, "auth", "health")
+		if c.Status != docFail {
+			t.Fatalf("auth/health = %s (%s), want fail", c.Status, c.Finding)
+		}
+		if !strings.Contains(c.Finding, "key@example.com") || !strings.Contains(c.Finding, "no credential loaded") {
+			t.Errorf("finding %q must name the store profile and the router contradiction", c.Finding)
+		}
+		if !strings.Contains(c.Fix, "baseten-switch up") {
+			t.Errorf("fix %q must name the router restart", c.Fix)
+		}
+		if rep.FirstFailure != "auth/health" {
+			t.Errorf("first_failure = %q, want auth/health", rep.FirstFailure)
+		}
+		if s := findCheck(t, rep, "auth", "signin"); s.Status != docOK {
+			t.Errorf("auth/signin = %s, want ok (the store-side key IS readable)", s.Status)
+		}
+	})
+
+	t.Run("signed_out with an empty store stays a skip", func(t *testing.T) {
+		newDoctorFixture(t, func(c *doctorFixtureCfg) {
+			c.signedIn = false
+			c.authHealth = "signed_out"
+		})
+		rep := runDoctor(doctorOpts{})
+		if c := findCheck(t, rep, "auth", "health"); c.Status != docSkip {
+			t.Fatalf("auth/health = %s (%s), want skip (signin already reports not signed in)", c.Status, c.Finding)
 		}
 	})
 

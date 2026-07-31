@@ -518,6 +518,20 @@ func doctorAuthHealthCheck(add addCheck, adminAddr string, routerUp bool) {
 			"the router's last token refresh failed transiently (network or endpoint error, not a rejected credential)"+detail,
 			"usually self-clears on the next refresh; re-run doctor, and check connectivity if it persists")
 	case "signed_out":
+		// The store-based signin check can pass while the RUNNING router
+		// holds nothing (an api_key-type profile the router predates, or
+		// a store it cannot read). That contradiction breaks every
+		// baseten-routed request while plain doctor looks green, so it
+		// is a fail, not a skip.
+		if _, _, err := auth.Load(""); err != nil {
+			var ak *auth.APIKeyProfileError
+			if errors.As(err, &ak) && ak.Key != "" {
+				add("auth", "health", docFail,
+					fmt.Sprintf("the credential store has API-key profile %q but the running router has no credential loaded; baseten-routed requests fail (or silently fall back) until it does", ak.Profile),
+					"baseten-switch up   (restart the router onto the current binary)")
+				return
+			}
+		}
 		add("auth", "health", docSkip, "router has no credential loaded (see auth/signin)", "")
 	default:
 		add("auth", "health", docOK, "router reports credential health "+health, "")

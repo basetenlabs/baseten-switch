@@ -864,6 +864,8 @@ func authLine(adminAddr string, routerUp bool) string {
 	var a struct {
 		SignedIn       bool   `json:"signed_in"`
 		Email          string `json:"email"`
+		AuthMode       string `json:"auth_mode"`
+		APIKeyProfile  string `json:"api_key_profile"`
 		FallbackInUse  bool   `json:"fallback_in_use"`
 		FallbackEnable bool   `json:"fallback_enabled"`
 	}
@@ -875,6 +877,10 @@ func authLine(adminAddr string, routerUp bool) string {
 		return fmt.Sprintf("signed in (OAuth, %s)", a.Email)
 	case a.SignedIn:
 		return "signed in (OAuth)"
+	case a.AuthMode == "api_key_profile" && a.APIKeyProfile != "":
+		return fmt.Sprintf("signed in (API key, profile %q)", a.APIKeyProfile)
+	case a.AuthMode == "api_key_profile":
+		return "signed in (API key profile)"
 	case a.FallbackInUse:
 		return "API key fallback in use (no OAuth sign-in)"
 	default:

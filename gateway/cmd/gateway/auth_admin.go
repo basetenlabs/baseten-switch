@@ -21,8 +21,11 @@ func (g *Gateway) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	email, expiresAt := g.authEmailAndExpiry()
 	ah := g.authHealth()
 	cfg := g.runtimeConfig()
+	mode, apiKeyProfile := g.authMode()
 	writeJSON(w, 200, map[string]any{
 		"signed_in":             signedIn,
+		"auth_mode":             mode,
+		"api_key_profile":       apiKeyProfile,
 		"health":                ah.Health,
 		"last_refresh_error":    ah.LastError,
 		"last_refresh_error_at": rfc3339OrEmpty(ah.LastErrorAt),
