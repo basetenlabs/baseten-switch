@@ -34,6 +34,7 @@ type modelsDevModel struct {
 	Status           string          `json:"status"`
 	Reasoning        json.RawMessage `json:"reasoning"`
 	ReasoningOptions json.RawMessage `json:"reasoning_options"`
+	Modalities       json.RawMessage `json:"modalities"`
 	Cost             json.RawMessage `json:"cost"`
 	Limit            struct {
 		Context int64 `json:"context"`
@@ -115,6 +116,10 @@ func withoutCachedModelsDev(catalog providerCatalog) (providerCatalog, bool) {
 		if record.Reasoning != nil &&
 			record.Reasoning.Provenance.Source == modelsDevSource {
 			record.Reasoning = nil
+		}
+		if record.Modalities != nil &&
+			record.Modalities.Provenance.Source == modelsDevSource {
+			record.Modalities = nil
 		}
 		// Family currently has record-level rather than field-level provenance.
 		// models.dev is the only runtime-cache source that supplies it.
@@ -383,6 +388,14 @@ func parseModelsDevModel(
 		return ModelRecord{}, fmt.Errorf("reasoning: %w", err)
 	}
 	record.Reasoning = reasoning
+	modalities, err := parseModelsDevModalities(
+		source.Modalities,
+		provenance,
+	)
+	if err != nil {
+		return ModelRecord{}, fmt.Errorf("modalities: %w", err)
+	}
+	record.Modalities = modalities
 	if provider != ProviderBaseten {
 		if price, ratePresence, present, err := parseModelsDevCost(source.Cost); err != nil {
 			return ModelRecord{}, fmt.Errorf("standard cost: %w", err)
@@ -444,6 +457,35 @@ func parseModelsDevModel(
 		return ModelRecord{}, err
 	}
 	return record, nil
+}
+
+func parseModelsDevModalities(
+	raw json.RawMessage,
+	provenance Provenance,
+) (*ModelModalities, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil, nil
+	}
+	if bytes.Equal(trimmed, []byte("null")) {
+		return nil, fmt.Errorf("modalities is not an object")
+	}
+	var source struct {
+		Input  []string `json:"input"`
+		Output []string `json:"output"`
+	}
+	if err := json.Unmarshal(trimmed, &source); err != nil {
+		return nil, fmt.Errorf("modalities is not an object")
+	}
+	modalities := &ModelModalities{
+		Input:      source.Input,
+		Output:     source.Output,
+		Provenance: provenance,
+	}
+	if err := validateModelModalities(*modalities); err != nil {
+		return nil, err
+	}
+	return modalities, nil
 }
 
 func includeModelsDevModel(

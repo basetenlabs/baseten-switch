@@ -340,6 +340,10 @@ func cachedModelsContainModelsDev(
 			record.Reasoning.Provenance.Source == modelsDevSource {
 			return true
 		}
+		if record.Modalities != nil &&
+			record.Modalities.Provenance.Source == modelsDevSource {
+			return true
+		}
 		for _, definition := range record.Profiles {
 			if definition.Provenance.Source == modelsDevSource {
 				return true
@@ -391,6 +395,9 @@ func markModelLoadedFrom(record ModelRecord, loadedFrom LoadedFrom) ModelRecord 
 	}
 	if record.Reasoning != nil {
 		record.Reasoning.Provenance.LoadedFrom = loadedFrom
+	}
+	if record.Modalities != nil {
+		record.Modalities.Provenance.LoadedFrom = loadedFrom
 	}
 	return record
 }

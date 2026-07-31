@@ -365,6 +365,9 @@ func TestAdminModelCatalogIgnoresNonSelectionFieldsAndUsesMetadataFallback(t *te
 
 func TestModelCatalogReasoningProjectionUsesExactBasetenRecord(t *testing.T) {
 	capturedAt := time.Date(2026, time.July, 26, 12, 0, 0, 0, time.UTC)
+	originalNow := modelCatalogNow
+	modelCatalogNow = func() time.Time { return capturedAt }
+	t.Cleanup(func() { modelCatalogNow = originalNow })
 	p := pricing.New()
 	if err := p.ReplaceModelsDev(
 		[]byte(publicCatalogGatewayFixture),
