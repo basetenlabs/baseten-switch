@@ -72,7 +72,7 @@ func TestReplacePreservesRelativeMultihopSymlink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !snapshot.Linked || snapshot.ResolvedPath != resolvedTarget {
+	if !snapshot.Linked || !snapshot.FinalLinked || snapshot.ResolvedPath != resolvedTarget {
 		t.Fatalf("snapshot path = %+v", snapshot)
 	}
 	if _, err := snapshot.Replace([]byte("after\n"), 0o600); err != nil {
@@ -104,7 +104,7 @@ func TestReplaceCreatesThroughSymlinkedParent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.Exists || !snapshot.Linked {
+	if snapshot.Exists || !snapshot.Linked || snapshot.FinalLinked {
 		t.Fatalf("snapshot = %+v", snapshot)
 	}
 	if _, err := snapshot.Replace([]byte("created\n"), 0o600); err != nil {
@@ -324,6 +324,21 @@ func TestRemoveRefusesHardLinkAddedAfterSnapshot(t *testing.T) {
 	}
 	assertFile(t, path, "value\n")
 	assertFile(t, alias, "value\n")
+}
+
+func TestVerifyRefusesPreimageConflict(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	writeFile(t, path, []byte("before\n"), 0o600)
+	snapshot, err := Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, path, []byte("concurrent\n"), 0o600)
+
+	if err := snapshot.Verify(); !errors.Is(err, ErrConflict) {
+		t.Fatalf("Verify error = %v, want ErrConflict", err)
+	}
+	assertFile(t, path, "concurrent\n")
 }
 
 func writeFile(t *testing.T, path string, data []byte, mode fs.FileMode) {

@@ -40,11 +40,11 @@ func CommitApplied(err error) bool {
 
 // Identity describes the file generation captured by a Snapshot.
 type Identity struct {
-	Device          uint64
-	Inode           uint64
-	Links           uint64
-	Size            int64
-	ModTimeUnixNano int64
+	Device          uint64 `json:"device"`
+	Inode           uint64 `json:"inode"`
+	Links           uint64 `json:"links"`
+	Size            int64  `json:"size"`
+	ModTimeUnixNano int64  `json:"mod_time_unix_nano"`
 }
 
 // Snapshot binds file bytes to the configured path, resolved target, mode, and
@@ -54,6 +54,7 @@ type Snapshot struct {
 	ResolvedPath  string
 	Exists        bool
 	Linked        bool
+	FinalLinked   bool
 	Data          []byte
 	Mode          fs.FileMode
 	Identity      Identity
@@ -63,6 +64,7 @@ type Snapshot struct {
 	preimageIdentity Identity
 	preimageExists   bool
 	preimageLinked   bool
+	preimageFinal    bool
 	preimageResolved string
 }
 
@@ -90,12 +92,18 @@ func Read(path string) (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
+	finalLinked, err := finalComponentLinked(requested)
+	if err != nil {
+		return nil, err
+	}
 	if !exists {
 		return &Snapshot{
 			RequestedPath:    requested,
 			ResolvedPath:     resolved,
 			Linked:           linked,
+			FinalLinked:      finalLinked,
 			preimageLinked:   linked,
+			preimageFinal:    finalLinked,
 			preimageResolved: resolved,
 		}, nil
 	}
@@ -152,7 +160,11 @@ func Read(path string) (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !checkExists || checkResolved != resolved || checkLinked != linked {
+	checkFinalLinked, err := finalComponentLinked(requested)
+	if err != nil {
+		return nil, err
+	}
+	if !checkExists || checkResolved != resolved || checkLinked != linked || checkFinalLinked != finalLinked {
 		return nil, fmt.Errorf("%w: %s changed while it was resolved", ErrConflict, requested)
 	}
 
@@ -161,6 +173,7 @@ func Read(path string) (*Snapshot, error) {
 		ResolvedPath:     resolved,
 		Exists:           true,
 		Linked:           linked,
+		FinalLinked:      finalLinked,
 		Data:             bytes.Clone(data),
 		Mode:             afterPath.Mode().Perm(),
 		Identity:         afterPathIdentity,
@@ -169,6 +182,7 @@ func Read(path string) (*Snapshot, error) {
 		preimageIdentity: afterPathIdentity,
 		preimageExists:   true,
 		preimageLinked:   linked,
+		preimageFinal:    finalLinked,
 		preimageResolved: resolved,
 	}, nil
 }
@@ -321,6 +335,18 @@ func (s *Snapshot) Remove() error {
 	return nil
 }
 
+// Verify confirms that the configured path still identifies the exact
+// preimage captured by Read without changing it.
+func (s *Snapshot) Verify() error {
+	if s == nil {
+		return fmt.Errorf("%w: nil snapshot", ErrUnsafeTarget)
+	}
+	if beforeCommitHook != nil {
+		beforeCommitHook()
+	}
+	return s.verifyCurrent()
+}
+
 func (s *Snapshot) verifyCurrent() error {
 	current, err := Read(s.RequestedPath)
 	if err != nil {
@@ -331,7 +357,8 @@ func (s *Snapshot) verifyCurrent() error {
 	}
 	if current.ResolvedPath != s.preimageResolved ||
 		current.Exists != s.preimageExists ||
-		current.Linked != s.preimageLinked {
+		current.Linked != s.preimageLinked ||
+		current.FinalLinked != s.preimageFinal {
 		return fmt.Errorf("%w: %s resolves differently", ErrConflict, s.RequestedPath)
 	}
 	if !s.preimageExists {
@@ -343,6 +370,17 @@ func (s *Snapshot) verifyCurrent() error {
 		return fmt.Errorf("%w: %s no longer matches its snapshot", ErrConflict, s.RequestedPath)
 	}
 	return nil
+}
+
+func finalComponentLinked(requested string) (bool, error) {
+	info, err := os.Lstat(requested)
+	if err == nil {
+		return info.Mode()&os.ModeSymlink != 0, nil
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	return false, fmt.Errorf("%w: inspect %s: %v", ErrUnsafeTarget, requested, err)
 }
 
 func resolveConfiguredPath(requested string) (resolved string, exists, linked bool, err error) {

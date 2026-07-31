@@ -133,7 +133,10 @@ func uninstallClaude() error {
 	settings := envDefault("BASETEN_SWITCH_CLAUDE_SETTINGS", homeJoin(".claude", "settings.json"))
 	backupRoot := envDefault("BASETEN_SWITCH_BACKUP_DIR", filepath.Join(basetenSwitchDataRoot(), "backups"))
 	backup := claudeBackupPath(backupRoot, settings)
-	if err := rejectSymlinkTargets(settings, backup); err != nil {
+	// Harness settings may intentionally be a symlink. The adapter restores
+	// through a validated safe-file snapshot; the internal backup itself must
+	// remain an ordinary file.
+	if err := rejectSymlinkTargets(backup); err != nil {
 		return err
 	}
 	if !pathExists(settings) && !pathExists(backup) {
