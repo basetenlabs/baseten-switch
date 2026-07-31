@@ -60,6 +60,10 @@ const modelsDevFixture = `{
         "family": "glm",
         "reasoning": true,
         "reasoning_options": [{"type": "toggle"}],
+        "modalities": {
+          "input": ["text", "image", "audio"],
+          "output": ["text"]
+        },
         "limit": {"context": 200000, "output": 100000},
         "cost": {"input": 0.3, "output": 0.75, "cache_read": 0.06}
       },
@@ -411,6 +415,46 @@ func TestModelsDevReasoningPreservesProviderScopedOptions(t *testing.T) {
 	}
 }
 
+func TestModelsDevModalitiesPreserveExactProviderScopedValues(t *testing.T) {
+	p := New()
+	if err := p.ReplaceModelsDev(
+		[]byte(modelsDevFixture),
+		time.Date(2026, time.July, 26, 12, 0, 0, 0, time.UTC),
+		`"modalities-etag"`,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	input, ok := p.Capture().ModelInputModalities(
+		ProviderBaseten,
+		"zai-org/GLM-Test",
+	)
+	if !ok || len(input) != 3 ||
+		input[0] != "text" || input[1] != "image" || input[2] != "audio" {
+		t.Fatalf("GLM input modalities = %#v, found=%t", input, ok)
+	}
+	input[0] = "changed"
+	again, ok := p.Capture().ModelInputModalities(
+		ProviderBaseten,
+		"zai-org/GLM-Test",
+	)
+	if !ok || again[0] != "text" {
+		t.Fatalf("caller mutated input modalities: %#v, found=%t", again, ok)
+	}
+	if _, ok := p.Capture().ModelInputModalities(
+		ProviderBaseten,
+		"plain/Model-Test",
+	); ok {
+		t.Fatal("model without modality metadata reported a capability")
+	}
+	if _, ok := p.Capture().ModelInputModalities(
+		ProviderBaseten,
+		"zai-org/GLM-Test-Variant",
+	); ok {
+		t.Fatal("inexact model id inherited modalities")
+	}
+}
+
 func TestReasoningEffortTokenValidationIsForwardCompatible(t *testing.T) {
 	for _, value := range []string{
 		"none",
@@ -729,6 +773,12 @@ func TestNormalizedCatalogReadResultsAreOwnedCopies(t *testing.T) {
 	)
 	*deepseek.Reasoning.Options[0].Values[0] = "changed"
 	*deepseek.Reasoning.Options[1].Max = 1
+	glm, _ := p.Capture().Model(
+		ProviderBaseten,
+		"zai-org/GLM-Test",
+	)
+	glm.Modalities.Input[0] = "changed"
+	glm.Modalities.Output[0] = "changed"
 
 	again, _ := p.Capture().Model(ProviderAnthropic, "claude-opus-5")
 	if again.Profiles[ProfileFast].RequestBody["speed"] != "fast" ||
@@ -748,6 +798,14 @@ func TestNormalizedCatalogReadResultsAreOwnedCopies(t *testing.T) {
 	if *deepseekAgain.Reasoning.Options[0].Values[0] != "low" ||
 		*deepseekAgain.Reasoning.Options[1].Max != 32_000 {
 		t.Fatal("reasoning result retained snapshot memory")
+	}
+	glmAgain, _ := p.Capture().Model(
+		ProviderBaseten,
+		"zai-org/GLM-Test",
+	)
+	if glmAgain.Modalities.Input[0] != "text" ||
+		glmAgain.Modalities.Output[0] != "text" {
+		t.Fatal("modality result retained snapshot memory")
 	}
 }
 
@@ -842,6 +900,13 @@ func TestProviderCacheSchema1RoundTripsReasoningAndRejectsOtherSchemas(
 		len(deepseek.Options) != 2 ||
 		deepseek.Options[0].Values[1] != nil {
 		t.Fatalf("restored reasoning = %+v, found=%t", deepseek, ok)
+	}
+	modalities, ok := restored.Capture().ModelInputModalities(
+		ProviderBaseten,
+		"zai-org/GLM-Test",
+	)
+	if !ok || len(modalities) != 3 || modalities[1] != "image" {
+		t.Fatalf("restored modalities = %#v, found=%t", modalities, ok)
 	}
 	metadata := restored.Capture().ProviderMetadata(ProviderBaseten)
 	if metadata.ModelsDevValidatedAt != capturedAt {

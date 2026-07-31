@@ -28,6 +28,9 @@ public_shipping_files=(
     gateway/cmd/baseten-switch/codex_adapter.go
     gateway/cmd/baseten-switch/doctor.go
     gateway/cmd/baseten-switch/main.go
+    gateway/cmd/baseten-switch/pi_adapter.go
+    gateway/cmd/baseten-switch/pi_catalog.go
+    gateway/cmd/baseten-switch/pi_store.go
     gateway/cmd/gateway/gateway.go
     gateway/internal/config/gateway.example.yaml
     gateway/internal/config/inittemplate.go

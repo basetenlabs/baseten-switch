@@ -104,6 +104,8 @@ func dispatch(args []string) int {
 		return cmdClaude(args[1:])
 	case "codex":
 		return cmdCodex(args[1:])
+	case "pi":
+		return cmdPi(args[1:])
 	case "menubar":
 		return cmdMenubar(args[1:])
 	default:
@@ -332,6 +334,24 @@ active profiled sessions use the new target without a Codex restart.
 
 reasoning configures a catalog-validated, Codex-only reasoning policy for the
 final Baseten model.
+`},
+	{"pi", "Install the direct Baseten provider for Pi", `Usage:
+  baseten-switch pi install
+  baseten-switch pi status
+  baseten-switch pi uninstall
+
+install adds the direct Baseten provider to Pi using the account-visible model
+catalog from "baseten model-api list --output json". Exact model IDs are
+enriched with reasoning and text/image input capabilities from models.dev.
+Unmatched models use conservative defaults and are reported. The command
+requires BASETEN_API_KEY in Pi's environment, but writes only the literal
+$BASETEN_API_KEY reference. It does not start the gateway, install services,
+open the macOS app, or change any other harness configuration.
+
+status reports whether the managed provider is installed and healthy.
+uninstall removes only the managed Baseten provider. The default Pi agent
+directory is ~/.pi/agent. A nonempty PI_CODING_AGENT_DIR overrides it and may
+begin with ~.
 `},
 }
 

@@ -133,6 +133,14 @@ type ReasoningCapability struct {
 	Provenance Provenance        `json:"provenance"`
 }
 
+// ModelModalities records provider-declared input and output modalities.
+// Harness projections select only the values their own schema can represent.
+type ModelModalities struct {
+	Input      []string   `json:"input"`
+	Output     []string   `json:"output"`
+	Provenance Provenance `json:"provenance"`
+}
+
 // ModelRecord is the provider-scoped normalized catalog identity.
 type ModelRecord struct {
 	Provider         string                                 `json:"provider"`
@@ -145,6 +153,7 @@ type ModelRecord struct {
 	Profiles         map[ExecutionProfile]ProfileDefinition `json:"profiles"`
 	Prices           map[ExecutionProfile]PriceProfile      `json:"prices"`
 	Reasoning        *ReasoningCapability                   `json:"reasoning,omitempty"`
+	Modalities       *ModelModalities                       `json:"modalities,omitempty"`
 	Provenance       Provenance                             `json:"provenance"`
 }
 
@@ -287,6 +296,41 @@ func validateModelRecord(record ModelRecord) error {
 	if record.Reasoning != nil {
 		if err := validateReasoningCapability(*record.Reasoning); err != nil {
 			return fmt.Errorf("reasoning capability: %w", err)
+		}
+	}
+	if record.Modalities != nil {
+		if err := validateModelModalities(*record.Modalities); err != nil {
+			return fmt.Errorf("model modalities: %w", err)
+		}
+	}
+	return nil
+}
+
+func validateModelModalities(modalities ModelModalities) error {
+	if err := validateProvenance(modalities.Provenance); err != nil {
+		return fmt.Errorf("provenance: %w", err)
+	}
+	if modalities.Provenance.Source != modelsDevSource {
+		return fmt.Errorf(
+			"source %q is not the modality authority",
+			modalities.Provenance.Source,
+		)
+	}
+	if modalities.Input == nil || modalities.Output == nil {
+		return fmt.Errorf("input and output are required")
+	}
+	for label, values := range map[string][]string{
+		"input": modalities.Input, "output": modalities.Output,
+	} {
+		seen := make(map[string]struct{}, len(values))
+		for index, value := range values {
+			if value == "" || strings.TrimSpace(value) != value {
+				return fmt.Errorf("%s modality %d is invalid", label, index)
+			}
+			if _, duplicate := seen[value]; duplicate {
+				return fmt.Errorf("%s modality %q is duplicated", label, value)
+			}
+			seen[value] = struct{}{}
 		}
 	}
 	return nil
@@ -729,6 +773,29 @@ func cloneModelRecord(record ModelRecord) ModelRecord {
 		capability := cloneReasoningCapability(*record.Reasoning)
 		out.Reasoning = &capability
 	}
+	if record.Modalities != nil {
+		modalities := cloneModelModalities(*record.Modalities)
+		out.Modalities = &modalities
+	}
+	return out
+}
+
+func cloneModelModalities(modalities ModelModalities) ModelModalities {
+	out := modalities
+	out.Provenance = cloneProvenance(modalities.Provenance)
+	out.Input = cloneStrings(modalities.Input)
+	out.Output = cloneStrings(modalities.Output)
+	return out
+}
+
+func cloneStrings(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	out := make([]string, len(values))
+	for index, value := range values {
+		out[index] = strings.Clone(value)
+	}
 	return out
 }
 
@@ -1001,6 +1068,10 @@ func mergeModelRecord(lower, higher ModelRecord) ModelRecord {
 		capability := cloneReasoningCapability(*higher.Reasoning)
 		out.Reasoning = &capability
 	}
+	if higher.Modalities != nil {
+		modalities := cloneModelModalities(*higher.Modalities)
+		out.Modalities = &modalities
+	}
 	if providerMetadataWins {
 		out.Provenance = higher.Provenance
 	}
@@ -1084,6 +1155,26 @@ func (s *Snapshot) ModelReasoning(
 		return ReasoningCapability{}, false
 	}
 	return cloneReasoningCapability(*record.Reasoning), true
+}
+
+// ModelInputModalities returns an owned copy of exact provider-scoped input
+// modalities. Callers must not infer capabilities from a model family.
+func (s *Snapshot) ModelInputModalities(
+	provider string,
+	canonicalID string,
+) ([]string, bool) {
+	if s == nil {
+		return nil, false
+	}
+	catalog, ok := s.providerCatalogs[provider]
+	if !ok {
+		return nil, false
+	}
+	record, ok := lookupModelRecord(catalog.models, canonicalID)
+	if !ok || record.Modalities == nil {
+		return nil, false
+	}
+	return cloneStrings(record.Modalities.Input), true
 }
 
 // DisplayName returns presentation metadata for one provider-scoped canonical

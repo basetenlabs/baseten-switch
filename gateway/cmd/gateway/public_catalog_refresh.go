@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"math/big"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,15 +20,15 @@ import (
 const (
 	publicCatalogRefreshMinDelay = 6 * time.Hour
 	publicCatalogRefreshMaxDelay = 24 * time.Hour
-	publicCatalogRefreshTimeout  = 10 * time.Second
-	publicCatalogResponseMaxSize = 8 << 20
+	publicCatalogRefreshTimeout  = pricing.ModelsDevFetchTimeout
+	publicCatalogResponseMaxSize = pricing.ModelsDevMaxResponseBytes
 	providerCatalogCacheMaxSize  = 16 << 20
 	publicCatalogStaleAfter      = 48 * time.Hour
 	publicCatalogMissRetryAfter  = 5 * time.Minute
 )
 
 var (
-	publicCatalogURL       = "https://models.dev/api.json"
+	publicCatalogURL       = pricing.ModelsDevURL
 	publicCatalogNow       = time.Now
 	publicCatalogNextDelay = randomPublicCatalogRefreshDelay
 )
@@ -185,14 +184,7 @@ func (g *Gateway) refreshPublicCatalogOnce(parent context.Context) {
 
 	ctx, cancel := context.WithTimeout(parent, publicCatalogRefreshTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, publicCatalogURL, nil)
-	if err == nil {
-		req.Header.Set("Accept", "application/json")
-		if etag := g.pricing.Capture().ModelsDevRootETag(); etag != "" {
-			req.Header.Set("If-None-Match", etag)
-		}
-		err = g.fetchAndPublishPublicCatalog(req)
-	}
+	err := g.fetchAndPublishPublicCatalog(ctx)
 	if err != nil {
 		message := err.Error()
 		if errors.Is(err, context.Canceled) {
@@ -215,18 +207,18 @@ func (g *Gateway) refreshPublicCatalogOnce(parent context.Context) {
 	manager.mu.Unlock()
 }
 
-func (g *Gateway) fetchAndPublishPublicCatalog(req *http.Request) error {
-	clientCopy := *g.client
-	clientCopy.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
-		return http.ErrUseLastResponse
-	}
-	resp, err := clientCopy.Do(req)
+func (g *Gateway) fetchAndPublishPublicCatalog(ctx context.Context) error {
+	result, err := pricing.FetchModelsDev(
+		ctx,
+		g.client,
+		publicCatalogURL,
+		g.pricing.Capture().ModelsDevRootETag(),
+		publicCatalogResponseMaxSize,
+	)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotModified {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	if result.NotModified {
 		if err := g.pricing.RevalidateModelsDev(
 			publicCatalogNow().UTC(),
 		); err != nil {
@@ -234,26 +226,10 @@ func (g *Gateway) fetchAndPublishPublicCatalog(req *http.Request) error {
 		}
 		return g.persistProviderCatalogCaches()
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-		return fmt.Errorf("models.dev returned %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(
-		io.LimitReader(resp.Body, publicCatalogResponseMaxSize+1),
-	)
-	if err != nil {
-		return err
-	}
-	if len(body) > publicCatalogResponseMaxSize {
-		return fmt.Errorf(
-			"models.dev response exceeds %d bytes",
-			publicCatalogResponseMaxSize,
-		)
-	}
 	if err := g.pricing.ReplaceModelsDev(
-		body,
+		result.Body,
 		publicCatalogNow().UTC(),
-		resp.Header.Get("ETag"),
+		result.ETag,
 	); err != nil {
 		return err
 	}
