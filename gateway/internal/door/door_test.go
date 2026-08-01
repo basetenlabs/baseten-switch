@@ -67,6 +67,25 @@ func refusedAddr(t *testing.T) string {
 	return addr
 }
 
+// closeWithoutResponse simulates a router transport failure after the
+// request reached the HTTP handler but before response headers were sent.
+func closeWithoutResponse(t *testing.T, w http.ResponseWriter) {
+	t.Helper()
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		t.Error("test response writer does not support hijacking")
+		return
+	}
+	conn, _, err := hijacker.Hijack()
+	if err != nil {
+		t.Errorf("hijack router connection: %v", err)
+		return
+	}
+	if err := conn.Close(); err != nil {
+		t.Errorf("close router connection: %v", err)
+	}
+}
+
 func doorURL(d *Door, path string) string {
 	return "http://" + d.Addr() + path
 }
@@ -282,15 +301,22 @@ func TestRouterConnectErrorFailsOverToFallback(t *testing.T) {
 	}
 }
 
-// (3) Router 502/503/504: same failover, per status.
-func TestRouterGatewayErrorsFailOverToFallback(t *testing.T) {
+// (3) Every router HTTP response proves liveness. Gateway errors relay
+// unchanged and never activate the door's native fallback.
+func TestRouterGatewayErrorsRelayWithoutTripping(t *testing.T) {
 	for _, status := range []int{502, 503, 504} {
 		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			var routerHits atomic.Int64
 			router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				routerHits.Add(1)
+				w.Header().Set("Retry-After", "7")
 				w.WriteHeader(status)
+				_, _ = io.WriteString(w, "from-router")
 			}))
 			defer router.Close()
+			var fallbackHits atomic.Int64
 			fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				fallbackHits.Add(1)
 				w.WriteHeader(200)
 				_, _ = io.WriteString(w, "from-fallback")
 			}))
@@ -301,17 +327,31 @@ func TestRouterGatewayErrorsFailOverToFallback(t *testing.T) {
 				RouterTarget: hostPort(t, router.URL),
 				FallbackBase: fallback.URL,
 			})
-			resp, err := http.Post(doorURL(d, "/v1/messages"), "application/json", strings.NewReader("{}"))
-			if err != nil {
-				t.Fatalf("request: %v", err)
+			for i := 0; i < 2; i++ {
+				resp, err := http.Post(doorURL(d, "/v1/messages"), "application/json", strings.NewReader("{}"))
+				if err != nil {
+					t.Fatalf("request %d: %v", i, err)
+				}
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode != status || string(body) != "from-router" {
+					t.Fatalf("request %d: status=%d body=%q, want %d from-router", i, resp.StatusCode, body, status)
+				}
+				if got := resp.Header.Get("X-Baseten-Switch-Door"); got != "router" {
+					t.Fatalf("request %d: X-Baseten-Switch-Door = %q, want router", i, got)
+				}
+				if got := resp.Header.Get("Retry-After"); got != "7" {
+					t.Fatalf("request %d: Retry-After = %q, want 7", i, got)
+				}
 			}
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode != 200 || string(body) != "from-fallback" {
-				t.Fatalf("status=%d body=%q, want 200 from-fallback", resp.StatusCode, body)
+			if routerHits.Load() != 2 {
+				t.Fatalf("router hits = %d, want 2", routerHits.Load())
 			}
-			if got := resp.Header.Get("X-Baseten-Switch-Door"); got != "fallback" {
-				t.Fatalf("X-Baseten-Switch-Door = %q, want fallback", got)
+			if fallbackHits.Load() != 0 {
+				t.Fatalf("fallback hits = %d, want 0", fallbackHits.Load())
+			}
+			if z := getDoorz(t, d); z.Tripped {
+				t.Fatalf("door tripped after router returned %d", status)
 			}
 		})
 	}
@@ -380,7 +420,8 @@ func TestCooldownSkipsRouterThenRecovers(t *testing.T) {
 	router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		routerHits.Add(1)
 		if !healthy.Load() {
-			w.WriteHeader(503)
+			_, _ = io.Copy(io.Discard, r.Body)
+			closeWithoutResponse(t, w)
 			return
 		}
 		w.WriteHeader(200)
@@ -412,8 +453,8 @@ func TestCooldownSkipsRouterThenRecovers(t *testing.T) {
 		return resp, string(body)
 	}
 
-	// Unhealthy router: first request trips (router hit 1) and is served
-	// by the fallback.
+	// Router transport failure: first request trips (router hit 1) and
+	// is served by the fallback.
 	resp, body := post()
 	if resp.Header.Get("X-Baseten-Switch-Door") != "fallback" || body != "from-fallback" {
 		t.Fatalf("first request: door=%q body=%q, want fallback", resp.Header.Get("X-Baseten-Switch-Door"), body)
@@ -516,7 +557,7 @@ func TestRequestBodyReplayOnTrip(t *testing.T) {
 	router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Consume the body (as a real router would) before failing.
 		_, _ = io.Copy(io.Discard, r.Body)
-		w.WriteHeader(503)
+		closeWithoutResponse(t, w)
 	}))
 	defer router.Close()
 	gotBody := make(chan []byte, 1)
@@ -550,16 +591,16 @@ func TestRequestBodyReplayOnTrip(t *testing.T) {
 	}
 }
 
-// Bodies over the replay cap go router-only: the router's 502/503/504 is
-// relayed as-is (no failover for that request), but the trip still
-// protects subsequent requests.
+// Bodies over the replay cap go router-only: a router transport failure
+// cannot replay that request, but the trip still protects subsequent
+// replayable requests.
 func TestOversizeBodyIsRouterOnly(t *testing.T) {
 	bigBody := strings.Repeat("x", 64)
 	var routerBody atomic.Value
 	router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		routerBody.Store(string(b))
-		w.WriteHeader(503)
+		closeWithoutResponse(t, w)
 	}))
 	defer router.Close()
 	var fallbackHits atomic.Int64
@@ -580,8 +621,8 @@ func TestOversizeBodyIsRouterOnly(t *testing.T) {
 		t.Fatalf("request: %v", err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != 503 {
-		t.Fatalf("status = %d, want the router's 503 relayed (router-only)", resp.StatusCode)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want door 502 for unreplayable transport failure", resp.StatusCode)
 	}
 	if got := resp.Header.Get("X-Baseten-Switch-Door"); got != "router" {
 		t.Fatalf("X-Baseten-Switch-Door = %q, want router", got)
@@ -649,10 +690,7 @@ func TestUnknownPathWhileTrippedReturns502JSON(t *testing.T) {
 
 // (8) /doorz reports state and transitions.
 func TestDoorzReportsStateTransitions(t *testing.T) {
-	router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(503)
-	}))
-	defer router.Close()
+	routerAddr := refusedAddr(t)
 	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 	}))
@@ -661,7 +699,7 @@ func TestDoorzReportsStateTransitions(t *testing.T) {
 	const cooldown = 30 * time.Second
 	d := startDoor(t, Config{
 		Shape:        ShapeOpenAI,
-		RouterTarget: hostPort(t, router.URL),
+		RouterTarget: routerAddr,
 		FallbackBase: fallback.URL,
 		Cooldown:     cooldown,
 	})
@@ -671,8 +709,8 @@ func TestDoorzReportsStateTransitions(t *testing.T) {
 	if _, p, err := net.SplitHostPort(d.Addr()); err == nil {
 		fmt.Sscanf(p, "%d", &wantPort)
 	}
-	if z.Port != wantPort || z.Shape != "openai" || z.Router != hostPort(t, router.URL) {
-		t.Fatalf("doorz identity = %+v, want port=%d shape=openai router=%s", z, wantPort, hostPort(t, router.URL))
+	if z.Port != wantPort || z.Shape != "openai" || z.Router != routerAddr {
+		t.Fatalf("doorz identity = %+v, want port=%d shape=openai router=%s", z, wantPort, routerAddr)
 	}
 	if z.Tripped || z.CooldownRemainingMS != 0 || z.LastTransitionUnix != 0 {
 		t.Fatalf("fresh doorz should be untripped with no transition: %+v", z)
@@ -687,7 +725,7 @@ func TestDoorzReportsStateTransitions(t *testing.T) {
 
 	z = getDoorz(t, d)
 	if !z.Tripped {
-		t.Fatalf("doorz not tripped after router 503: %+v", z)
+		t.Fatalf("doorz not tripped after router transport failure: %+v", z)
 	}
 	if z.CooldownRemainingMS <= 0 || z.CooldownRemainingMS > cooldown.Milliseconds() {
 		t.Fatalf("cooldown_remaining_ms = %d, want in (0, %d]", z.CooldownRemainingMS, cooldown.Milliseconds())

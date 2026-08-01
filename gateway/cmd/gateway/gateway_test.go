@@ -1977,6 +1977,295 @@ func TestPostMessagesSanitizeHistory(t *testing.T) {
 	}
 }
 
+// TestAnthropic429RelaysWithoutFallbackOrCooldown verifies that a rate
+// limit is a terminal response for an Anthropic-shape request. The
+// original retry contract reaches the harness, and a later request
+// rechecks the configured primary instead of inheriting a cooldown.
+func TestAnthropic429RelaysWithoutFallbackOrCooldown(t *testing.T) {
+	const rateLimitBody = `{"type":"error","error":{"type":"rate_limit_error","message":"try again later"}}`
+	var primaryHits atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		primaryHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "17")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, rateLimitBody)
+	}))
+	defer primary.Close()
+
+	var fallbackHits atomic.Int32
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fallbackHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"type":"message","content":[]}`)
+	}))
+	defer fallback.Close()
+
+	cfg := testConfig(t, primary.URL, fallback.URL)
+	rc := resolvedAnthropicBaseten(t)
+	rc.FallbackRoute = "anthropic"
+	g, adminL, _ := newGateway(t, cfg, rc)
+	defer adminL.Close()
+	stop := start(t, g)
+	defer stop()
+
+	send := func() {
+		t.Helper()
+		body := []byte(`{"model":"claude-opus-4-8","stream":false,"messages":[{"role":"user","content":"ping"}]}`)
+		req, _ := http.NewRequest(
+			http.MethodPost,
+			clientURL(g, "claude-code", "/v1/messages"),
+			bytes.NewReader(body),
+		)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("status = %d, want 429", resp.StatusCode)
+		}
+		if got := resp.Header.Get("Retry-After"); got != "17" {
+			t.Fatalf("Retry-After = %q, want 17", got)
+		}
+		if string(gotBody) != rateLimitBody {
+			t.Fatalf("body = %q, want exact upstream body %q", gotBody, rateLimitBody)
+		}
+		if g.fallbackActive("claude-code") {
+			t.Fatal("Anthropic 429 activated fallback cooldown")
+		}
+	}
+
+	send()
+	send()
+
+	if got := primaryHits.Load(); got != 2 {
+		t.Fatalf("primary hits = %d, want 2", got)
+	}
+	if got := fallbackHits.Load(); got != 0 {
+		t.Fatalf("fallback hits = %d, want 0", got)
+	}
+
+	rows := waitForRows(t, cfg.TelemetryDir, 2, 2*time.Second)
+	for i, row := range rows {
+		if row.ConfiguredRoute != "baseten" ||
+			row.EffectiveProvider != "baseten" {
+			t.Fatalf(
+				"row %d route/effective = %q/%q, want baseten/baseten",
+				i,
+				row.ConfiguredRoute,
+				row.EffectiveProvider,
+			)
+		}
+		if row.StatusCode() != http.StatusTooManyRequests ||
+			!row.IsHTTPError() {
+			t.Fatalf(
+				"row %d status/error = %d/%v, want 429/true",
+				i,
+				row.StatusCode(),
+				row.IsHTTPError(),
+			)
+		}
+		if row.Fallback.Attempted ||
+			row.Fallback.Count != 0 ||
+			row.Fallback.Trigger != nil {
+			t.Fatalf("row %d fallback = %+v, want no fallback", i, row.Fallback)
+		}
+	}
+}
+
+// TestTranslatedAnthropic429PreservesRetryAfter verifies the terminal
+// rate-limit policy also applies when an Anthropic listener translates
+// its Baseten request through the OpenAI wire shape. The error envelope
+// keeps the existing translation behavior while response control
+// headers survive that body rewrite.
+func TestTranslatedAnthropic429PreservesRetryAfter(t *testing.T) {
+	var primaryHits atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		primaryHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "23")
+		w.Header().Set("ETag", `"stale-error-body"`)
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(
+			w,
+			`{"error":{"type":"rate_limit","message":"translated retry later"}}`,
+		)
+	}))
+	defer primary.Close()
+
+	var fallbackHits atomic.Int32
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fallbackHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"type":"message","content":[]}`)
+	}))
+	defer fallback.Close()
+
+	cfg := testConfig(t, primary.URL, fallback.URL)
+	rc := resolvedAnthropicBaseten(t)
+	rc.DefaultModel = reasoningNeutralBasetenModel
+	rc.UpstreamShape = "openai"
+	rc.FallbackRoute = "anthropic"
+	g, adminL, _ := newGateway(t, cfg, rc)
+	defer adminL.Close()
+	stop := start(t, g)
+	defer stop()
+
+	body := []byte(`{"model":"claude-opus-4-8","stream":false,"messages":[{"role":"user","content":"ping"}]}`)
+	req, _ := http.NewRequest(
+		http.MethodPost,
+		clientURL(g, "claude-code", "/v1/messages"),
+		bytes.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf(
+			"status/body/primary/fallback = %d/%s/%d/%d, want 429 from primary",
+			resp.StatusCode,
+			gotBody,
+			primaryHits.Load(),
+			fallbackHits.Load(),
+		)
+	}
+	if got := resp.Header.Get("Retry-After"); got != "23" {
+		t.Fatalf("Retry-After = %q, want 23", got)
+	}
+	if got := resp.Header.Get("ETag"); got != "" {
+		t.Fatalf("ETag = %q, want stale representation header removed", got)
+	}
+	var envelope struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(gotBody, &envelope); err != nil {
+		t.Fatalf("decode translated error: %v: %s", err, gotBody)
+	}
+	if envelope.Type != "error" ||
+		envelope.Error.Type != "rate_limit_error" ||
+		envelope.Error.Message != "translated retry later" {
+		t.Fatalf("translated error = %+v, want Anthropic rate-limit envelope", envelope)
+	}
+	if got := primaryHits.Load(); got != 1 {
+		t.Fatalf("primary hits = %d, want 1", got)
+	}
+	if got := fallbackHits.Load(); got != 0 {
+		t.Fatalf("fallback hits = %d, want 0", got)
+	}
+	if g.fallbackActive("claude-code") {
+		t.Fatal("translated Anthropic 429 activated fallback cooldown")
+	}
+
+	rows := waitForRows(t, cfg.TelemetryDir, 1, 2*time.Second)
+	row := rows[0]
+	if row.EffectiveProvider != "baseten" ||
+		row.StatusCode() != http.StatusTooManyRequests ||
+		!row.IsHTTPError() ||
+		row.Fallback.Attempted ||
+		row.Fallback.Trigger != nil {
+		t.Fatalf(
+			"provider/status/error/fallback = %q/%d/%v/%+v, want baseten/429/true/none",
+			row.EffectiveProvider,
+			row.StatusCode(),
+			row.IsHTTPError(),
+			row.Fallback,
+		)
+	}
+}
+
+// TestOpenAI429RetainsFallbackAndCooldown verifies that making the
+// status policy shape-aware does not change the OpenAI-shape contract.
+func TestOpenAI429RetainsFallbackAndCooldown(t *testing.T) {
+	var primaryHits atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		primaryHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"type":"rate_limit_error","message":"try later"}}`)
+	}))
+	defer primary.Close()
+
+	var fallbackHits atomic.Int32
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fallbackHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(
+			w,
+			`{"id":"chatcmpl_1","object":"chat.completion","model":"gpt-5","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`,
+		)
+	}))
+	defer fallback.Close()
+
+	cfg := testConfig(t, primary.URL, primary.URL)
+	cfg.OpenAIURL = fallback.URL
+	rc := resolvedOpenAIBaseten(t, "codex", "baseten")
+	rc.FallbackRoute = "openai"
+	g, adminL, _ := newGateway(t, cfg, rc)
+	defer adminL.Close()
+	stop := start(t, g)
+	defer stop()
+
+	body := []byte(`{"model":"gpt-5","stream":false,"messages":[{"role":"user","content":"ping"}]}`)
+	req, _ := http.NewRequest(
+		http.MethodPost,
+		clientURL(g, "codex", "/v1/chat/completions"),
+		bytes.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer synthetic-native-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK ||
+		!strings.Contains(string(gotBody), `"content":"ok"`) {
+		t.Fatalf("status/body = %d/%s, want 200 from fallback", resp.StatusCode, gotBody)
+	}
+	if got := primaryHits.Load(); got != 1 {
+		t.Fatalf("primary hits = %d, want 1", got)
+	}
+	if got := fallbackHits.Load(); got != 1 {
+		t.Fatalf("fallback hits = %d, want 1", got)
+	}
+	if !g.fallbackActive("codex") {
+		t.Fatal("OpenAI 429 did not activate fallback cooldown")
+	}
+
+	rows := waitForRows(t, cfg.TelemetryDir, 1, 2*time.Second)
+	row := rows[0]
+	if row.ConfiguredRoute != "baseten" ||
+		row.EffectiveProvider != "openai" ||
+		row.StatusCode() != http.StatusOK ||
+		row.IsHTTPError() {
+		t.Fatalf(
+			"route/effective/status/error = %q/%q/%d/%v, want baseten/openai/200/false",
+			row.ConfiguredRoute,
+			row.EffectiveProvider,
+			row.StatusCode(),
+			row.IsHTTPError(),
+		)
+	}
+	if !row.Fallback.Attempted ||
+		row.Fallback.Count != 1 ||
+		valueOrZero(row.Fallback.Trigger) != "http_429" {
+		t.Fatalf("fallback = %+v, want attempted count=1 trigger=http_429", row.Fallback)
+	}
+}
+
 // TestFallbackRouteOn503WithCooldown: a baseten-routed listener with
 // fallback_route=anthropic retries the fallback when the primary
 // returns 503 (invisible to the client), then routes straight to the

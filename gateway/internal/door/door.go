@@ -511,26 +511,11 @@ func (d *Door) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	switch resp.StatusCode {
-	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-		// Router-level failure, decided before anything reached the
-		// client. Trip, then retry the same request against the fallback.
-		d.tripNow(fmt.Sprintf("router returned %d", resp.StatusCode))
-		if replayable {
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-			_ = resp.Body.Close()
-			d.serveFallback(w, r, bytes.NewReader(bodyBuf), int64(len(bodyBuf)))
-			return
-		}
-		// Body too large to replay: router-only, relay the answer as-is.
-		d.relay(w, resp, "router")
-	default:
-		// Anything else (2xx, 4xx, 429, 500) is a legitimate answer the
-		// router chose to relay; second-guessing it is the router's own
-		// fallback_route job. It also proves the router is up.
-		d.clearTrip("router answered")
-		d.relay(w, resp, "router")
-	}
+	// Any HTTP response proves the direct loopback router accepted and
+	// classified the request. Status-based fallback belongs to the
+	// router; the door only rescues transport and health-probe failures.
+	d.clearTrip("router answered")
+	d.relay(w, resp, "router")
 }
 
 func (d *Door) warnNoReplay() {

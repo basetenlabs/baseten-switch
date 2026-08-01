@@ -2019,11 +2019,15 @@ func (at upstreamAttempt) telStrippedToolTypes() string {
 }
 
 // fallbackCooldown is how long a listener sends requests straight to
-// its fallback route after the primary trips (connect error, 429,
-// 5xx), so a dead upstream doesn't add per-request latency.
+// its fallback route after the primary trips (connect error, eligible
+// 429, or 5xx), so a dead upstream doesn't add per-request latency.
 const fallbackCooldown = 30 * time.Second
 
-func fallbackTriggerStatus(code int) bool {
+func fallbackTriggerStatus(protocolShape string, code int) bool {
+	if protocolShape == "anthropic" &&
+		code == http.StatusTooManyRequests {
+		return false
+	}
 	return code == 429 || code >= 500
 }
 
@@ -2941,12 +2945,14 @@ func ExpectedPrimaryRoute(c config.Client, globalRoutingEnabled bool, requestedI
 // response to the client (streaming or not), parses usage and writes
 // one telemetry row tagged with the listener name. A later attempt is
 // tried (and the fallback cooldown tripped) when an earlier one fails
-// to connect, returns 429/5xx, or exceeds the ttft_timeout first-byte
-// deadline; nothing has been written to the client at that point, so
-// the retry is invisible. A TTFT expiry on the final attempt (or on an
-// explicit alias/slug choice, which has no fallback) surfaces as a 504
-// naming the model and the deadline. Once the first response byte has
-// arrived the deadline is inert: a live stream is never truncated.
+// to connect, returns an eligible 429 or 5xx, or exceeds the
+// ttft_timeout first-byte deadline; nothing has been written to the
+// client at that point, so the retry is invisible. Anthropic-shape 429
+// responses are terminal and relay without fallback or cooldown. A
+// TTFT expiry on the final attempt (or on an explicit alias/slug
+// choice, which has no fallback) surfaces as a 504 naming the model
+// and the deadline. Once the first response byte has arrived the
+// deadline is inert: a live stream is never truncated.
 func (g *Gateway) streamForward(cl *clientListener, w http.ResponseWriter, r *http.Request, attempts []upstreamAttempt, isStream bool, start time.Time) {
 	pricingSnapshot := attempts[0].catalogSnapshot
 	if pricingSnapshot == nil {
@@ -3061,7 +3067,11 @@ attemptLoop:
 				break
 			}
 
-			if !last && fallbackTriggerStatus(resp.StatusCode) {
+			if !last &&
+				fallbackTriggerStatus(
+					cl.cfg.ProtocolShape,
+					resp.StatusCode,
+				) {
 				watch.stop()
 				fmt.Fprintf(os.Stderr,
 					"[gateway] fallback client=%s route=%s status=%d -> trying %s\n",
@@ -3551,6 +3561,20 @@ func (g *Gateway) relayTranslated(cl *clientListener, w http.ResponseWriter, res
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		ab := translate.ErrorToAnthropic(resp.StatusCode, usage.MaybeDecompress(body, upstreamCE))
 		h := w.Header()
+		proxy.CopyHeader(h, resp.Header)
+		// The error body changed shape and may have been decompressed.
+		// Preserve end-to-end control headers such as Retry-After, but
+		// remove metadata that describes the upstream representation.
+		for _, name := range []string{
+			"Content-Encoding",
+			"Content-MD5",
+			"Digest",
+			"Content-Digest",
+			"Repr-Digest",
+			"ETag",
+		} {
+			h.Del(name)
+		}
 		h.Set("Content-Type", "application/json")
 		h.Set("Content-Length", itoa(len(ab)))
 		w.WriteHeader(resp.StatusCode)
