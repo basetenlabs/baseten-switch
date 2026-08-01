@@ -139,8 +139,9 @@ type Client struct {
 	// tri-state so an absent key is distinguishable from explicit false.
 	SanitizeHistory *bool `yaml:"sanitize_history,omitempty" json:"sanitize_history,omitempty"`
 	// FallbackRoute is tried when the primary route's upstream is
-	// unreachable or returns 429/5xx. Must be the native route for
-	// protocol_shape.
+	// unreachable, returns 5xx, or returns 429 for openai-shape traffic.
+	// Anthropic-shape 429 responses relay without fallback. The fallback
+	// must be the native route for protocol_shape.
 	FallbackRoute string `yaml:"fallback_route,omitempty" json:"fallback_route,omitempty"`
 	// UpstreamShape overrides the wire shape used toward the upstream on
 	// the baseten route. Setting "openai" on an anthropic listener makes

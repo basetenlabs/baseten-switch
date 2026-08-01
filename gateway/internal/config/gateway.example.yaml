@@ -51,7 +51,8 @@ clients:
     # Route Claude Code subagent (sidechain) traffic to a model; toggle with 'baseten-switch claude subagents'. See the subagent-routing contract.
     # subagent_model: claude-baseten-glm-5-2
     # subagent_routing: on
-    # Tried when baseten is unreachable, returns 429/5xx, or ttft_timeout expires (30s cooldown).
+    # Tried when baseten is unreachable, returns 5xx, or ttft_timeout expires (30s cooldown).
+    # Anthropic 429 responses relay to the harness without fallback or cooldown.
     fallback_route: anthropic
 
   # codex ships parked (enabled: false; no listener bound); 'baseten-switch codex on' offers to
