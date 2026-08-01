@@ -199,9 +199,14 @@ rejected. Machine callers may place these options before or after the verb:
   --if-active-token TOKEN
   --if-config-hash HASH
 `},
-	{"mutation", "Reconcile an interrupted routing policy mutation", `Usage: baseten-switch mutation reconcile <operation-id> [--json]
+	{"mutation", "Inspect or recover a routing policy mutation", `Usage:
+  baseten-switch mutation status [--json]
+  baseten-switch mutation recover [--json]
+  baseten-switch mutation reconcile <operation-id> [--json]
 
-Finish or safely roll back an interrupted routing policy mutation.
+status classifies local recovery state without changing config or routing.
+recover removes only recovery state whose exact outcome is already confirmed.
+reconcile may finish or safely roll back the named interrupted mutation.
 `},
 	{"menubar", "Install or refresh and open the macOS menubar app", `Usage: baseten-switch menubar [--which]
 

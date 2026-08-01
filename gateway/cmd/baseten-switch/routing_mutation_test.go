@@ -226,7 +226,7 @@ func TestRoutingMutationCASAndStatusPreconditionsFailClosed(t *testing.T) {
 				return []string{"--json", "--operation-id", "missing-path", "--if-config-hash", hash}
 			},
 			wantCode:   "router_state_mismatch",
-			wantPhrase: "active config path",
+			wantPhrase: "managed routing config",
 		},
 		{
 			name: "wrong active config path",
@@ -237,7 +237,7 @@ func TestRoutingMutationCASAndStatusPreconditionsFailClosed(t *testing.T) {
 				return []string{"--json", "--operation-id", "wrong-path", "--if-config-hash", hash}
 			},
 			wantCode:   "router_state_mismatch",
-			wantPhrase: "running router uses config",
+			wantPhrase: "managed routing config",
 		},
 	}
 	for _, testCase := range cases {
@@ -406,7 +406,7 @@ func TestRoutingMutationUnfinishedJournalBlocksNextMutation(t *testing.T) {
 	}
 	result := decodeMutationResult(t, second.String())
 	if result.Error == nil || result.Error.Code != "unfinished_mutation" ||
-		!strings.Contains(result.Error.Message, "first-offline") {
+		result.BlockingOperationID != "first-offline" || result.ReconciliationRequired {
 		t.Fatalf("result = %+v", result)
 	}
 	if routingEnabledFromFile(t, path) {
@@ -689,8 +689,22 @@ func TestRoutingMutationClaudeRouteOfflineReconcilePreservesReceipt(t *testing.T
 		result.Operation != "set_claude_route" ||
 		result.Client != "claude-code" ||
 		result.Key != "sonnet" ||
-		result.RequestedTarget != "native" {
+		result.RequestedTarget != "native" ||
+		result.IdentityStrength != mutationIdentityExact ||
+		result.RequestFingerprint == "" {
 		t.Fatalf("reconciled result = %+v", result)
+	}
+	replayStdout, replayRC := captureStdout(t, func() int {
+		return cmdMutation([]string{"reconcile", "route-offline", "--json"})
+	})
+	if replayRC != 0 {
+		t.Fatalf("terminal reconcile rc = %d: %s", replayRC, replayStdout)
+	}
+	replay := decodeMutationResult(t, replayStdout)
+	if !replay.OK || replay.Operation != result.Operation || replay.Client != result.Client ||
+		replay.Key != "" || replay.RequestedTarget != "" ||
+		replay.RequestFingerprint != result.RequestFingerprint || replay.IdentityStrength != mutationIdentityExact {
+		t.Fatalf("terminal reconcile replay = %+v", replay)
 	}
 }
 
@@ -711,6 +725,7 @@ func TestJournaledMutationCASPreservesConcurrentExternalEdit(t *testing.T) {
 	opts := mutationOptions{JSON: true, OperationID: "external-race", hasOperationID: true}
 	rc := runJournaledMutationLocked(path, prior, mode, opts, &out, journaledMutationSpec{
 		Operation:       "set_claude_route",
+		Surface:         mutationSurfaceClaude,
 		RequestedTarget: "native",
 		Client:          "claude-code",
 		Key:             "opus",
@@ -737,6 +752,52 @@ func TestJournaledMutationCASPreservesConcurrentExternalEdit(t *testing.T) {
 	}
 	if _, err := os.Stat(mutationJournalPath(path, "external-race")); !os.IsNotExist(err) {
 		t.Fatalf("CAS refusal left a journal: %v", err)
+	}
+}
+
+func TestRejectedMutationReceiptPreservesCleanupPending(t *testing.T) {
+	installRoutingMutationSeams(t)
+	installTerminalPublicationSeams(t)
+	path := writeSwitchFixture(t, globalRoutingFixtureYAML)
+	prior, mode, err := readExactConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	external := append(append([]byte(nil), prior...), []byte("# external edit\n")...)
+	realRemove := mutationTerminalRemove
+	mutationTerminalRemove = func(target string) error {
+		if target == mutationJournalPath(path, "rejected-cleanup") {
+			return errors.New("injected active journal cleanup failure")
+		}
+		return realRemove(target)
+	}
+	lock, err := acquireConfigMutationLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.close()
+	var out strings.Builder
+	opts := mutationOptions{JSON: true, OperationID: "rejected-cleanup", hasOperationID: true}
+	rc := runJournaledMutationLocked(path, prior, mode, opts, &out, journaledMutationSpec{
+		Operation: "set_claude_route", Surface: mutationSurfaceClaude, Client: "claude-code", Key: "opus", RequestedTarget: "native",
+		Apply: func(previewPath string) error {
+			if err := config.SetClientMapEntries(previewPath, "claude-code", "model_routes", map[string]string{"opus": "native"}); err != nil {
+				return err
+			}
+			return os.WriteFile(path, external, mode)
+		},
+	})
+	result := decodeMutationResult(t, out.String())
+	if rc != 1 || result.Error == nil || result.Error.Code != "stale_config_hash" ||
+		result.Outcome != mutationOutcomeRejected || !result.CleanupPending {
+		t.Fatalf("rejected result rc=%d result=%+v", rc, result)
+	}
+	if _, err := os.Stat(mutationJournalPath(path, opts.OperationID)); err != nil {
+		t.Fatalf("cleanup-pending journal missing: %v", err)
+	}
+	record, err := readMutationTerminal(path, opts.OperationID)
+	if err != nil || record.Outcome != mutationOutcomeRejected {
+		t.Fatalf("rejected terminal=%+v err=%v", record, err)
 	}
 }
 

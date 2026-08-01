@@ -249,6 +249,19 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             added = true
         }
 
+        if let message = state.mutationRecoveryMessage {
+            let item = disabledItem("Routing Cleanup Required")
+            item.image = symbol("exclamationmark.triangle")
+            item.toolTip = menuErrorLabel(message)
+            menu.addItem(item)
+            if state.canRetryMutationCleanup {
+                menu.addItem(actionItem(
+                    "Retry cleanup",
+                    action: #selector(retryMutationCleanup(_:))))
+            }
+            added = true
+        }
+
         if added {
             menu.addItem(.separator())
         }
@@ -360,6 +373,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func openConfigurationWindow(_ sender: NSMenuItem) {
         guard !isPreview else { return }
         openConfiguration(sender.representedObject as? String)
+    }
+
+    @objc private func retryMutationCleanup(_ sender: NSMenuItem) {
+        state.retryMutationCleanup()
     }
 
     @objc private func openNativeTraffic() {

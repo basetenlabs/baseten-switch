@@ -1318,6 +1318,114 @@ func TestDoctorRouterDownDependentsSkip(t *testing.T) {
 	}
 }
 
+func TestDoctorMutationRecoveryClassificationPolicy(t *testing.T) {
+	tests := []struct {
+		name        string
+		class       string
+		wantStatus  string
+		wantFix     bool
+		wantFinding string
+	}{
+		{name: "none", class: mutationStatusNone, wantStatus: docOK},
+		{name: "desired active", class: mutationStatusDesiredActive, wantStatus: docFail, wantFix: true},
+		{name: "prior active", class: mutationStatusPriorActive, wantStatus: docFail, wantFix: true, wantFinding: "was not applied; the prior routing state is active"},
+		{name: "cleanup pending", class: mutationStatusCleanupPending, wantStatus: docFail, wantFix: true},
+		{name: "desired pending", class: mutationStatusDesiredPending, wantStatus: docFail},
+		{name: "prior pending", class: mutationStatusPriorPending, wantStatus: docFail},
+		{name: "router unavailable", class: mutationStatusRouterUnavailable, wantStatus: docFail},
+		{name: "router unsupported", class: mutationStatusRouterUnsupported, wantStatus: docFail},
+		{name: "external change", class: mutationStatusExternalChange, wantStatus: docFail},
+		{name: "commit recovery required", class: mutationStatusCommitRecoveryRequired, wantStatus: docFail},
+		{name: "journal invalid", class: mutationStatusJournalInvalid, wantStatus: docFail},
+		{name: "journal conflict", class: mutationStatusJournalConflict, wantStatus: docFail},
+		{name: "unknown", class: "future_state", wantStatus: docFail},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oldInspect := doctorInspectRoutingMutationStatus
+			doctorInspectRoutingMutationStatus = func(string) (routingMutationStatus, error) {
+				return routingMutationStatus{Classification: tt.class}, nil
+			}
+			t.Cleanup(func() { doctorInspectRoutingMutationStatus = oldInspect })
+
+			var checks []doctorCheck
+			doctorMutationRecoveryCheck(func(section, name, status, finding, fix string, fixArgv ...string) {
+				checks = append(checks, doctorCheck{
+					Section: section,
+					Name:    name,
+					Status:  status,
+					Finding: finding,
+					Fix:     fix,
+					fixArgv: fixArgv,
+				})
+			}, "/private/config/path")
+
+			if len(checks) != 1 {
+				t.Fatalf("checks = %+v, want one", checks)
+			}
+			check := checks[0]
+			if check.Section != "router" || check.Name != "mutation_recovery" || check.Status != tt.wantStatus {
+				t.Errorf("check = %+v, want router/mutation_recovery %s", check, tt.wantStatus)
+			}
+			if tt.wantFinding != "" && !strings.Contains(check.Finding, tt.wantFinding) {
+				t.Errorf("finding = %q, want text %q", check.Finding, tt.wantFinding)
+			}
+			if tt.wantFix {
+				if got := strings.Join(check.fixArgv, " "); got != "mutation recover" {
+					t.Errorf("fixArgv = %q, want mutation recover", got)
+				}
+			} else if len(check.fixArgv) != 0 {
+				t.Errorf("manual-only classification got fixArgv %v", check.fixArgv)
+			}
+			if strings.Contains(check.Finding, "/private/config/path") || strings.Contains(check.Fix, "/private/config/path") {
+				t.Errorf("check leaked config path: %+v", check)
+			}
+		})
+	}
+}
+
+func TestDoctorMutationRecoveryInspectionErrorIsSanitized(t *testing.T) {
+	oldInspect := doctorInspectRoutingMutationStatus
+	doctorInspectRoutingMutationStatus = func(string) (routingMutationStatus, error) {
+		return routingMutationStatus{}, fmt.Errorf("open /private/config/path.mutation-journal: permission denied")
+	}
+	t.Cleanup(func() { doctorInspectRoutingMutationStatus = oldInspect })
+
+	var check doctorCheck
+	doctorMutationRecoveryCheck(func(section, name, status, finding, fix string, fixArgv ...string) {
+		check = doctorCheck{Section: section, Name: name, Status: status, Finding: finding, Fix: fix, fixArgv: fixArgv}
+	}, "/private/config/path")
+	if check.Status != docFail || len(check.fixArgv) != 0 {
+		t.Fatalf("check = %+v, want manual-only failure", check)
+	}
+	if strings.Contains(check.Finding, "/private/") || strings.Contains(check.Fix, "/private/") || strings.Contains(check.Finding, "permission denied") {
+		t.Errorf("inspection failure leaked raw error or path: %+v", check)
+	}
+}
+
+func TestDoctorMutationRecoveryCheckOrdering(t *testing.T) {
+	newDoctorFixture(t, nil)
+	oldInspect := doctorInspectRoutingMutationStatus
+	doctorInspectRoutingMutationStatus = func(string) (routingMutationStatus, error) {
+		return routingMutationStatus{Classification: mutationStatusNone}, nil
+	}
+	t.Cleanup(func() { doctorInspectRoutingMutationStatus = oldInspect })
+
+	rep := runDoctor(doctorOpts{})
+	indices := map[string]int{}
+	for i, check := range rep.Checks {
+		indices[check.Section+"/"+check.Name] = i
+	}
+	reachable := indices["router/reachable"]
+	status := indices["router/status"]
+	recovery := indices["router/mutation_recovery"]
+	client := indices["router/client:claude-code"]
+	if !(reachable < status && status < recovery && recovery < client) {
+		t.Fatalf("router check order = reachable:%d status:%d recovery:%d client:%d", reachable, status, recovery, client)
+	}
+}
+
 func TestDoctorForeignAdminPort(t *testing.T) {
 	newDoctorFixture(t, func(c *doctorFixtureCfg) { c.adminForeign = true })
 	rep := runDoctor(doctorOpts{})
@@ -1484,6 +1592,86 @@ func TestDoctorFixRouterDownAppliedAndResolved(t *testing.T) {
 	}
 	if !strings.Contains(out, "all checks passed") {
 		t.Errorf("final green report missing:\n%s", out)
+	}
+}
+
+func TestDoctorFixRouterDownWithActiveMutationDoesNotStartRouter(t *testing.T) {
+	fx := newDoctorFixture(t, nil)
+	journal := legacyJournalForTest(t, fx.cfgPath, "doctor-blocks-up")
+	if err := writeMutationJournal(journal); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(fx.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	takeRouterDown(t)
+	calls := setDoctorFixSeams(t, false, "", nil)
+	out, code := captureStdout(t, func() int { return cmdDoctor([]string{"--fix", "--yes"}) })
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1 with recovery still pending\n%s", code, out)
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("router-down recovery state executed fixes: %v", *calls)
+	}
+	if strings.Contains(out, "will run:") || !strings.Contains(out, "resolve the routing mutation recovery state") {
+		t.Fatalf("doctor offered startup before recovery:\n%s", out)
+	}
+	after, err := os.ReadFile(fx.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("doctor changed the routing config while recovery was pending")
+	}
+	if _, err := os.Stat(mutationJournalPath(fx.cfgPath, journal.OperationID)); err != nil {
+		t.Fatalf("doctor changed the active recovery journal: %v", err)
+	}
+}
+
+func TestDoctorFixMutationRecoveryRunsOnlyRecover(t *testing.T) {
+	newDoctorFixture(t, nil)
+	classification := mutationStatusDesiredActive
+	oldInspect := doctorInspectRoutingMutationStatus
+	doctorInspectRoutingMutationStatus = func(string) (routingMutationStatus, error) {
+		return routingMutationStatus{Classification: classification}, nil
+	}
+	t.Cleanup(func() { doctorInspectRoutingMutationStatus = oldInspect })
+
+	calls := setDoctorFixSeams(t, false, "", func(argv []string) error {
+		classification = mutationStatusNone
+		return nil
+	})
+	out, code := captureStdout(t, func() int { return cmdDoctor([]string{"--fix", "--yes"}) })
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 after recovery cleanup\n%s", code, out)
+	}
+	if len(*calls) != 1 || strings.Join((*calls)[0], " ") != "mutation recover" {
+		t.Fatalf("fix argvs = %v, want exactly ['mutation', 'recover']", *calls)
+	}
+	if strings.Contains(out, "mutation reconcile") {
+		t.Errorf("doctor --fix proposed full reconciliation:\n%s", out)
+	}
+}
+
+func TestDoctorFixYesCannotReconcileUnsafeMutation(t *testing.T) {
+	newDoctorFixture(t, nil)
+	oldInspect := doctorInspectRoutingMutationStatus
+	doctorInspectRoutingMutationStatus = func(string) (routingMutationStatus, error) {
+		return routingMutationStatus{Classification: mutationStatusDesiredPending}, nil
+	}
+	t.Cleanup(func() { doctorInspectRoutingMutationStatus = oldInspect })
+
+	calls := setDoctorFixSeams(t, false, "", nil)
+	out, code := captureStdout(t, func() int { return cmdDoctor([]string{"--fix", "--yes"}) })
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1 with manual reconciliation pending\n%s", code, out)
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("unsafe status executed fixes: %v", *calls)
+	}
+	if !strings.Contains(out, "no automatable fix for router/mutation_recovery") {
+		t.Errorf("manual-only guidance missing:\n%s", out)
 	}
 }
 
