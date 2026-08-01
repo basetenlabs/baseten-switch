@@ -68,6 +68,268 @@ private struct FixedClock: RuntimeClock {
     }
 }
 
+private final class RecordingClock: RuntimeClock, @unchecked Sendable {
+    let now: Date
+    private let queue = DispatchQueue(label: "mutation-recovery-test-clock")
+    private var values: [TimeInterval] = []
+
+    init(now: Date = Date(timeIntervalSince1970: 100)) {
+        self.now = now
+    }
+
+    func sleep(seconds: TimeInterval) async throws {
+        try Task.checkCancellation()
+        queue.sync {
+            values.append(seconds)
+        }
+    }
+
+    var sleeps: [TimeInterval] {
+        queue.sync { values }
+    }
+}
+
+private actor RecoveryScriptRunner: CLIRunning {
+    private(set) var arguments: [[String]] = []
+    private let statusResult: CLIExecutionResult
+    private var recoverResults: [CLIExecutionResult]
+
+    init(statusResult: CLIExecutionResult,
+         recoverResults: [CLIExecutionResult]) {
+        self.statusResult = statusResult
+        self.recoverResults = recoverResults
+    }
+
+    func run(_ request: CLIExecutionRequest) async -> CLIExecutionResult {
+        arguments.append(request.arguments)
+        if request.arguments.suffix(2) == ["mutation", "status"] {
+            return statusResult
+        }
+        if request.arguments.suffix(2) == ["mutation", "recover"] {
+            if !recoverResults.isEmpty {
+                return recoverResults.removeFirst()
+            }
+        }
+        return CLIExecutionResult(
+            status: 1,
+            standardOutput: "",
+            standardError: "",
+            timedOut: false)
+    }
+}
+
+private actor PrimaryFailureRunner: CLIRunning {
+    enum Mode: Equatable {
+        case blocker
+        case doubleTimeout
+        case failedReconciliation
+        case malformedSecondary
+        case mismatchedSecondary
+        case timedTypedError
+        case timedSuccess
+    }
+
+    private(set) var arguments: [[String]] = []
+    private let mode: Mode
+
+    init(mode: Mode) {
+        self.mode = mode
+    }
+
+    func run(_ request: CLIExecutionRequest) async -> CLIExecutionResult {
+        arguments.append(request.arguments)
+        let args = request.arguments
+        let operationID: String
+        if let flag = args.firstIndex(of: "--operation-id"),
+           args.indices.contains(flag + 1) {
+            operationID = args[flag + 1]
+        } else {
+            operationID = args.last ?? ""
+        }
+        let reconciling = args.suffix(3).dropLast().contains("mutation")
+            || (args.contains("mutation") && args.contains("reconcile"))
+        if mode == .doubleTimeout
+            || mode == .malformedSecondary
+            || mode == .mismatchedSecondary {
+            if !reconciling || mode == .doubleTimeout {
+                return CLIExecutionResult(
+                    status: -1,
+                    standardOutput: "",
+                    standardError: "",
+                    timedOut: true)
+            }
+            if mode == .malformedSecondary {
+                return CLIExecutionResult(
+                    status: 1,
+                    standardOutput: "{not-json",
+                    standardError: "",
+                    timedOut: false)
+            }
+            let object: [String: Any] = [
+                "ok": true,
+                "operation_id": "different-operation",
+                "operation": "set_global_routing",
+                "requested": true,
+                "desired_config_hash": "sha256:active",
+                "active_config_hash": "sha256:active",
+                "active_token": "boot-a:4",
+                "applied": true,
+                "reconciliation_required": false,
+                "error": NSNull(),
+            ]
+            let data = try! JSONSerialization.data(withJSONObject: object)
+            return CLIExecutionResult(
+                status: 0,
+                standardOutput: String(decoding: data, as: UTF8.self),
+                standardError: "",
+                timedOut: false)
+        }
+        if mode == .timedSuccess {
+            let object: [String: Any] = [
+                "ok": true,
+                "operation_id": operationID,
+                "operation": "set_global_routing",
+                "requested": true,
+                "desired_config_hash": "sha256:active",
+                "active_config_hash": "sha256:active",
+                "active_token": "boot-a:4",
+                "applied": true,
+                "reconciliation_required": false,
+                "error": NSNull(),
+            ]
+            let data = try! JSONSerialization.data(withJSONObject: object)
+            return CLIExecutionResult(
+                status: reconciling ? 0 : -1,
+                standardOutput: String(decoding: data, as: UTF8.self),
+                standardError: "",
+                timedOut: !reconciling)
+        }
+        let errorCode: String
+        let blockingID: String?
+        let reconciliationRequired: Bool
+        if mode == .blocker {
+            errorCode = "unfinished_mutation"
+            blockingID = "older-operation"
+            reconciliationRequired = false
+        } else if mode == .timedTypedError {
+            errorCode = "stale_config_hash"
+            blockingID = nil
+            reconciliationRequired = false
+        } else if reconciling {
+            errorCode = "journal_not_found"
+            blockingID = nil
+            reconciliationRequired = false
+        } else {
+            errorCode = "activation_indeterminate"
+            blockingID = nil
+            reconciliationRequired = true
+        }
+        var object: [String: Any] = [
+            "ok": false,
+            "operation_id": operationID,
+            "operation": "set_global_routing",
+            "applied": false,
+            "reconciliation_required": reconciliationRequired,
+            "error": [
+                "code": errorCode,
+                "message": "open /Users/example/private/model-id.json: no such file",
+                "retryable": false,
+            ],
+        ]
+        if let blockingID {
+            object["blocking_operation_id"] = blockingID
+        }
+        let data = try! JSONSerialization.data(withJSONObject: object)
+        return CLIExecutionResult(
+            status: mode == .timedTypedError ? -1 : 1,
+            standardOutput: String(decoding: data, as: UTF8.self),
+            standardError: "",
+            timedOut: mode == .timedTypedError)
+    }
+}
+
+private actor CleanupPendingMutationRunner: CLIRunning {
+    enum Mode: Equatable {
+        case rejected
+        case priorActive
+    }
+
+    private(set) var arguments: [[String]] = []
+    private let mode: Mode
+
+    init(mode: Mode) {
+        self.mode = mode
+    }
+
+    func run(_ request: CLIExecutionRequest) async -> CLIExecutionResult {
+        arguments.append(request.arguments)
+        let args = request.arguments
+        let operationID = argumentValue("--operation-id", in: args)
+            ?? args.last
+            ?? ""
+        let reconciling = args.contains("reconcile")
+        let rejected = mode == .rejected
+        let object: [String: Any]
+        if reconciling {
+            object = [
+                "ok": true,
+                "operation_id": operationID,
+                "operation": "set_global_routing",
+                "requested": true,
+                "desired_config_hash": "sha256:new",
+                "active_config_hash": "sha256:active",
+                "active_token": "boot-a:4",
+                "applied": false,
+                "reconciliation_required": false,
+                "cleanup_pending": true,
+                "outcome": "not_applied",
+                "identity_strength": "exact",
+                "request_fingerprint":
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "error": NSNull(),
+            ]
+        } else {
+            object = [
+                "ok": false,
+                "operation_id": operationID,
+                "operation": "set_global_routing",
+                "requested": true,
+                "desired_config_hash": rejected
+                    ? "sha256:active"
+                    : "sha256:new",
+                "active_config_hash": "sha256:active",
+                "active_token": "boot-a:4",
+                "applied": false,
+                "reconciliation_required": !rejected,
+                "cleanup_pending": rejected,
+                "outcome": rejected ? "rejected" : "",
+                "error": [
+                    "code": rejected
+                        ? "stale_config_hash"
+                        : "activation_indeterminate",
+                    "message": "reviewed mutation error",
+                    "retryable": false,
+                ],
+            ]
+        }
+        let data = try! JSONSerialization.data(withJSONObject: object)
+        return CLIExecutionResult(
+            status: reconciling ? 0 : 1,
+            standardOutput: String(decoding: data, as: UTF8.self),
+            standardError: "",
+            timedOut: false)
+    }
+
+    private func argumentValue(
+        _ flag: String,
+        in arguments: [String]
+    ) -> String? {
+        guard let index = arguments.firstIndex(of: flag),
+              arguments.indices.contains(index + 1) else { return nil }
+        return arguments[index + 1]
+    }
+}
+
 private actor ConcurrencyRecordingRunner: CLIRunning {
     private(set) var active = 0
     private(set) var maximumActive = 0
@@ -87,12 +349,57 @@ private actor ConcurrencyRecordingRunner: CLIRunning {
     }
 }
 
+private actor BlockingFirstRunner: CLIRunning {
+    private(set) var arguments: [[String]] = []
+    private var firstContinuation: CheckedContinuation<Void, Never>?
+
+    func run(_ request: CLIExecutionRequest) async -> CLIExecutionResult {
+        arguments.append(request.arguments)
+        if arguments.count == 1 {
+            await withCheckedContinuation { continuation in
+                firstContinuation = continuation
+            }
+        }
+        return CLIExecutionResult(
+            status: 0,
+            standardOutput: "",
+            standardError: "",
+            timedOut: false)
+    }
+
+    func waitUntilFirstStarted() async {
+        while arguments.isEmpty {
+            await Task.yield()
+        }
+    }
+
+    func releaseFirst() {
+        firstContinuation?.resume()
+        firstContinuation = nil
+    }
+}
+
 private actor ReconciliationReceiptRunner: CLIRunning {
+    private static let requestFingerprint =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     private(set) var arguments: [[String]] = []
     private var journalOperation = ""
     private var journalClient = ""
     private var journalKey = ""
     private var journalTarget = ""
+    private let reconciledFingerprint: String
+    private let primaryTargetOverride: String?
+    private let clientOverride: String?
+
+    init(
+        reconciledFingerprint: String = requestFingerprint,
+        primaryTargetOverride: String? = nil,
+        clientOverride: String? = nil
+    ) {
+        self.reconciledFingerprint = reconciledFingerprint
+        self.primaryTargetOverride = primaryTargetOverride
+        self.clientOverride = clientOverride
+    }
 
     func run(_ request: CLIExecutionRequest) async -> CLIExecutionResult {
         arguments.append(request.arguments)
@@ -135,24 +442,27 @@ private actor ReconciliationReceiptRunner: CLIRunning {
             key = journalKey
             target = journalTarget
         } else {
+            client = clientOverride ?? client
             journalOperation = operation
             journalClient = client
             journalKey = key
             journalTarget = target
         }
         let ok = reconciling
-        let object: [String: Any] = [
+        var object: [String: Any] = [
             "ok": ok,
             "operation_id": operationID,
             "operation": operation,
             "client": client,
-            "key": key,
-            "requested_target": target,
             "desired_config_hash": "sha256:new",
             "active_token": "boot-a:5",
             "active_config_hash": "sha256:new",
             "applied": ok,
             "reconciliation_required": !ok,
+            "request_fingerprint": reconciling
+                ? reconciledFingerprint
+                : Self.requestFingerprint,
+            "identity_strength": "exact",
             "error": ok
                 ? NSNull()
                 : [
@@ -160,6 +470,10 @@ private actor ReconciliationReceiptRunner: CLIRunning {
                     "message": "reconciliation required",
                 ],
         ]
+        if !reconciling {
+            object["key"] = key
+            object["requested_target"] = primaryTargetOverride ?? target
+        }
         let data = try! JSONSerialization.data(withJSONObject: object)
         return CLIExecutionResult(
             status: ok ? 0 : 1,
@@ -193,7 +507,9 @@ final class RuntimeCoordinationTests: XCTestCase {
     private let previewConfigPath =
         "/tmp/baseten-switch-home/.config/baseten-switch-preview/gateway.yaml"
 
-    private func previewVariant() -> AppVariant {
+    private func previewVariant(
+        binaryPath: String = "/usr/bin/true"
+    ) -> AppVariant {
         AppVariant.resolve(
             infoDictionary: [
                 "BasetenSwitchBuildChannel": "preview",
@@ -203,7 +519,7 @@ final class RuntimeCoordinationTests: XCTestCase {
             bundleIdentifier: "co.baseten.switch.preview",
             runningExecutableName: "BasetenSwitchPreview",
             homeDirectory: "/tmp/baseten-switch-home",
-            environment: ["BASETEN_SWITCH_GATEWAY_BIN": "/usr/bin/true"])
+            environment: ["BASETEN_SWITCH_GATEWAY_BIN": binaryPath])
     }
 
     private func isolatedPreviewVariant() throws -> AppVariant {
@@ -249,10 +565,12 @@ final class RuntimeCoordinationTests: XCTestCase {
         hash: String,
         familyTarget: String,
         subagentModel: String = "",
-        subagentRouting: String = "off"
+        subagentRouting: String = "off",
+        bootID: String = "boot-a",
+        clientName: String = "claude-code"
     ) -> AdminStatusSnapshot {
         AdminStatusSnapshot(dict: [
-            "router_boot_id": "boot-a",
+            "router_boot_id": bootID,
             "active_generation": generation,
             "active_config_hash": hash,
             "desired_config_hash": hash,
@@ -261,7 +579,7 @@ final class RuntimeCoordinationTests: XCTestCase {
             "config_path": previewConfigPath,
             "global_routing_enabled": false,
             "clients": [[
-                "name": "claude-code",
+                "name": clientName,
                 "enabled": true,
                 "bind_addr": "127.0.0.1:45372",
                 "protocol_shape": "anthropic",
@@ -432,6 +750,11 @@ final class RuntimeCoordinationTests: XCTestCase {
           "active_config_hash": "sha256:new",
           "applied": true,
           "reconciliation_required": true,
+          "blocking_operation_id": "op-older",
+          "outcome": "applied",
+          "cleanup_pending": true,
+          "request_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "identity_strength": "exact",
           "error": null
         }
         """)
@@ -447,6 +770,510 @@ final class RuntimeCoordinationTests: XCTestCase {
         XCTAssertEqual(receipt?.activeConfigHash, "sha256:new")
         XCTAssertEqual(receipt?.applied, true)
         XCTAssertEqual(receipt?.reconciliationRequired, true)
+        XCTAssertEqual(receipt?.blockingOperationID, "op-older")
+        XCTAssertEqual(receipt?.outcome, "applied")
+        XCTAssertEqual(receipt?.cleanupPending, true)
+        XCTAssertEqual(
+            receipt?.requestFingerprint,
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        XCTAssertEqual(receipt?.identityStrength, "exact")
+        XCTAssertTrue(isValidMutationRequestFingerprint(
+            receipt?.requestFingerprint ?? ""))
+        XCTAssertFalse(isValidMutationRequestFingerprint(
+            "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"))
+    }
+
+    @MainActor
+    func testStartupRecoveryProbesOnceThenRunsCleanupOnly() async {
+        let runner = RecoveryScriptRunner(
+            statusResult: recoveryStatusResult(
+                classification: "none"),
+            recoverResults: [recoveryResult(
+                ok: true,
+                classification: "none")])
+        let state = BasetenSwitchState(
+            variant: previewVariant(),
+            reader: CountingAdminReader(status: previewStatus(
+                generation: 4,
+                hash: "sha256:active",
+                familyTarget: "native")),
+            cliRunner: runner,
+            clock: RecordingClock(),
+            loginItemService: FakeLoginItemService(),
+            previewRuntimeValidator: { _ in nil },
+            startPolling: false,
+            automaticMutationRecoveryEnabled: true)
+
+        XCTAssertFalse(state.canMutateRouting)
+        await state.refresh()
+        await state.waitForMutationRecovery()
+
+        XCTAssertEqual(state.mutationRecoveryState, .ready)
+        XCTAssertTrue(state.canMutateRouting)
+        let initialCalls = await runner.arguments
+        XCTAssertEqual(initialCalls, [
+            ["--json", "mutation", "status"],
+            ["--json", "mutation", "recover"],
+        ])
+
+        await state.refresh()
+        let repeatedCalls = await runner.arguments
+        XCTAssertEqual(repeatedCalls.count, 2)
+        state.stop()
+    }
+
+    @MainActor
+    func testStartupRecoveryUsesBoundedBackoffAndManualRetry() async {
+        let transient = recoveryResult(
+            ok: false,
+            errorCode: "mutation_locked",
+            status: 1)
+        let clock = RecordingClock()
+        let runner = RecoveryScriptRunner(
+            statusResult: recoveryStatusResult(
+                classification: "desired_active"),
+            recoverResults: Array(repeating: transient, count: 6) + [
+                recoveryResult(ok: true, classification: "none"),
+            ])
+        let state = BasetenSwitchState(
+            variant: previewVariant(),
+            reader: CountingAdminReader(status: previewStatus(
+                generation: 4,
+                hash: "sha256:active",
+                familyTarget: "native")),
+            cliRunner: runner,
+            clock: clock,
+            loginItemService: FakeLoginItemService(),
+            previewRuntimeValidator: { _ in nil },
+            startPolling: false,
+            automaticMutationRecoveryEnabled: true)
+
+        await state.refresh()
+        await state.waitForMutationRecovery()
+
+        XCTAssertEqual(
+            state.mutationRecoveryState,
+            .blocked(errorCode: "mutation_locked"))
+        XCTAssertEqual(clock.sleeps, [1, 2, 4, 8, 16])
+        XCTAssertTrue(state.canRetryMutationCleanup)
+        let automaticCalls = await runner.arguments
+        XCTAssertFalse(automaticCalls.joined().contains("reconcile"))
+
+        state.retryMutationCleanup()
+        await state.waitForMutationRecovery()
+        XCTAssertEqual(state.mutationRecoveryState, .ready)
+        XCTAssertEqual(clock.sleeps, [1, 2, 4, 8, 16])
+        state.stop()
+    }
+
+    @MainActor
+    func testCleanupPendingSuccessRemainsGatedAndRetries() async {
+        let pending = recoveryResult(
+            ok: true,
+            classification: "cleanup_pending",
+            cleanupPending: true)
+        let clock = RecordingClock()
+        let runner = RecoveryScriptRunner(
+            statusResult: recoveryStatusResult(
+                classification: "cleanup_pending"),
+            recoverResults: Array(repeating: pending, count: 6))
+        let state = BasetenSwitchState(
+            variant: previewVariant(),
+            reader: CountingAdminReader(status: previewStatus(
+                generation: 4,
+                hash: "sha256:active",
+                familyTarget: "native")),
+            cliRunner: runner,
+            clock: clock,
+            loginItemService: FakeLoginItemService(),
+            previewRuntimeValidator: { _ in nil },
+            startPolling: false,
+            automaticMutationRecoveryEnabled: true)
+
+        await state.refresh()
+        await state.waitForMutationRecovery()
+
+        XCTAssertEqual(
+            state.mutationRecoveryState,
+            .blocked(errorCode: "cleanup_pending"))
+        XCTAssertFalse(state.canMutateRouting)
+        XCTAssertTrue(state.canRetryMutationCleanup)
+        XCTAssertEqual(clock.sleeps, [1, 2, 4, 8, 16])
+        state.stop()
+    }
+
+    @MainActor
+    func testRetryableCleanupPredicateChangeRetriesThenRecovers() async {
+        let clock = RecordingClock()
+        let runner = RecoveryScriptRunner(
+            statusResult: recoveryStatusResult(
+                classification: "desired_active"),
+            recoverResults: [
+                recoveryResult(
+                    ok: false,
+                    errorCode: "cleanup_predicate_changed",
+                    status: 1,
+                    errorRetryable: true),
+                recoveryResult(ok: true, classification: "none"),
+            ])
+        let state = BasetenSwitchState(
+            variant: previewVariant(),
+            reader: CountingAdminReader(status: previewStatus(
+                generation: 4,
+                hash: "sha256:active",
+                familyTarget: "native")),
+            cliRunner: runner,
+            clock: clock,
+            loginItemService: FakeLoginItemService(),
+            previewRuntimeValidator: { _ in nil },
+            startPolling: false,
+            automaticMutationRecoveryEnabled: true)
+
+        await state.refresh()
+        await state.waitForMutationRecovery()
+
+        XCTAssertEqual(state.mutationRecoveryState, .ready)
+        XCTAssertEqual(clock.sleeps, [1])
+        state.stop()
+    }
+
+    @MainActor
+    func testTimedOutCleanupProcessRetriesThenRecovers() async {
+        let clock = RecordingClock()
+        let runner = RecoveryScriptRunner(
+            statusResult: recoveryStatusResult(
+                classification: "desired_active"),
+            recoverResults: [
+                recoveryResult(
+                    ok: false,
+                    status: -1,
+                    timedOut: true),
+                recoveryResult(ok: true, classification: "none"),
+            ])
+        let state = BasetenSwitchState(
+            variant: previewVariant(),
+            reader: CountingAdminReader(status: previewStatus(
+                generation: 4,
+                hash: "sha256:active",
+                familyTarget: "native")),
+            cliRunner: runner,
+            clock: clock,
+            loginItemService: FakeLoginItemService(),
+            previewRuntimeValidator: { _ in nil },
+            startPolling: false,
+            automaticMutationRecoveryEnabled: true)
+
+        await state.refresh()
+        await state.waitForMutationRecovery()
+
+        XCTAssertEqual(state.mutationRecoveryState, .ready)
+        XCTAssertEqual(clock.sleeps, [1])
+        state.stop()
+    }
+
+    @MainActor
+    func testTimedOutStatusProbeStillRunsCleanupRecovery() async {
+        let runner = RecoveryScriptRunner(
+            statusResult: recoveryResult(
+                ok: false,
+                status: -1,
+                timedOut: true),
+            recoverResults: [
+                recoveryResult(ok: true, classification: "none"),
+            ])
+        let state = BasetenSwitchState(
+            variant: previewVariant(),
+            reader: CountingAdminReader(status: previewStatus(
+                generation: 4,
+                hash: "sha256:active",
+                familyTarget: "native")),
+            cliRunner: runner,
+            clock: RecordingClock(),
+            loginItemService: FakeLoginItemService(),
+            previewRuntimeValidator: { _ in nil },
+            startPolling: false,
+            automaticMutationRecoveryEnabled: true)
+
+        await state.refresh()
+        await state.waitForMutationRecovery()
+
+        XCTAssertEqual(state.mutationRecoveryState, .ready)
+        let calls = await runner.arguments
+        XCTAssertEqual(calls, [
+            ["--json", "mutation", "status"],
+            ["--json", "mutation", "recover"],
+        ])
+        state.stop()
+    }
+
+    @MainActor
+    func testUnsupportedStatusFallsBackWithoutRepeatedProbe() async {
+        let runner = RecoveryScriptRunner(
+            statusResult: recoveryResult(
+                ok: false,
+                errorCode: "usage",
+                status: 2),
+            recoverResults: [])
+        let state = BasetenSwitchState(
+            variant: previewVariant(),
+            reader: SequencedAdminReader(statuses: [
+                previewStatus(
+                    generation: 4,
+                    hash: "sha256:active",
+                    familyTarget: "native"),
+                previewStatus(
+                    generation: 4,
+                    hash: "sha256:active",
+                    familyTarget: "native"),
+                previewStatus(
+                    generation: 1,
+                    hash: "sha256:active",
+                    familyTarget: "native",
+                    bootID: "boot-b"),
+            ]),
+            cliRunner: runner,
+            clock: RecordingClock(),
+            loginItemService: FakeLoginItemService(),
+            previewRuntimeValidator: { _ in nil },
+            startPolling: false,
+            automaticMutationRecoveryEnabled: true)
+
+        await state.refresh()
+        await state.waitForMutationRecovery()
+        XCTAssertEqual(state.mutationRecoveryState, .legacyFallback)
+        XCTAssertTrue(state.canMutateRouting)
+        let initialCalls = await runner.arguments
+        XCTAssertEqual(initialCalls.count, 1)
+
+        await state.refresh()
+        let repeatedCalls = await runner.arguments
+        XCTAssertEqual(repeatedCalls.count, 1)
+        state.stop()
+    }
+
+    @MainActor
+    func testInPlaceCLIUpgradeInvalidatesLegacyFallback() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let binary = root.appendingPathComponent("baseten-switch")
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true)
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: binary)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: 0o755)],
+            ofItemAtPath: binary.path)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let runner = RecoveryScriptRunner(
+            statusResult: recoveryResult(
+                ok: false,
+                errorCode: "usage",
+                status: 2),
+            recoverResults: [])
+        let state = BasetenSwitchState(
+            variant: previewVariant(binaryPath: binary.path),
+            reader: CountingAdminReader(status: previewStatus(
+                generation: 4,
+                hash: "sha256:active",
+                familyTarget: "native")),
+            cliRunner: runner,
+            loginItemService: FakeLoginItemService(),
+            previewRuntimeValidator: { _ in nil },
+            startPolling: false,
+            automaticMutationRecoveryEnabled: true)
+
+        await state.refresh()
+        await state.waitForMutationRecovery()
+        let initialCalls = await runner.arguments
+        XCTAssertEqual(initialCalls.count, 1)
+
+        try Data("#!/bin/sh\nexit 0\n# upgraded\n".utf8)
+            .write(to: binary, options: .atomic)
+        try FileManager.default.setAttributes(
+            [
+                .posixPermissions: NSNumber(value: 0o755),
+                .modificationDate: Date(timeIntervalSinceNow: 5),
+            ],
+            ofItemAtPath: binary.path)
+
+        await state.refresh()
+        await state.waitForMutationRecovery()
+        let calls = await runner.arguments
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertEqual(calls.last, ["--json", "mutation", "status"])
+        state.stop()
+    }
+
+    @MainActor
+    func testReasoningControlsStayDisabledDuringStartupRecovery() async {
+        let runner = BlockingFirstRunner()
+        let state = BasetenSwitchState(
+            variant: previewVariant(),
+            reader: CountingAdminReader(status: previewStatus(
+                generation: 4,
+                hash: "sha256:active",
+                familyTarget: "native")),
+            cliRunner: runner,
+            loginItemService: FakeLoginItemService(),
+            previewRuntimeValidator: { _ in nil },
+            startPolling: false,
+            automaticMutationRecoveryEnabled: true)
+
+        await state.refresh()
+        await runner.waitUntilFirstStarted()
+        XCTAssertFalse(state.canMutateReasoning)
+
+        state.stop()
+        await runner.releaseFirst()
+    }
+
+    @MainActor
+    func testBlockingOperationPreservesPrimaryAndNeverReconcilesNewID() async {
+        let runner = PrimaryFailureRunner(mode: .blocker)
+        let state = mutationTestState(runner: runner)
+        await state.refresh()
+
+        await state.setAllRoutesThroughBaseten(true)
+
+        let calls = await runner.arguments
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(
+            state.lastError,
+            "A previous routing change still needs cleanup.")
+        XCTAssertFalse(state.lastError?.contains("/Users/") == true)
+        XCTAssertFalse(state.lastError?.contains("model-id") == true)
+        state.stop()
+    }
+
+    @MainActor
+    func testFailedSecondaryReconciliationCannotMaskPrimaryFailure() async {
+        let runner = PrimaryFailureRunner(mode: .failedReconciliation)
+        let state = mutationTestState(runner: runner)
+        await state.refresh()
+
+        await state.setAllRoutesThroughBaseten(true)
+
+        let calls = await runner.arguments
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertEqual(Array(calls[1].prefix(3)), [
+            "--json", "mutation", "reconcile",
+        ])
+        XCTAssertEqual(
+            state.lastError,
+            "The routing change could not be confirmed safely. Retry cleanup.")
+        XCTAssertFalse(state.lastError?.contains("/Users/") == true)
+        state.stop()
+    }
+
+    @MainActor
+    func testDoubleTimeoutRetainsRecoveryGate() async {
+        let runner = PrimaryFailureRunner(mode: .doubleTimeout)
+        let state = mutationTestState(runner: runner)
+        await state.refresh()
+
+        await state.setAllRoutesThroughBaseten(true)
+
+        let calls = await runner.arguments
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertEqual(
+            state.mutationRecoveryState,
+            .blocked(errorCode: "reconciliation_required"))
+        XCTAssertFalse(state.canMutateRouting)
+        state.stop()
+    }
+
+    @MainActor
+    func testUnusableSecondaryReceiptRetainsRecoveryGate() async {
+        for mode in [
+            PrimaryFailureRunner.Mode.malformedSecondary,
+            .mismatchedSecondary,
+        ] {
+            let runner = PrimaryFailureRunner(mode: mode)
+            let state = mutationTestState(runner: runner)
+            await state.refresh()
+
+            await state.setAllRoutesThroughBaseten(true)
+
+            let calls = await runner.arguments
+            XCTAssertEqual(calls.count, 2)
+            XCTAssertEqual(
+                state.mutationRecoveryState,
+                .blocked(errorCode: "reconciliation_required"))
+            XCTAssertFalse(state.canMutateRouting)
+            state.stop()
+        }
+    }
+
+    @MainActor
+    func testMatchingTypedPrimaryErrorOutranksProcessTimeout() async {
+        let runner = PrimaryFailureRunner(mode: .timedTypedError)
+        let state = mutationTestState(runner: runner)
+        await state.refresh()
+
+        await state.setAllRoutesThroughBaseten(true)
+
+        let calls = await runner.arguments
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(
+            state.lastError,
+            "Routing settings changed before this request completed. Refresh and try again.")
+        XCTAssertFalse(state.lastError?.contains("timed out") == true)
+        state.stop()
+    }
+
+    @MainActor
+    func testTimedOutSuccessReceiptStillReconciles() async {
+        let runner = PrimaryFailureRunner(mode: .timedSuccess)
+        let state = mutationTestState(runner: runner)
+        await state.refresh()
+
+        await state.setAllRoutesThroughBaseten(true)
+
+        let calls = await runner.arguments
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertEqual(
+            Array(calls[1].prefix(3)),
+            ["--json", "mutation", "reconcile"])
+        XCTAssertFalse(state.lastError?.contains("timed out") == true)
+        state.stop()
+    }
+
+    @MainActor
+    func testRejectedReceiptWithCleanupPendingRetainsRecoveryGate() async {
+        let runner = CleanupPendingMutationRunner(mode: .rejected)
+        let state = mutationTestState(runner: runner)
+        await state.refresh()
+
+        await state.setAllRoutesThroughBaseten(true)
+
+        let calls = await runner.arguments
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(
+            state.mutationRecoveryState,
+            .blocked(errorCode: "cleanup_pending"))
+        XCTAssertFalse(state.canMutateRouting)
+        state.stop()
+    }
+
+    @MainActor
+    func testPriorActiveReconcileWithCleanupPendingIsNotResolved() async {
+        let runner = CleanupPendingMutationRunner(mode: .priorActive)
+        let state = mutationTestState(runner: runner)
+        await state.refresh()
+
+        await state.setAllRoutesThroughBaseten(true)
+
+        let calls = await runner.arguments
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertTrue(calls[1].contains("reconcile"))
+        XCTAssertEqual(
+            state.mutationRecoveryState,
+            .blocked(errorCode: "cleanup_pending"))
+        XCTAssertFalse(state.canMutateRouting)
+        state.stop()
     }
 
     func testMutationCoordinatorSerializesChildProcesses() async {
@@ -466,6 +1293,34 @@ final class RuntimeCoordinationTests: XCTestCase {
         let arguments = await runner.arguments
         XCTAssertEqual(maximumActive, 1)
         XCTAssertEqual(arguments, [["on"], ["on"]])
+    }
+
+    func testMutationCoordinatorDropsCanceledQueuedRequest() async {
+        let runner = BlockingFirstRunner()
+        let coordinator = MutationCoordinator(runner: runner)
+        let firstRequest = CLIExecutionRequest(
+            binary: URL(fileURLWithPath: "/usr/bin/true"),
+            arguments: ["first"],
+            environment: [:],
+            timeout: 1)
+        let secondRequest = CLIExecutionRequest(
+            binary: URL(fileURLWithPath: "/usr/bin/true"),
+            arguments: ["stale"],
+            environment: [:],
+            timeout: 1)
+
+        let first = Task { await coordinator.perform(firstRequest) }
+        await runner.waitUntilFirstStarted()
+        let stale = Task { await coordinator.perform(secondRequest) }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        stale.cancel()
+        let staleResult = await stale.value
+        await runner.releaseFirst()
+        _ = await first.value
+
+        XCTAssertEqual(staleResult.status, -1)
+        let calls = await runner.arguments
+        XCTAssertEqual(calls, [["first"]])
     }
 
     func testSuccessfulCLIWithUnchangedFamilyStateIsNotConfirmed() {
@@ -732,6 +1587,103 @@ final class RuntimeCoordinationTests: XCTestCase {
     }
 
     @MainActor
+    func testTargetlessReplayUsesSelectedFallbackAdapterClient() async {
+        let reader = SequencedAdminReader(statuses: [
+            previewStatus(
+                generation: 4,
+                hash: "sha256:old",
+                familyTarget: "zai-org/GLM-5.2",
+                clientName: "anthropic"),
+            previewStatus(
+                generation: 5,
+                hash: "sha256:new",
+                familyTarget: "native",
+                clientName: "anthropic"),
+        ])
+        let runner = ReconciliationReceiptRunner(
+            clientOverride: "anthropic")
+        let state = BasetenSwitchState(
+            variant: previewVariant(),
+            reader: reader,
+            cliRunner: runner,
+            loginItemService: FakeLoginItemService(),
+            previewRuntimeValidator: { _ in nil },
+            startPolling: false)
+        await state.refresh()
+        let client = try! XCTUnwrap(state.clients.first)
+
+        await state.routeFamily(client, family: "opus", choice: .native)
+
+        XCTAssertNil(state.lastError)
+        state.stop()
+    }
+
+    @MainActor
+    func testTargetlessTerminalReplayRequiresMatchingExactFingerprint() async {
+        let reader = SequencedAdminReader(statuses: [
+            previewStatus(
+                generation: 4,
+                hash: "sha256:old",
+                familyTarget: "zai-org/GLM-5.2"),
+            previewStatus(
+                generation: 5,
+                hash: "sha256:new",
+                familyTarget: "native"),
+        ])
+        let runner = ReconciliationReceiptRunner(
+            reconciledFingerprint:
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        let state = BasetenSwitchState(
+            variant: previewVariant(),
+            reader: reader,
+            cliRunner: runner,
+            loginItemService: FakeLoginItemService(),
+            previewRuntimeValidator: { _ in nil },
+            startPolling: false)
+        await state.refresh()
+        let client = try! XCTUnwrap(state.clients.first)
+
+        await state.routeFamily(client, family: "opus", choice: .native)
+
+        XCTAssertEqual(
+            state.lastError,
+            "Opus mapping was not present in the active router state.")
+        state.stop()
+    }
+
+    @MainActor
+    func testTerminalFingerprintMustBindTheDispatchedRequest() async {
+        let reader = SequencedAdminReader(statuses: [
+            previewStatus(
+                generation: 4,
+                hash: "sha256:old",
+                familyTarget: "zai-org/GLM-5.2"),
+            previewStatus(
+                generation: 5,
+                hash: "sha256:new",
+                familyTarget: "native"),
+        ])
+        let runner = ReconciliationReceiptRunner(
+            primaryTargetOverride: "different-target")
+        let state = BasetenSwitchState(
+            variant: previewVariant(),
+            reader: reader,
+            cliRunner: runner,
+            loginItemService: FakeLoginItemService(),
+            previewRuntimeValidator: { _ in nil },
+            startPolling: false)
+        await state.refresh()
+        let client = try! XCTUnwrap(state.clients.first)
+
+        await state.routeFamily(client, family: "opus", choice: .native)
+
+        XCTAssertEqual(
+            state.lastError,
+            "Opus mapping was not present in the active router state.")
+        state.stop()
+    }
+
+    @MainActor
     func testSubagentMutationUsesCASAndReconcilesBeforeClearingPending() async {
         let reader = SequencedAdminReader(statuses: [
             previewStatus(
@@ -817,6 +1769,77 @@ final class RuntimeCoordinationTests: XCTestCase {
         }
         XCTAssertFalse(state.canMutateRouting)
         state.stop()
+    }
+
+    private func recoveryResult(
+        ok: Bool,
+        classification: String = "",
+        errorCode: String = "",
+        status: Int32 = 0,
+        cleanupPending: Bool = false,
+        errorRetryable: Bool? = nil,
+        timedOut: Bool = false
+    ) -> CLIExecutionResult {
+        var object: [String: Any] = [
+            "ok": ok,
+            "classification": classification,
+            "cleanup_pending": cleanupPending,
+            "error": NSNull(),
+        ]
+        if !errorCode.isEmpty {
+            object["error"] = [
+                "code": errorCode,
+                "message": "private backend detail must not be displayed",
+                "retryable": errorRetryable
+                    ?? (errorCode == "mutation_locked"
+                        || errorCode == "router_unavailable"),
+            ]
+        }
+        let data = try! JSONSerialization.data(withJSONObject: object)
+        return CLIExecutionResult(
+            status: status,
+            standardOutput: String(decoding: data, as: UTF8.self),
+            standardError: "",
+            timedOut: timedOut)
+    }
+
+    private func recoveryStatusResult(
+        classification: String,
+        errorCode: String = "",
+        status: Int32 = 0
+    ) -> CLIExecutionResult {
+        var object: [String: Any] = [
+            "classification": classification,
+        ]
+        if !errorCode.isEmpty {
+            object["error"] = [
+                "code": errorCode,
+                "message": "reviewed status text",
+                "retryable": errorCode == "mutation_locked",
+            ]
+        }
+        let data = try! JSONSerialization.data(withJSONObject: object)
+        return CLIExecutionResult(
+            status: status,
+            standardOutput: String(decoding: data, as: UTF8.self),
+            standardError: "",
+            timedOut: false)
+    }
+
+    @MainActor
+    private func mutationTestState(
+        runner: any CLIRunning
+    ) -> BasetenSwitchState {
+        BasetenSwitchState(
+            variant: previewVariant(),
+            reader: CountingAdminReader(status: previewStatus(
+                generation: 4,
+                hash: "sha256:active",
+                familyTarget: "native")),
+            cliRunner: runner,
+            loginItemService: FakeLoginItemService(),
+            previewRuntimeValidator: { _ in nil },
+            startPolling: false)
     }
 
     private func argumentValue(_ flag: String,

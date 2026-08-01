@@ -377,7 +377,7 @@ func TestSubagentsOnWithoutModelExits1(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("on without model = %d, want 1 (%s)", code, stderr)
 	}
-	if !strings.Contains(stderr, "no subagent_model configured") {
+	if !strings.Contains(stderr, "set a subagent model") {
 		t.Errorf("error must name the fix: %q", stderr)
 	}
 }
@@ -585,7 +585,7 @@ door:
 	if strings.Contains(stderr, "verified live") {
 		t.Errorf("stale admin must not verify: %q", stderr)
 	}
-	if !strings.Contains(stderr, "restored and reactivated the prior exact config") {
+	if !strings.Contains(stderr, "prior routing state was restored") {
 		t.Errorf("rollback confirmation missing: %q", stderr)
 	}
 	// The notice must be calm, not scary: no "warning" prefix.

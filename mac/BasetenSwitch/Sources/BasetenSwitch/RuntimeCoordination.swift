@@ -303,27 +303,57 @@ struct SystemCLIRunner: CLIRunning {
 }
 
 actor MutationCoordinator {
+    private struct Waiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Bool, Never>
+    }
+
     private let runner: any CLIRunning
     private var busy = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var waiters: [Waiter] = []
 
     init(runner: any CLIRunning) {
         self.runner = runner
     }
 
     func perform(_ request: CLIExecutionRequest) async -> CLIExecutionResult {
-        await acquire()
+        guard await acquire() else {
+            return canceledCLIExecutionResult
+        }
+        guard !Task.isCancelled else {
+            release()
+            return canceledCLIExecutionResult
+        }
         defer { release() }
         return await runner.run(request)
     }
 
-    private func acquire() async {
+    private func acquire() async -> Bool {
+        guard !Task.isCancelled else { return false }
         if !busy {
             busy = true
-            return
+            return true
         }
-        await withCheckedContinuation { continuation in
-            waiters.append(continuation)
+        let id = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(returning: false)
+                } else {
+                    waiters.append(Waiter(
+                        id: id,
+                        continuation: continuation))
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(id) }
+        }
+    }
+
+    private func cancelWaiter(_ id: UUID) {
+        if let index = waiters.firstIndex(where: { $0.id == id }) {
+            let waiter = waiters.remove(at: index)
+            waiter.continuation.resume(returning: false)
         }
     }
 
@@ -331,8 +361,16 @@ actor MutationCoordinator {
         if waiters.isEmpty {
             busy = false
         } else {
-            waiters.removeFirst().resume()
+            waiters.removeFirst().continuation.resume(returning: true)
         }
+    }
+
+    private var canceledCLIExecutionResult: CLIExecutionResult {
+        CLIExecutionResult(
+            status: -1,
+            standardOutput: "",
+            standardError: "",
+            timedOut: false)
     }
 }
 
@@ -349,8 +387,14 @@ struct GlobalMutationReceipt: Equatable, Sendable {
     var activeConfigHash: String
     var applied: Bool
     var reconciliationRequired: Bool
+    var blockingOperationID: String
+    var outcome: String
+    var cleanupPending: Bool
+    var requestFingerprint: String
+    var identityStrength: String
     var errorCode: String
     var errorMessage: String
+    var errorRetryable: Bool
 
     init?(json: String) {
         guard let data = json.data(using: .utf8),
@@ -371,10 +415,51 @@ struct GlobalMutationReceipt: Equatable, Sendable {
         applied = dict["applied"] as? Bool ?? false
         reconciliationRequired =
             dict["reconciliation_required"] as? Bool ?? false
+        blockingOperationID = dict["blocking_operation_id"] as? String ?? ""
+        outcome = dict["outcome"] as? String ?? ""
+        cleanupPending = dict["cleanup_pending"] as? Bool ?? false
+        requestFingerprint = dict["request_fingerprint"] as? String ?? ""
+        identityStrength = dict["identity_strength"] as? String ?? ""
         let error = dict["error"] as? [String: Any]
         errorCode = error?["code"] as? String ?? ""
         errorMessage = error?["message"] as? String ?? ""
+        errorRetryable = error?["retryable"] as? Bool ?? false
     }
+}
+
+struct MutationRecoveryReceipt: Equatable, Sendable {
+    var ok: Bool
+    var classification: String
+    var operationID: String
+    var cleanupPending: Bool
+    var errorCode: String
+    var errorRetryable: Bool
+
+    init?(json: String) {
+        guard let data = json.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let dict = object as? [String: Any] else {
+            return nil
+        }
+        ok = dict["ok"] as? Bool ?? false
+        classification = dict["classification"] as? String
+            ?? dict["status"] as? String
+            ?? ""
+        operationID = dict["operation_id"] as? String ?? ""
+        cleanupPending = dict["cleanup_pending"] as? Bool ?? false
+        let error = dict["error"] as? [String: Any]
+        errorCode = error?["code"] as? String ?? ""
+        errorRetryable = error?["retryable"] as? Bool ?? false
+    }
+}
+
+func isValidMutationRequestFingerprint(_ value: String) -> Bool {
+    guard value.hasPrefix("sha256:") else { return false }
+    let digest = value.dropFirst("sha256:".count)
+    return digest.count == 64
+        && digest.allSatisfy {
+            $0.isNumber || ("a"..."f").contains($0)
+        }
 }
 
 func allowlistedCLIEnvironment(

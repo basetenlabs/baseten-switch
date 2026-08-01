@@ -5,13 +5,13 @@
 // and names the FIRST failed link with a concrete fix, so a broken
 // setup never needs a manual link-by-link back-and-forth.
 //
-// doctor NEVER mutates anything: no starts, no config writes, no
-// settings writes. The only side effect is terminal output. Exit
-// codes: 0 = no check failed (warns allowed), 1 = at least one FAIL,
-// 2 = usage error. The one exception is the opt-in `--fix` repair
-// loop (doctor_fix.go), which mutates only by running existing
-// baseten-switch verbs as confirmed child processes; runDoctor itself
-// stays read-only in both modes.
+// doctor NEVER mutates config, journal/terminal recovery state, router state,
+// or installed settings. It may create or secure coordination metadata while
+// acquiring the mutation status lock. Exit codes: 0 = no check failed (warns
+// allowed), 1 = at least one FAIL, 2 = usage error. The one exception is the
+// opt-in `--fix` repair loop (doctor_fix.go), which mutates only by running
+// existing baseten-switch verbs as confirmed child processes; runDoctor
+// itself stays read-only with respect to managed state in both modes.
 //
 // Test override points (the same seams the rest of the CLI uses):
 // BASETEN_SWITCH_CONFIG_PATH, BASETEN_SWITCH_ADMIN_ADDR, BASETEN_SWITCH_GATEWAY_PIDFILE,
@@ -53,6 +53,10 @@ const (
 	docFail = "fail"
 	docSkip = "skip"
 )
+
+// doctorInspectRoutingMutationStatus is a seam for exercising the doctor's
+// rendering and repair policy independently from journal and router I/O.
+var doctorInspectRoutingMutationStatus = inspectRoutingMutationStatus
 
 type doctorCheck struct {
 	Section string `json:"section"`
@@ -132,8 +136,9 @@ func cmdDoctor(args []string) int {
 	return rep.ExitCode
 }
 
-// runDoctor executes every check in request-path order and returns the
-// full report. All state gathering is read-only.
+// runDoctor executes every check in request-path order and returns the full
+// report. State gathering does not mutate managed state; mutation status may
+// acquire its coordination lock.
 func runDoctor(o doctorOpts) doctorReport {
 	rep := doctorReport{}
 	var add addCheck = func(section, name, status, finding, fix string, fixArgv ...string) {
@@ -191,7 +196,15 @@ func runDoctor(o doctorOpts) doctorReport {
 	doctorBasetenCLICheck(add)
 
 	// --- 4. router --------------------------------------------------------
-	st := doctorRouterChecks(add, adminAddr, routerState)
+	// Inspect mutation recovery before attaching any automatic lifecycle
+	// repair. Starting the router can make the config currently on disk
+	// authoritative, so an unfinished or unreadable mutation must suppress
+	// every `up` fix until recovery has been handled explicitly.
+	mutationStatus, mutationStatusErr := doctorInspectRoutingMutationStatus(cfgPath)
+	allowStartupFix := mutationStatusErr == nil && mutationStatus.Classification == mutationStatusNone
+	st := doctorRouterChecks(add, adminAddr, routerState, allowStartupFix)
+	doctorMutationRecoveryCheckForStatus(add, mutationStatus, mutationStatusErr)
+	doctorRouterClientChecks(add, st)
 	boundAddrs := map[string]bool{}
 	if st != nil {
 		for _, c := range st.Clients {
@@ -202,7 +215,7 @@ func runDoctor(o doctorOpts) doctorReport {
 	}
 
 	// --- 5. door ----------------------------------------------------------
-	doorUp := doctorDoorChecks(add, doorSpecs, st != nil, boundAddrs)
+	doorUp := doctorDoorChecks(add, doorSpecs, st != nil, boundAddrs, allowStartupFix)
 
 	// Resolve the telemetry store path once: the claude subagents traffic
 	// check (section 6) and the telemetry section (9) both use it.
@@ -218,7 +231,7 @@ func runDoctor(o doctorOpts) doctorReport {
 	doctorCodexChecks(add, f, envFile, envFilePath)
 
 	// --- 7. supervision ---------------------------------------------------
-	doctorSupervisionChecks(add, routerState, doorSpecs, doorUp)
+	doctorSupervisionChecks(add, routerState, doorSpecs, doorUp, allowStartupFix)
 
 	// --- 8. e2e -----------------------------------------------------------
 	doctorE2EChecks(add, o, doorSpecs, doorUp, f, telPath)
@@ -638,19 +651,23 @@ func doctorBasetenRouted(f *config.File) []string {
 }
 
 // doctorRouterChecks probes the admin listener (ours/foreign/down, the
-// probePort semantics `up` uses), parses the admin status, and checks
-// every enabled client: bound, valid route, sane fallback_route, and a
-// listener that actually accepts TCP. Returns the parsed status (nil
-// when unavailable) for the door wiring check.
-func doctorRouterChecks(add addCheck, adminAddr string, state portState) *doctorAdminStatus {
+// probePort semantics `up` uses) and parses the admin status. Returns the
+// parsed status (nil when unavailable) for the mutation, client, and door
+// wiring checks.
+func doctorRouterChecks(add addCheck, adminAddr string, state portState, allowStartupFix bool) *doctorAdminStatus {
 	switch state {
 	case portForeign:
 		add("router", "reachable", docFail,
 			fmt.Sprintf("a foreign process (%s) owns %s (answers, but not our router)", portOwner(adminAddr), adminAddr),
 			"free the port or change BASETEN_SWITCH_ADMIN_ADDR")
 	case portDown:
-		add("router", "reachable", docFail, fmt.Sprintf("router not running (nothing listens on %s)", adminAddr),
-			"baseten-switch up", "up")
+		if allowStartupFix {
+			add("router", "reachable", docFail, fmt.Sprintf("router not running (nothing listens on %s)", adminAddr),
+				"baseten-switch up", "up")
+		} else {
+			add("router", "reachable", docFail, fmt.Sprintf("router not running (nothing listens on %s)", adminAddr),
+				"resolve the routing mutation recovery state before running 'baseten-switch up'")
+		}
 	default:
 		var h struct {
 			UptimeSeconds int64 `json:"uptime_seconds"`
@@ -667,7 +684,6 @@ func doctorRouterChecks(add addCheck, adminAddr string, state portState) *doctor
 	}
 	if state != portOurs {
 		add("router", "status", docSkip, "router not up", "")
-		add("router", "clients", docSkip, "router not up", "")
 		return nil
 	}
 
@@ -676,17 +692,95 @@ func doctorRouterChecks(add addCheck, adminAddr string, state portState) *doctor
 	if !ok {
 		add("router", "status", docFail, fmt.Sprintf("admin /v1/admin/status unreachable at %s", adminAddr),
 			"check the router log; restart with 'baseten-switch restart'")
-		add("router", "clients", docSkip, "admin status unavailable", "")
 		return nil
 	}
 	var st doctorAdminStatus
 	if err := json.Unmarshal([]byte(body), &st); err != nil {
 		add("router", "status", docFail, fmt.Sprintf("admin status does not parse: %v", err),
 			"version mismatch between CLI and router? restart with 'baseten-switch restart'")
-		add("router", "clients", docSkip, "admin status unavailable", "")
 		return nil
 	}
 	add("router", "status", docOK, "admin status parses", "")
+	return &st
+}
+
+// doctorMutationRecoveryCheck reports the read-only status classification.
+// It intentionally exposes only reviewed messages and never raw paths, target
+// values, journal bytes, or underlying filesystem and admin errors.
+func doctorMutationRecoveryCheck(add addCheck, configPath string) {
+	status, err := doctorInspectRoutingMutationStatus(configPath)
+	doctorMutationRecoveryCheckForStatus(add, status, err)
+}
+
+func doctorMutationRecoveryCheckForStatus(add addCheck, status routingMutationStatus, err error) {
+	if err != nil {
+		add("router", "mutation_recovery", docFail,
+			"routing mutation recovery state could not be inspected",
+			"run 'baseten-switch mutation status' and preserve the recovery files for manual review")
+		return
+	}
+
+	switch status.Classification {
+	case mutationStatusNone:
+		add("router", "mutation_recovery", docOK, "no unfinished routing mutation", "")
+	case mutationStatusDesiredActive:
+		add("router", "mutation_recovery", docFail,
+			"a previous routing change is active but its recovery record still needs cleanup",
+			"baseten-switch mutation recover", "mutation", "recover")
+	case mutationStatusPriorActive:
+		add("router", "mutation_recovery", docFail,
+			"a previous routing change was not applied; the prior routing state is active and its recovery record still needs cleanup",
+			"baseten-switch mutation recover", "mutation", "recover")
+	case mutationStatusCleanupPending:
+		add("router", "mutation_recovery", docFail,
+			"a completed routing change has stale recovery cleanup state",
+			"baseten-switch mutation recover", "mutation", "recover")
+	case mutationStatusDesiredPending:
+		add("router", "mutation_recovery", docFail,
+			"a pending routing change is present but is not the active router configuration",
+			"review 'baseten-switch mutation status'; explicit reconciliation is required")
+	case mutationStatusPriorPending:
+		add("router", "mutation_recovery", docFail,
+			"a pending routing change still has its prior configuration on disk",
+			"review 'baseten-switch mutation status'; explicit reconciliation is required")
+	case mutationStatusRouterUnavailable:
+		add("router", "mutation_recovery", docFail,
+			"the router is unavailable to confirm a pending routing change",
+			"start the router, then rerun 'baseten-switch doctor --fix'")
+	case mutationStatusRouterUnsupported:
+		add("router", "mutation_recovery", docFail,
+			"the running router cannot report authoritative mutation recovery state",
+			"restart with the current baseten-switch binary, then rerun doctor")
+	case mutationStatusExternalChange:
+		add("router", "mutation_recovery", docFail,
+			"the configuration changed outside the pending routing operation; both states were preserved",
+			"review 'baseten-switch mutation status' before explicit reconciliation")
+	case mutationStatusCommitRecoveryRequired:
+		add("router", "mutation_recovery", docFail,
+			"an interrupted exact-config commit requires explicit recovery",
+			"review 'baseten-switch mutation status' before explicit reconciliation")
+	case mutationStatusJournalInvalid:
+		add("router", "mutation_recovery", docFail,
+			"routing mutation recovery state is invalid",
+			"run 'baseten-switch mutation status' and preserve the recovery files for manual review")
+	case mutationStatusJournalConflict:
+		add("router", "mutation_recovery", docFail,
+			"multiple or conflicting routing mutation records require manual recovery",
+			"run 'baseten-switch mutation status' and preserve the recovery files for manual review")
+	default:
+		add("router", "mutation_recovery", docFail,
+			"routing mutation recovery state has an unsupported classification",
+			"run 'baseten-switch mutation status' and preserve the recovery files for manual review")
+	}
+}
+
+// doctorRouterClientChecks checks every enabled client: bound, valid route,
+// sane fallback_route, and a listener that actually accepts TCP.
+func doctorRouterClientChecks(add addCheck, st *doctorAdminStatus) {
+	if st == nil {
+		add("router", "clients", docSkip, "admin status unavailable", "")
+		return
+	}
 
 	checked := 0
 	for _, c := range st.Clients {
@@ -719,7 +813,6 @@ func doctorRouterChecks(add addCheck, adminAddr string, state portState) *doctor
 	if checked == 0 {
 		add("router", "clients", docSkip, "no enabled clients to check (see config section)", "")
 	}
-	return &st
 }
 
 func dialOK(addr string) bool {
@@ -735,7 +828,7 @@ func dialOK(addr string) bool {
 // ours/foreign/down semantics) and verifies the live door's router
 // target is an addr some bound client actually listens on. Returns
 // which ports answered as ours, for the supervision and e2e sections.
-func doctorDoorChecks(add addCheck, doorSpecs []door.Config, haveStatus bool, boundAddrs map[string]bool) map[string]bool {
+func doctorDoorChecks(add addCheck, doorSpecs []door.Config, haveStatus bool, boundAddrs map[string]bool, allowStartupFix bool) map[string]bool {
 	doorUp := map[string]bool{}
 	if len(doorSpecs) == 0 {
 		add("door", "ports", docSkip, "no usable door ports (see config section)", "")
@@ -745,7 +838,12 @@ func doctorDoorChecks(add addCheck, doorSpecs []door.Config, haveStatus bool, bo
 		port := portOf(sp.ListenAddr)
 		switch probePort(sp.ListenAddr, doorHealthPath, doorHealthMarker) {
 		case portDown:
-			add("door", "doorz:"+port, docFail, fmt.Sprintf("door not running (nothing listens on %s)", sp.ListenAddr), "baseten-switch up", "up")
+			if allowStartupFix {
+				add("door", "doorz:"+port, docFail, fmt.Sprintf("door not running (nothing listens on %s)", sp.ListenAddr), "baseten-switch up", "up")
+			} else {
+				add("door", "doorz:"+port, docFail, fmt.Sprintf("door not running (nothing listens on %s)", sp.ListenAddr),
+					"resolve the routing mutation recovery state before running 'baseten-switch up'")
+			}
 			add("door", "wiring:"+port, docSkip, "door not up", "")
 			continue
 		case portForeign:
@@ -1409,7 +1507,7 @@ func doctorPortTarget(raw, desiredPort string) (status, finding string) {
 // doctorSupervisionChecks reports the launchd state per label. Skipped
 // entirely under BASETEN_SWITCH_LAUNCHD=off or off darwin, matching the rest of
 // the CLI's launchd seam.
-func doctorSupervisionChecks(add addCheck, routerState portState, doorSpecs []door.Config, doorUp map[string]bool) {
+func doctorSupervisionChecks(add addCheck, routerState portState, doorSpecs []door.Config, doorUp map[string]bool, allowStartupFix bool) {
 	if runtime.GOOS != "darwin" || launchdDisabled() {
 		add("supervision", "launchd", docSkip, "launchd interaction disabled (BASETEN_SWITCH_LAUNCHD=off or non-darwin)", "")
 		return
@@ -1429,10 +1527,16 @@ func doctorSupervisionChecks(add addCheck, routerState portState, doorSpecs []do
 		case s.supervised():
 			add("supervision", c.name, docOK, "launchd job "+c.label+" loaded", "")
 		case s.installed:
-			add("supervision", c.name, docWarn,
-				"launchd plist installed but "+c.label+" is not loaded (a login-items approval in System Settings may be pending)",
-				"baseten-switch up   (re-bootstraps the job; approve it in System Settings > General > Login Items if prompted)",
-				"up")
+			if allowStartupFix {
+				add("supervision", c.name, docWarn,
+					"launchd plist installed but "+c.label+" is not loaded (a login-items approval in System Settings may be pending)",
+					"baseten-switch up   (re-bootstraps the job; approve it in System Settings > General > Login Items if prompted)",
+					"up")
+			} else {
+				add("supervision", c.name, docWarn,
+					"launchd plist installed but "+c.label+" is not loaded (a login-items approval in System Settings may be pending)",
+					"resolve the routing mutation recovery state before re-bootstrapping the job")
+			}
 		case c.up:
 			add("supervision", c.name, docWarn, c.name+" is running unsupervised (no LaunchAgent installed)",
 				"baseten-switch up --install")

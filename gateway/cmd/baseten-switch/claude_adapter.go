@@ -93,6 +93,9 @@ func cmdClaude(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: baseten-switch claude on|off|status|subagents [<model>|on|inherit]|route [<family> <target|default>]|reasoning baseten <model> off|follow-harness|effort <value>|default  (start/stop are aliases for on/off)")
 		return 2
 	}
+	if replayed, rc := preflightClaudeTerminalReplay(args); replayed {
+		return rc
+	}
 	a, err := newClaudeAdapterFromEnv()
 	if err != nil {
 		if args[0] == "route" ||
@@ -128,11 +131,47 @@ func cmdClaude(args []string) int {
 	case "route":
 		return a.route(args[1:], os.Stdout)
 	case "reasoning":
-		return runClientReasoning(a.clientName, args[1:], os.Stdout)
+		return runClientReasoning(mutationSurfaceClaude, a.clientName, args[1:], os.Stdout)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown claude subcommand: %s (use on|off|status|subagents|route|reasoning)\n", args[0])
 		return 2
 	}
+}
+
+func preflightClaudeTerminalReplay(args []string) (bool, int) {
+	path, _ := resolveConfigPath()
+	var opts mutationOptions
+	var spec journaledMutationSpec
+	var err error
+	switch args[0] {
+	case "route":
+		var positional []string
+		opts, positional, err = parseMutationOptions(args[1:])
+		if err != nil || len(positional) != 2 {
+			return false, 0
+		}
+		spec = journaledMutationSpec{Operation: "set_claude_route", Surface: mutationSurfaceClaude, Key: positional[0], RequestedTarget: positional[1]}
+	case "subagents":
+		var positional []string
+		opts, positional, err = parseMutationOptions(args[1:])
+		if err != nil || len(positional) != 1 {
+			return false, 0
+		}
+		target := positional[0]
+		if target == "off" {
+			target = "inherit"
+		}
+		spec = journaledMutationSpec{Operation: "set_claude_subagents", Surface: mutationSurfaceClaude, Key: "subagents", RequestedTarget: target}
+	case "reasoning":
+		opts, spec, err = reasoningTerminalReplayRequest("", args[1:])
+		if err != nil {
+			return false, 0
+		}
+		spec.Surface = mutationSurfaceClaude
+	default:
+		return false, 0
+	}
+	return preflightTerminalReplay(path, opts, spec, os.Stdout)
 }
 
 // claudeAdapter carries the resolved paths and gateway topology for
@@ -166,6 +205,7 @@ func (a *claudeAdapter) requiresJournaledMutation(_ mutationOptions) (bool, erro
 }
 
 func (a *claudeAdapter) runClaudeJournaledMutationLocked(opts mutationOptions, stdout io.Writer, spec journaledMutationSpec) int {
+	spec.Surface = mutationSurfaceClaude
 	out := stdout
 	if !opts.JSON {
 		out = a.out
@@ -1235,8 +1275,9 @@ func (a *claudeAdapter) subagentsSetModel(model string, opts mutationOptions, st
 		})
 	}
 	if err := config.SetClientScalars(a.configPath, a.clientName, set); err != nil {
-		fmt.Fprintf(a.out, "claude subagents: %v\n", err)
-		return 1
+		return failMutation(opts, stdout, mutationResult{
+			Operation: "set_claude_subagents", Client: a.clientName, Key: "subagents", RequestedTarget: model, ConfigPath: a.configPath,
+		}, "config_edit_failed", err.Error(), false, 1)
 	}
 
 	switch class {
@@ -1259,8 +1300,9 @@ func (a *claudeAdapter) subagentsSetModel(model string, opts mutationOptions, st
 func (a *claudeAdapter) subagentsRouting(want, requestedTarget string, opts mutationOptions, stdout io.Writer, journaled bool) int {
 	f, err := config.Load(a.configPath)
 	if err != nil {
-		fmt.Fprintf(a.out, "claude subagents: %v\n", err)
-		return 1
+		return failMutation(opts, stdout, mutationResult{
+			Operation: "set_claude_subagents", Client: a.clientName, Key: "subagents", RequestedTarget: requestedTarget, ConfigPath: a.configPath,
+		}, "config_load_failed", err.Error(), false, 1)
 	}
 	var cur *config.Client
 	for i := range f.Clients {
@@ -1270,8 +1312,9 @@ func (a *claudeAdapter) subagentsRouting(want, requestedTarget string, opts muta
 		}
 	}
 	if cur == nil {
-		fmt.Fprintf(a.out, "claude subagents: no client named %q in %s\n", a.clientName, a.configPath)
-		return 1
+		return failMutation(opts, stdout, mutationResult{
+			Operation: "set_claude_subagents", Client: a.clientName, Key: "subagents", RequestedTarget: requestedTarget, ConfigPath: a.configPath,
+		}, "invalid_routing_policy", "selected client is absent from the routing config", false, 1)
 	}
 	if want == "on" && cur.SubagentModel == "" {
 		return failMutation(opts, stdout, mutationResult{
@@ -1337,8 +1380,9 @@ func (a *claudeAdapter) subagentsRouting(want, requestedTarget string, opts muta
 	}
 
 	if err := config.SetClientScalars(a.configPath, a.clientName, set); err != nil {
-		fmt.Fprintf(a.out, "claude subagents: %v\n", err)
-		return 1
+		return failMutation(opts, stdout, mutationResult{
+			Operation: "set_claude_subagents", Client: a.clientName, Key: "subagents", RequestedTarget: requestedTarget, ConfigPath: a.configPath,
+		}, "config_edit_failed", err.Error(), false, 1)
 	}
 	a.subagentsReloadAndVerify(cur.SubagentModel, want)
 	if want == "off" {
@@ -1716,8 +1760,9 @@ func (a *claudeAdapter) routeSet(key, target string, stdout io.Writer, opts muta
 		})
 	}
 	if err := config.SetClientMapEntries(a.configPath, a.clientName, "model_routes", map[string]string{key: target}); err != nil {
-		fmt.Fprintf(a.out, "claude route: %v\n", err)
-		return 1
+		return failMutation(opts, stdout, mutationResult{
+			Operation: "set_claude_route", Client: a.clientName, Key: key, RequestedTarget: target, ConfigPath: a.configPath,
+		}, "config_edit_failed", err.Error(), false, 1)
 	}
 	switch class {
 	case subagentClassSlug:
@@ -1733,8 +1778,9 @@ func (a *claudeAdapter) routeSet(key, target string, stdout io.Writer, opts muta
 func (a *claudeAdapter) routeRemove(key string, stdout io.Writer, opts mutationOptions, journaled bool) int {
 	f, err := config.Load(a.configPath)
 	if err != nil {
-		fmt.Fprintf(a.out, "claude route: %v\n", err)
-		return 1
+		return failMutation(opts, stdout, mutationResult{
+			Operation: "set_claude_route", Client: a.clientName, Key: key, RequestedTarget: "default", ConfigPath: a.configPath,
+		}, "config_load_failed", err.Error(), false, 1)
 	}
 	var cur *config.Client
 	for i := range f.Clients {
@@ -1744,10 +1790,21 @@ func (a *claudeAdapter) routeRemove(key string, stdout io.Writer, opts mutationO
 		}
 	}
 	if cur == nil {
-		fmt.Fprintf(a.out, "claude route: no client named %q in %s\n", a.clientName, a.configPath)
-		return 1
+		return failMutation(opts, stdout, mutationResult{
+			Operation: "set_claude_route", Client: a.clientName, Key: key, RequestedTarget: "default", ConfigPath: a.configPath,
+		}, "invalid_routing_policy", "selected client is absent from the routing config", false, 1)
 	}
 	if _, pinned := cur.ModelRoutes[key]; !pinned {
+		if journaled {
+			return a.runClaudeJournaledMutationLocked(opts, stdout, journaledMutationSpec{
+				Operation:       "set_claude_route",
+				RequestedTarget: "default",
+				Client:          a.clientName,
+				Key:             key,
+				Apply:           func(string) error { return nil },
+				HumanSuccess:    fmt.Sprintf("claude route: %s already default (no pin in gateway.yaml)", key),
+			})
+		}
 		fmt.Fprintf(a.out, "claude route: %s already default (no pin in gateway.yaml)\n", key)
 		return 0
 	}
@@ -1772,8 +1829,9 @@ func (a *claudeAdapter) routeRemove(key string, stdout io.Writer, opts mutationO
 		return 0
 	}
 	if err := config.RemoveClientMapEntries(a.configPath, a.clientName, "model_routes", []string{key}); err != nil {
-		fmt.Fprintf(a.out, "claude route: %v\n", err)
-		return 1
+		return failMutation(opts, stdout, mutationResult{
+			Operation: "set_claude_route", Client: a.clientName, Key: key, RequestedTarget: "default", ConfigPath: a.configPath,
+		}, "config_edit_failed", err.Error(), false, 1)
 	}
 	a.routeReloadAndVerify(key, "")
 	fmt.Fprintf(a.out, "claude route: %s -> default (pin removed from %s)\n", key, a.configPath)

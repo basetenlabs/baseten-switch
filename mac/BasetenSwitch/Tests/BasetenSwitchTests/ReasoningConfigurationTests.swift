@@ -71,6 +71,7 @@ private actor ReasoningAdminReader: AdminStatusReading {
 private actor FixedReasoningPreflightReader: ReasoningPreflightReading {
     let snapshot: ReasoningPreflightSnapshot
     private(set) var calls = 0
+    private(set) var clients: [String] = []
 
     init(snapshot: ReasoningPreflightSnapshot) {
         self.snapshot = snapshot
@@ -83,6 +84,7 @@ private actor FixedReasoningPreflightReader: ReasoningPreflightReading {
         policy: ReasoningPolicyValue
     ) async throws -> ReasoningPreflightSnapshot {
         calls += 1
+        clients.append(client)
         return snapshot
     }
 }
@@ -96,6 +98,52 @@ private actor ReasoningRecordingRunner: CLIRunning {
             status: 1,
             standardOutput: "",
             standardError: "fixture failure",
+            timedOut: false)
+    }
+}
+
+private actor ReasoningTerminalReplayRunner: CLIRunning {
+    private(set) var arguments: [[String]] = []
+
+    func run(_ request: CLIExecutionRequest) async -> CLIExecutionResult {
+        arguments.append(request.arguments)
+        let reconciling = request.arguments.contains("reconcile")
+        let operationID: String
+        if let index = request.arguments.firstIndex(of: "--operation-id"),
+           request.arguments.indices.contains(index + 1) {
+            operationID = request.arguments[index + 1]
+        } else {
+            operationID = request.arguments.last ?? ""
+        }
+        var object: [String: Any] = [
+            "ok": reconciling,
+            "operation_id": operationID,
+            "operation": "set_model_reasoning",
+            "client": "claude-code",
+            "desired_config_hash": "sha256:active",
+            "active_config_hash": "sha256:active",
+            "active_token": "boot-a:4",
+            "applied": reconciling,
+            "reconciliation_required": !reconciling,
+            "request_fingerprint":
+                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "identity_strength": "exact",
+            "error": reconciling
+                ? NSNull()
+                : [
+                    "code": "activation_indeterminate",
+                    "message": "reconciliation required",
+                ],
+        ]
+        if !reconciling {
+            object["key"] = "zai-org/GLM-5.2"
+            object["requested_target"] = "default"
+        }
+        let data = try! JSONSerialization.data(withJSONObject: object)
+        return CLIExecutionResult(
+            status: reconciling ? 0 : 1,
+            standardOutput: String(decoding: data, as: UTF8.self),
+            standardError: "",
             timedOut: false)
     }
 }
@@ -639,6 +687,14 @@ final class ReasoningConfigurationTests: XCTestCase {
                 model: model,
                 policy: ReasoningPolicyValue(mode: .fixed, effort: "high")),
             ["codex", "reasoning", "baseten", model, "effort", "high"])
+        XCTAssertEqual(
+            reasoningDispatchArgs(
+                client: "anthropic-fallback",
+                protocolShape: "anthropic",
+                provider: "baseten",
+                model: model,
+                policy: ReasoningPolicyValue(mode: .off)),
+            ["claude", "reasoning", "baseten", model, "off"])
 
         let fixed = routingSnapshot(client: reasoningClient(
             configured: ["mode": "fixed", "effort": "high"],
@@ -708,6 +764,41 @@ final class ReasoningConfigurationTests: XCTestCase {
     }
 
     @MainActor
+    func testFallbackAnthropicReasoningUsesClaudeVerbAndSelectedIdentity()
+        async {
+        let preflight = FixedReasoningPreflightReader(
+            snapshot: preflightSnapshot())
+        let runner = ReasoningRecordingRunner()
+        let state = makeState(
+            preflight: preflight,
+            runner: runner,
+            clientName: "anthropic-fallback",
+            protocolShape: "anthropic")
+        await state.refresh()
+
+        XCTAssertTrue(state.requestReasoning(
+            client: "anthropic-fallback",
+            provider: "baseten",
+            model: model,
+            policy: ReasoningPolicyValue(mode: .followHarness)))
+        await waitUntil { state.pendingReasoning == nil }
+
+        let clients = await preflight.clients
+        XCTAssertEqual(clients, ["anthropic-fallback"])
+        let calls = await runner.arguments
+        XCTAssertEqual(
+            Array(calls[0].suffix(5)),
+            [
+                "claude",
+                "reasoning",
+                "baseten",
+                model,
+                "follow-harness",
+            ])
+        state.stop()
+    }
+
+    @MainActor
     func testDefaultResetSkipsPreflightAndUsesTypedCLIPath() async {
         let preflight = FixedReasoningPreflightReader(
             snapshot: preflightSnapshot())
@@ -731,6 +822,32 @@ final class ReasoningConfigurationTests: XCTestCase {
         XCTAssertEqual(
             Array(calls[0].suffix(5)),
             ["claude", "reasoning", "baseten", model, "default"])
+        XCTAssertEqual(
+            Array(calls[1].prefix(3)),
+            ["--json", "mutation", "reconcile"])
+        state.stop()
+    }
+
+    @MainActor
+    func testReasoningAcceptsVerifiedTargetlessTerminalReplay() async {
+        let preflight = FixedReasoningPreflightReader(
+            snapshot: preflightSnapshot())
+        let runner = ReasoningTerminalReplayRunner()
+        let state = makeState(
+            preflight: preflight,
+            runner: runner)
+        await state.refresh()
+
+        XCTAssertTrue(state.requestReasoning(
+            client: "claude-code",
+            provider: "baseten",
+            model: model,
+            policy: ReasoningPolicyValue(mode: .default)))
+        await waitUntil { state.pendingReasoning == nil }
+
+        XCTAssertNil(state.lastError)
+        let calls = await runner.arguments
+        XCTAssertEqual(calls.count, 2)
         XCTAssertEqual(
             Array(calls[1].prefix(3)),
             ["--json", "mutation", "reconcile"])
@@ -1004,7 +1121,9 @@ final class ReasoningConfigurationTests: XCTestCase {
     @MainActor
     private func makeState(
         preflight: FixedReasoningPreflightReader,
-        runner: ReasoningRecordingRunner
+        runner: any CLIRunning,
+        clientName: String = "claude-code",
+        protocolShape: String = "anthropic"
     ) -> BasetenSwitchState {
         let status = AdminStatusSnapshot(dict: [
             "router_boot_id": "boot-a",
@@ -1014,9 +1133,10 @@ final class ReasoningConfigurationTests: XCTestCase {
             "health": "ready",
             "global_routing_enabled": true,
             "clients": [[
-                "name": "claude-code",
+                "name": clientName,
                 "enabled": true,
                 "bind_addr": "127.0.0.1:8789",
+                "protocol_shape": protocolShape,
                 "model_options": [
                     "baseten": [
                         model: [

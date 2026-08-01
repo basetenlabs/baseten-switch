@@ -20,6 +20,12 @@ import (
 
 const mutationJournalVersion = 1
 
+const (
+	mutationSurfaceSwitch = "switch"
+	mutationSurfaceClaude = "claude"
+	mutationSurfaceCodex  = "codex"
+)
+
 var (
 	mutationLockTimeout = 2 * time.Second
 	mutationHTTPTimeout = 500 * time.Millisecond
@@ -68,6 +74,8 @@ type mutationOptions struct {
 	IfActiveToken  string
 	IfConfigHash   string
 	hasOperationID bool
+	hasActiveToken bool
+	hasConfigHash  bool
 }
 
 type mutationError struct {
@@ -92,6 +100,11 @@ type mutationResult struct {
 	ActiveConfigHash          string         `json:"active_config_hash"`
 	Applied                   bool           `json:"applied"`
 	ReconciliationRequired    bool           `json:"reconciliation_required,omitempty"`
+	BlockingOperationID       string         `json:"blocking_operation_id,omitempty"`
+	Outcome                   string         `json:"outcome,omitempty"`
+	RequestFingerprint        string         `json:"request_fingerprint,omitempty"`
+	IdentityStrength          string         `json:"identity_strength,omitempty"`
+	CleanupPending            bool           `json:"cleanup_pending,omitempty"`
 	Error                     *mutationError `json:"error"`
 }
 
@@ -117,6 +130,7 @@ type routingMutationJournal struct {
 	Version             int       `json:"version"`
 	OperationID         string    `json:"operation_id"`
 	Operation           string    `json:"operation"`
+	Surface             string    `json:"surface,omitempty"`
 	ConfigPath          string    `json:"config_path"`
 	Requested           bool      `json:"requested"`
 	RequestedTarget     string    `json:"requested_target,omitempty"`
@@ -128,6 +142,9 @@ type routingMutationJournal struct {
 	PreviousConfigHash  string    `json:"previous_config_hash"`
 	DesiredConfigHash   string    `json:"desired_config_hash"`
 	PreviousActiveToken string    `json:"previous_active_token"`
+	IfConfigHash        string    `json:"if_config_hash,omitempty"`
+	IfActiveToken       string    `json:"if_active_token,omitempty"`
+	RequestFingerprint  string    `json:"request_fingerprint,omitempty"`
 	CreatedAt           time.Time `json:"created_at"`
 }
 
@@ -246,16 +263,20 @@ func parseMutationOptions(args []string) (mutationOptions, []string, error) {
 			}
 			i++
 			opts.IfActiveToken = args[i]
+			opts.hasActiveToken = true
 		case strings.HasPrefix(arg, "--if-active-token="):
 			opts.IfActiveToken = strings.TrimPrefix(arg, "--if-active-token=")
+			opts.hasActiveToken = true
 		case arg == "--if-config-hash":
 			if i+1 >= len(args) {
 				return opts, nil, fmt.Errorf("--if-config-hash requires a value")
 			}
 			i++
 			opts.IfConfigHash = args[i]
+			opts.hasConfigHash = true
 		case strings.HasPrefix(arg, "--if-config-hash="):
 			opts.IfConfigHash = strings.TrimPrefix(arg, "--if-config-hash=")
+			opts.hasConfigHash = true
 		case strings.HasPrefix(arg, "-"):
 			return opts, nil, fmt.Errorf("unknown mutation option %q", arg)
 		default:
@@ -271,8 +292,14 @@ func parseMutationOptions(args []string) (mutationOptions, []string, error) {
 	if err := validateOperationID(opts.OperationID); err != nil {
 		return opts, nil, err
 	}
+	if opts.hasConfigHash && opts.IfConfigHash == "" {
+		return opts, nil, fmt.Errorf("--if-config-hash cannot be empty")
+	}
 	if opts.IfConfigHash != "" && !validConfigHash(opts.IfConfigHash) {
 		return opts, nil, fmt.Errorf("--if-config-hash must be sha256 followed by 64 lowercase hexadecimal characters")
+	}
+	if opts.hasActiveToken && opts.IfActiveToken == "" {
+		return opts, nil, fmt.Errorf("--if-active-token cannot be empty")
 	}
 	return opts, positional, nil
 }
@@ -323,6 +350,9 @@ func emitMutationResult(out io.Writer, result mutationResult) {
 func failMutation(opts mutationOptions, out io.Writer, result mutationResult, code, message string, retryable bool, rc int) int {
 	result.OK = false
 	result.OperationID = opts.OperationID
+	if opts.JSON || reviewedMutationFailureCode(code) {
+		message = reviewedMutationMessage(code)
+	}
 	result.Error = &mutationError{Code: code, Message: message, Retryable: retryable}
 	if opts.JSON {
 		emitMutationResult(out, result)
@@ -330,6 +360,16 @@ func failMutation(opts mutationOptions, out io.Writer, result mutationResult, co
 		fmt.Fprintln(os.Stderr, message)
 	}
 	return rc
+}
+
+func reviewedMutationFailureCode(code string) bool {
+	switch code {
+	case "usage", "client_scoped_switch_removed", "invalid_operation_id",
+		"invalid_route_key", "invalid_route_target", "invalid_subagent_target":
+		return false
+	default:
+		return true
+	}
 }
 
 func readExactConfig(path string) ([]byte, os.FileMode, error) {
@@ -355,9 +395,15 @@ func readExactConfig(path string) ([]byte, os.FileMode, error) {
 	if !os.SameFile(info, openedInfo) {
 		return nil, 0, fmt.Errorf("%s changed while it was being opened", path)
 	}
-	data, err := io.ReadAll(file)
+	if openedInfo.Size() > mutationConfigReadLimit {
+		return nil, 0, fmt.Errorf("config exceeds the 4 MiB mutation read limit")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, mutationConfigReadLimit+1))
 	if err != nil {
 		return nil, 0, err
+	}
+	if len(data) > mutationConfigReadLimit {
+		return nil, 0, fmt.Errorf("config exceeds the 4 MiB mutation read limit")
 	}
 	return data, openedInfo.Mode().Perm(), nil
 }
@@ -396,10 +442,7 @@ func mutationJournalPath(configPath, operationID string) string {
 
 func writeMutationJournal(journal routingMutationJournal) error {
 	dir := mutationJournalDir(journal.ConfigPath)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create transaction journal directory: %w", err)
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
+	if err := secureDirectory(dir, true); err != nil {
 		return fmt.Errorf("secure transaction journal directory: %w", err)
 	}
 	entries, err := os.ReadDir(dir)
@@ -407,6 +450,9 @@ func writeMutationJournal(journal routingMutationJournal) error {
 		return fmt.Errorf("inspect transaction journal directory: %w", err)
 	}
 	for _, entry := range entries {
+		if entry.Name() == "completed" && entry.IsDir() {
+			continue
+		}
 		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".json") {
 			return fmt.Errorf("unfinished routing mutation %q must be reconciled before starting another", strings.TrimSuffix(entry.Name(), ".json"))
 		}
@@ -422,6 +468,9 @@ func writeMutationJournal(journal routingMutationJournal) error {
 		return fmt.Errorf("encode transaction journal: %w", err)
 	}
 	data = append(data, '\n')
+	if len(data) > mutationJournalReadLimit {
+		return fmt.Errorf("transaction journal exceeds the size limit")
+	}
 	if err := atomicWriteFile(path, data, 0o600); err != nil {
 		return fmt.Errorf("write transaction journal: %w", err)
 	}
@@ -430,8 +479,11 @@ func writeMutationJournal(journal routingMutationJournal) error {
 
 func readMutationJournal(configPath, operationID string) (routingMutationJournal, error) {
 	var journal routingMutationJournal
+	if err := validateMutationStateDirectories(configPath, false); err != nil {
+		return journal, err
+	}
 	path := mutationJournalPath(configPath, operationID)
-	data, err := os.ReadFile(path)
+	data, err := readBoundedRegularFile(path, mutationJournalReadLimit, 0o600)
 	if err != nil {
 		return journal, err
 	}
@@ -442,6 +494,38 @@ func readMutationJournal(configPath, operationID string) (routingMutationJournal
 		journal.OperationID != operationID ||
 		canonicalPath(journal.ConfigPath) != canonicalPath(configPath) {
 		return journal, fmt.Errorf("transaction journal identity does not match this config and operation")
+	}
+	if journal.Operation == "" || !validConfigHash(journal.PreviousConfigHash) ||
+		!validConfigHash(journal.DesiredConfigHash) ||
+		exactConfigHash(journal.PreviousConfig) != journal.PreviousConfigHash ||
+		journal.CreatedAt.IsZero() {
+		return journal, fmt.Errorf("transaction journal contents are invalid")
+	}
+	if journal.RequestFingerprint != "" {
+		if !validConfigHash(journal.RequestFingerprint) {
+			return journal, fmt.Errorf("transaction journal fingerprint is invalid")
+		}
+		if !validMutationSurface(journal.Operation, journal.Surface) {
+			return journal, fmt.Errorf("transaction journal surface is invalid")
+		}
+		expected, err := mutationRequestFingerprint(journal.ConfigPath, mutationOptions{
+			IfConfigHash:   journal.IfConfigHash,
+			IfActiveToken:  journal.IfActiveToken,
+			hasConfigHash:  journal.IfConfigHash != "",
+			hasActiveToken: journal.IfActiveToken != "",
+		}, journaledMutationSpec{
+			Operation:       journal.Operation,
+			Surface:         journal.Surface,
+			Requested:       journal.Requested,
+			RequestedTarget: journal.RequestedTarget,
+			Client:          journal.Client,
+			Key:             journal.Key,
+		})
+		if err != nil || expected != journal.RequestFingerprint {
+			return journal, fmt.Errorf("transaction journal fingerprint does not match its contents")
+		}
+	} else if journal.Surface != "" {
+		return journal, fmt.Errorf("legacy transaction journal surface is invalid")
 	}
 	return journal, nil
 }
@@ -498,6 +582,23 @@ func canonicalPath(path string) string {
 	}
 	if evaluated, err := filepath.EvalSymlinks(absolute); err == nil {
 		return evaluated
+	}
+	// Replay identity must remain stable after the config is removed. Resolve
+	// the longest existing parent (for example macOS /var -> /private/var),
+	// then append the missing suffix without following nonexistent entries.
+	parent := absolute
+	var suffix []string
+	for {
+		if evaluated, err := filepath.EvalSymlinks(parent); err == nil {
+			parts := append([]string{evaluated}, suffix...)
+			return filepath.Join(parts...)
+		}
+		next := filepath.Dir(parent)
+		if next == parent {
+			break
+		}
+		suffix = append([]string{filepath.Base(parent)}, suffix...)
+		parent = next
 	}
 	return absolute
 }
@@ -623,6 +724,7 @@ func signalVerifiedRouter(expected routingAdminStatus, adminAddr string) (int, e
 
 type journaledMutationSpec struct {
 	Operation       string
+	Surface         string
 	Requested       bool
 	RequestedTarget string
 	Client          string
@@ -1159,16 +1261,30 @@ func unfinishedMutationOperation(configPath string) (string, error) {
 func runJournaledMutationLocked(path string, prior []byte, mode os.FileMode, opts mutationOptions, out io.Writer, spec journaledMutationSpec) int {
 	priorHash := exactConfigHash(prior)
 	result := mutationResultForSpec(spec, opts.OperationID, path, priorHash)
+	fingerprint, err := mutationRequestFingerprint(path, opts, spec)
+	if err != nil {
+		return failMutation(opts, out, result, "fingerprint_failed", "could not identify the routing mutation request", false, 1)
+	}
+	result.RequestFingerprint = fingerprint
+	result.IdentityStrength = mutationIdentityExact
+	if replay, found, rc, replayErr := replayTerminalForRequest(path, opts, spec); found {
+		_ = gcMutationTerminals(path, time.Now().UTC())
+		if replayErr != nil && replayErr.Error() != "operation_id_conflict" && replayErr.Error() != "operation_id_legacy" &&
+			replayErr.Error() != "mutation_not_applied" && replayErr.Error() != "activation_failed_rolled_back" {
+			replayErr = fmt.Errorf("terminal_conflict")
+		}
+		return emitTerminalReplay(opts, out, replay, rc, replayErr)
+	}
 	if opts.IfConfigHash != "" && opts.IfConfigHash != priorHash {
 		return failMutation(opts, out, result, "stale_config_hash",
 			fmt.Sprintf("config changed: expected %s, found %s", opts.IfConfigHash, priorHash), true, 1)
 	}
-	if operationID, err := unfinishedMutationOperation(path); err != nil {
-		return failMutation(opts, out, result, "journal_read_failed", err.Error(), true, 1)
-	} else if operationID != "" {
-		result.ReconciliationRequired = true
+	if activeJournal, found, err := singleActiveMutation(path); err != nil {
+		return failMutation(opts, out, result, "journal_read_failed", reviewedMutationMessage("journal_invalid"), true, 1)
+	} else if found {
+		result.BlockingOperationID = activeJournal.OperationID
 		return failMutation(opts, out, result, "unfinished_mutation",
-			fmt.Sprintf("unfinished routing mutation %q must be reconciled before starting another", operationID), true, 1)
+			"another routing mutation must be reconciled before starting this operation", true, 1)
 	}
 
 	adminAddr := envDefault("BASETEN_SWITCH_ADMIN_ADDR", gateway.DefaultAdminAddr)
@@ -1209,6 +1325,9 @@ func runJournaledMutationLocked(path string, prior []byte, mode os.FileMode, opt
 		return failMutation(opts, out, result, "config_edit_failed",
 			fmt.Sprintf("prepare config edit: %v", err), false, 1)
 	}
+	if len(desired) > mutationConfigReadLimit {
+		return failMutation(opts, out, result, "config_size_limit", reviewedMutationMessage("config_size_limit"), false, 1)
+	}
 	desiredHash := exactConfigHash(desired)
 	result.DesiredConfigHash = desiredHash
 	if err := validateConfigBytesForRouter(path, desired, mode); err != nil {
@@ -1218,6 +1337,21 @@ func runJournaledMutationLocked(path string, prior []byte, mode os.FileMode, opt
 	if desiredHash == priorHash {
 		result.OK = true
 		result.Applied = routerRunning
+		result.Outcome = mutationOutcomeUnchanged
+		journal := routingMutationJournal{
+			Version: mutationJournalVersion, OperationID: opts.OperationID, Operation: spec.Operation,
+			Surface: spec.Surface, ConfigPath: path, Requested: spec.Requested, RequestedTarget: spec.RequestedTarget,
+			Client: spec.Client, Key: spec.Key, PreviousConfigHash: priorHash,
+			DesiredConfigHash: desiredHash, PreviousActiveToken: before.activeToken(),
+			IfConfigHash: opts.IfConfigHash, IfActiveToken: opts.IfActiveToken,
+			RequestFingerprint: fingerprint, CreatedAt: time.Now().UTC(),
+		}
+		published, publishErr := publishMutationTerminal(path, terminalFromJournal(journal, mutationOutcomeUnchanged, before, "", false), nil)
+		if publishErr != nil {
+			result.OK = false
+			return failMutation(opts, out, result, "terminal_write_failed", reviewedMutationMessage("terminal_write_failed"), true, 1)
+		}
+		result.CleanupPending = published.CleanupPending
 		if opts.JSON {
 			emitMutationResult(out, result)
 		} else if spec.HumanSuccess != "" {
@@ -1230,6 +1364,7 @@ func runJournaledMutationLocked(path string, prior []byte, mode os.FileMode, opt
 		Version:             mutationJournalVersion,
 		OperationID:         opts.OperationID,
 		Operation:           spec.Operation,
+		Surface:             spec.Surface,
 		ConfigPath:          path,
 		Requested:           spec.Requested,
 		RequestedTarget:     spec.RequestedTarget,
@@ -1240,6 +1375,9 @@ func runJournaledMutationLocked(path string, prior []byte, mode os.FileMode, opt
 		PreviousConfigHash:  priorHash,
 		DesiredConfigHash:   desiredHash,
 		PreviousActiveToken: before.activeToken(),
+		IfConfigHash:        opts.IfConfigHash,
+		IfActiveToken:       opts.IfActiveToken,
+		RequestFingerprint:  fingerprint,
 		CreatedAt:           time.Now().UTC(),
 	}
 	if err := writeMutationJournal(journal); err != nil {
@@ -1252,7 +1390,14 @@ func runJournaledMutationLocked(path string, prior []byte, mode os.FileMode, opt
 			return failMutation(opts, out, result, "activation_indeterminate",
 				fmt.Sprintf("exact config commit was interrupted: %v; run mutation reconcile %s", err, opts.OperationID), true, 1)
 		}
-		_ = clearMutationJournal(path, opts.OperationID)
+		terminal := terminalFromJournal(journal, mutationOutcomeRejected, before, "stale_config_hash", true)
+		published, terminalErr := publishMutationTerminal(path, terminal, &journal)
+		if terminalErr != nil {
+			result.ReconciliationRequired = true
+			return failMutation(opts, out, result, "terminal_write_failed", reviewedMutationMessage("terminal_write_failed"), true, 1)
+		}
+		result.Outcome = mutationOutcomeRejected
+		result.CleanupPending = published.CleanupPending
 		return failMutation(opts, out, result, "stale_config_hash", err.Error(), true, 1)
 	}
 
@@ -1277,12 +1422,14 @@ func runJournaledMutationLocked(path string, prior []byte, mode os.FileMode, opt
 		result.Applied = true
 		result.ActiveToken = active.activeToken()
 		result.ActiveConfigHash = active.ActiveConfigHash
-		if err := clearMutationJournal(path, opts.OperationID); err != nil {
+		published, err := publishMutationTerminal(path, terminalFromJournal(journal, mutationOutcomeApplied, active, "", false), &journal)
+		if err != nil {
 			result.ReconciliationRequired = true
-			return failMutation(opts, out, result, "journal_clear_failed",
-				fmt.Sprintf("config activated but transaction journal could not be cleared: %v", err), true, 1)
+			return failMutation(opts, out, result, "terminal_write_failed", reviewedMutationMessage("terminal_write_failed"), true, 1)
 		}
 		result.OK = true
+		result.Outcome = mutationOutcomeApplied
+		result.CleanupPending = published.CleanupPending
 		if opts.JSON {
 			emitMutationResult(out, result)
 		} else {
@@ -1306,7 +1453,6 @@ func rollbackJournaledMutation(path string, journal routingMutationJournal, befo
 		return failMutation(opts, out, result, "activation_indeterminate",
 			fmt.Sprintf("%s; refusing to overwrite a concurrent config change while restoring: %v; run mutation reconcile %s", cause, err, journal.OperationID), true, 1)
 	}
-	result.DesiredConfigHash = journal.PreviousConfigHash
 	if active, alreadyActive := waitConfigHashActivation(adminAddr, path, journal.PreviousConfigHash, "", false, 250*time.Millisecond); alreadyActive {
 		result.ActiveToken = active.activeToken()
 		result.ActiveConfigHash = active.ActiveConfigHash
@@ -1324,13 +1470,16 @@ func rollbackJournaledMutation(path string, journal routingMutationJournal, befo
 		return failMutation(opts, out, result, "activation_indeterminate",
 			fmt.Sprintf("%s; prior config was restored but not confirmed active; run mutation reconcile %s", cause, journal.OperationID), true, 1)
 	}
-	if err := clearMutationJournal(path, journal.OperationID); err != nil {
+	published, err := publishMutationTerminal(path,
+		terminalFromJournal(journal, mutationOutcomeRolledBack, active, "activation_failed_rolled_back", false), &journal)
+	if err != nil {
 		result.ReconciliationRequired = true
-		return failMutation(opts, out, result, "journal_clear_failed",
-			fmt.Sprintf("%s; prior config is active but journal cleanup failed: %v", cause, err), true, 1)
+		return failMutation(opts, out, result, "terminal_write_failed", reviewedMutationMessage("terminal_write_failed"), true, 1)
 	}
 	result.ActiveToken = active.activeToken()
 	result.ActiveConfigHash = active.ActiveConfigHash
+	result.Outcome = mutationOutcomeRolledBack
+	result.CleanupPending = published.CleanupPending
 	return failMutation(opts, out, result, "activation_failed_rolled_back",
 		cause+"; restored and reactivated the prior exact config", false, 1)
 }
@@ -1339,7 +1488,7 @@ func runGlobalSwitchLocked(verb, path string, file *config.File, prior []byte, m
 	requested := verb == "on"
 	if file.Global.RoutingEnabled == nil {
 		return failMutation(opts, out, mutationResultForSpec(journaledMutationSpec{
-			Operation: "set_global_routing", Requested: requested,
+			Operation: "set_global_routing", Surface: mutationSurfaceSwitch, Requested: requested,
 		}, opts.OperationID, path, exactConfigHash(prior)), "invalid_routing_policy",
 			"config has no explicit global.routing_enabled", false, 1)
 	}
@@ -1349,6 +1498,7 @@ func runGlobalSwitchLocked(verb, path string, file *config.File, prior []byte, m
 	}
 	return runJournaledMutationLocked(path, prior, mode, opts, out, journaledMutationSpec{
 		Operation: "set_global_routing",
+		Surface:   mutationSurfaceSwitch,
 		Requested: requested,
 		Apply: func(editPath string) error {
 			return config.SetGlobalRoutingEnabled(editPath, requested)
@@ -1358,6 +1508,14 @@ func runGlobalSwitchLocked(verb, path string, file *config.File, prior []byte, m
 }
 
 func cmdMutation(args []string) int {
+	if len(args) > 0 {
+		switch args[0] {
+		case "status":
+			return cmdMutationStatus(args[1:])
+		case "recover":
+			return cmdMutationRecover(args[1:])
+		}
+	}
 	opts, positional, err := parseMutationOptions(args)
 	if err != nil {
 		return failMutation(opts, os.Stdout, mutationResult{Operation: "reconcile_routing_mutation"},
@@ -1390,12 +1548,41 @@ func cmdMutation(args []string) int {
 	}
 	lock, err := acquireConfigMutationLock(path)
 	if err != nil {
-		return failMutation(opts, os.Stdout, result, "mutation_locked", err.Error(), true, 1)
+		return failMutation(opts, os.Stdout, result, "mutation_locked", reviewedMutationMessage("mutation_locked"), true, 1)
 	}
 	defer lock.close()
+	if terminal, terminalErr := readMutationTerminal(path, operationID); terminalErr == nil {
+		_ = gcMutationTerminals(path, time.Now().UTC())
+		result = resultFromTerminal(path, terminal, false, journaledMutationSpec{})
+		result.OperationID = operationID
+		cleanupPending, cleanupErr := terminalCleanupPending(path, terminal)
+		if cleanupErr != nil {
+			return failMutation(opts, os.Stdout, result, "terminal_conflict", reviewedMutationMessage("terminal_conflict"), false, 1)
+		}
+		result.CleanupPending = cleanupPending
+		switch terminal.Outcome {
+		case mutationOutcomeApplied, mutationOutcomeUnchanged, mutationOutcomeNotApplied, mutationOutcomeRolledBack:
+			result.OK = true
+			result.Error = nil
+			if opts.JSON {
+				emitMutationResult(os.Stdout, result)
+			} else {
+				fmt.Fprintf(os.Stdout, "mutation %s replayed (%s)\n", operationID, terminal.Outcome)
+			}
+			return 0
+		default:
+			code := terminal.ErrorCode
+			if code == "" {
+				code = "mutation_rejected"
+			}
+			return failMutation(opts, os.Stdout, result, code, reviewedMutationMessage(code), terminal.ErrorRetryable, 1)
+		}
+	} else if !errors.Is(terminalErr, os.ErrNotExist) {
+		return failMutation(opts, os.Stdout, result, "terminal_conflict", reviewedMutationMessage("terminal_conflict"), false, 1)
+	}
 	if err := recoverInterruptedExactConfigCommit(path); err != nil {
 		result.ReconciliationRequired = true
-		return failMutation(opts, os.Stdout, result, "commit_recovery_failed", err.Error(), true, 1)
+		return failMutation(opts, os.Stdout, result, "commit_recovery_failed", reviewedMutationMessage("commit_recovery_failed"), true, 1)
 	}
 	journal, err := readMutationJournal(path, operationID)
 	if err != nil {
@@ -1403,7 +1590,11 @@ func cmdMutation(args []string) int {
 		if errors.Is(err, os.ErrNotExist) {
 			code = "journal_not_found"
 		}
-		return failMutation(opts, os.Stdout, result, code, err.Error(), false, 1)
+		message := reviewedMutationMessage(code)
+		if code != "journal_not_found" {
+			message = reviewedMutationMessage("journal_invalid")
+		}
+		return failMutation(opts, os.Stdout, result, code, message, false, 1)
 	}
 	result.Requested = journal.Requested
 	result.RequestedTarget = journal.RequestedTarget
@@ -1413,36 +1604,45 @@ func cmdMutation(args []string) int {
 	result.PreviousActiveToken = journal.PreviousActiveToken
 	result.PreviousDesiredConfigHash = journal.PreviousConfigHash
 	result.DesiredConfigHash = journal.DesiredConfigHash
+	result.RequestFingerprint = journal.RequestFingerprint
+	result.IdentityStrength = mutationIdentityLegacy
+	if journal.RequestFingerprint != "" {
+		result.IdentityStrength = mutationIdentityExact
+	}
 	current, _, err := readExactConfig(path)
 	if err != nil {
-		return failMutation(opts, os.Stdout, result, "config_read_failed", err.Error(), true, 1)
+		return failMutation(opts, os.Stdout, result, "config_read_failed", reviewedMutationMessage("config_read_failed"), true, 1)
 	}
 	currentHash := exactConfigHash(current)
 	if currentHash != journal.DesiredConfigHash && currentHash != journal.PreviousConfigHash {
 		return failMutation(opts, os.Stdout, result, "external_config_change",
-			fmt.Sprintf("current config hash %s matches neither the intended hash %s nor prior hash %s; journal left intact", currentHash, journal.DesiredConfigHash, journal.PreviousConfigHash), false, 1)
+			reviewedMutationMessage("external_config_change"), false, 1)
 	}
 	switch state, pid := classifyPidfile(gatewayPidfilePath()); state {
 	case pidfileAlive:
 		adminAddr := envDefault("BASETEN_SWITCH_ADMIN_ADDR", gateway.DefaultAdminAddr)
 		before, statusErr := fetchRoutingAdminStatus(adminAddr)
 		if statusErr != nil {
-			return failMutation(opts, os.Stdout, result, "router_unavailable", statusErr.Error(), true, 1)
+			return failMutation(opts, os.Stdout, result, "router_unavailable", reviewedMutationMessage("router_unavailable"), true, 1)
 		}
 		if before.ConfigPath == "" || canonicalPath(before.ConfigPath) != canonicalPath(path) {
 			return failMutation(opts, os.Stdout, result, "router_state_mismatch",
-				fmt.Sprintf("running router config path %q does not match %s", before.ConfigPath, path), false, 1)
+				reviewedMutationMessage("router_state_mismatch"), false, 1)
 		}
 		if err := validateManagedRouterIdentity(before, pid); err != nil {
-			return failMutation(opts, os.Stdout, result, "router_identity_mismatch", err.Error(), false, 1)
+			return failMutation(opts, os.Stdout, result, "router_identity_mismatch", reviewedMutationMessage("router_identity_mismatch"), false, 1)
 		}
 		if currentHash == journal.DesiredConfigHash {
 			if active, ok := waitConfigHashActivation(adminAddr, path, journal.DesiredConfigHash, "", false, 250*time.Millisecond); ok {
-				if err := clearMutationJournal(path, operationID); err != nil {
-					return failMutation(opts, os.Stdout, result, "journal_clear_failed", err.Error(), true, 1)
+				published, err := publishMutationTerminal(path, terminalFromJournal(journal, mutationOutcomeApplied, active, "", false), &journal)
+				if err != nil {
+					result.ReconciliationRequired = true
+					return failMutation(opts, os.Stdout, result, "terminal_write_failed", reviewedMutationMessage("terminal_write_failed"), true, 1)
 				}
 				result.OK = true
 				result.Applied = true
+				result.Outcome = mutationOutcomeApplied
+				result.CleanupPending = published.CleanupPending
 				result.ActiveToken = active.activeToken()
 				result.ActiveConfigHash = active.ActiveConfigHash
 				if opts.JSON {
@@ -1454,11 +1654,15 @@ func cmdMutation(args []string) int {
 			}
 			if _, err := signalVerifiedRouter(before, adminAddr); err == nil {
 				if active, ok := waitConfigHashActivation(adminAddr, path, journal.DesiredConfigHash, journal.PreviousActiveToken, true, routeApplyTimeout); ok {
-					if err := clearMutationJournal(path, operationID); err != nil {
-						return failMutation(opts, os.Stdout, result, "journal_clear_failed", err.Error(), true, 1)
+					published, err := publishMutationTerminal(path, terminalFromJournal(journal, mutationOutcomeApplied, active, "", false), &journal)
+					if err != nil {
+						result.ReconciliationRequired = true
+						return failMutation(opts, os.Stdout, result, "terminal_write_failed", reviewedMutationMessage("terminal_write_failed"), true, 1)
 					}
 					result.OK = true
 					result.Applied = true
+					result.Outcome = mutationOutcomeApplied
+					result.CleanupPending = published.CleanupPending
 					result.ActiveToken = active.activeToken()
 					result.ActiveConfigHash = active.ActiveConfigHash
 					if opts.JSON {
@@ -1472,7 +1676,6 @@ func cmdMutation(args []string) int {
 			return rollbackJournaledMutation(path, journal, before, adminAddr, opts, os.Stdout, result,
 				"reconciliation could not activate the intended config")
 		}
-		result.DesiredConfigHash = journal.PreviousConfigHash
 		if _, alreadyActive := waitConfigHashActivation(adminAddr, path, journal.PreviousConfigHash, "", false, 250*time.Millisecond); !alreadyActive {
 			_, _ = signalVerifiedRouter(before, adminAddr)
 		}
@@ -1482,11 +1685,15 @@ func cmdMutation(args []string) int {
 			return failMutation(opts, os.Stdout, result, "reconcile_failed",
 				"prior config is present but could not be confirmed active; journal left intact", true, 1)
 		}
-		if err := clearMutationJournal(path, operationID); err != nil {
-			return failMutation(opts, os.Stdout, result, "journal_clear_failed", err.Error(), true, 1)
+		published, err := publishMutationTerminal(path, terminalFromJournal(journal, mutationOutcomeNotApplied, active, "", false), &journal)
+		if err != nil {
+			result.ReconciliationRequired = true
+			return failMutation(opts, os.Stdout, result, "terminal_write_failed", reviewedMutationMessage("terminal_write_failed"), true, 1)
 		}
 		result.OK = true
 		result.Applied = false
+		result.Outcome = mutationOutcomeNotApplied
+		result.CleanupPending = published.CleanupPending
 		result.ActiveToken = active.activeToken()
 		result.ActiveConfigHash = active.ActiveConfigHash
 		if opts.JSON {

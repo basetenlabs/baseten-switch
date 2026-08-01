@@ -113,7 +113,7 @@ func TestRunSwitchRequiresGlobalRoutingEnabled(t *testing.T) {
 			t.Fatalf("code = %d, output:\n%s", code, out.String())
 		}
 	})
-	if !strings.Contains(stderr, "global.routing_enabled") {
+	if !strings.Contains(stderr, "routing config could not be safely prepared") {
 		t.Fatalf("stdout:\n%s\nstderr:\n%s", out.String(), stderr)
 	}
 }
