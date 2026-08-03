@@ -107,6 +107,47 @@ final class LoginItemTests: XCTestCase {
         XCTAssertFalse(startAtLoginOpensSystemSettings(status: .notFound))
     }
 
+    // MARK: - CLI uninstall acceptance
+
+    // The headless --unregister-login-item mode exits 0 when
+    // .notRegistered confirms removal, whatever the prior status. Live,
+    // pending, and unknown future end states fail closed.
+    func testLoginItemUnregisterAccepted() throws {
+        XCTAssertTrue(loginItemUnregisterAccepted(before: .enabled, after: .notRegistered))
+        XCTAssertTrue(loginItemUnregisterAccepted(before: .notFound, after: .notRegistered))
+        XCTAssertFalse(loginItemUnregisterAccepted(before: .enabled, after: .enabled))
+        XCTAssertFalse(loginItemUnregisterAccepted(before: .enabled, after: .requiresApproval))
+        let future = try XCTUnwrap(SMAppService.Status(rawValue: 999))
+        XCTAssertFalse(loginItemUnregisterAccepted(before: .enabled, after: future))
+    }
+
+    // .notFound is a lookup error, not confirmation of unregistration,
+    // so a registration that was live or pending before the call and is
+    // .notFound after it fails closed. .notFound going in is the
+    // distinct never-resolvable case (an ad-hoc signed bundle whose code
+    // identity changed across an upgrade): no unregister() this bundle
+    // can make will move that status, so refusing would strand the app
+    // forever rather than protect a login item we could still reach.
+    func testLoginItemUnregisterNotFoundDependsOnPriorStatus() throws {
+        XCTAssertTrue(loginItemUnregisterAccepted(before: .notFound, after: .notFound))
+        XCTAssertTrue(loginItemUnregisterAccepted(before: .notRegistered, after: .notFound))
+        XCTAssertFalse(loginItemUnregisterAccepted(before: .enabled, after: .notFound))
+        XCTAssertFalse(loginItemUnregisterAccepted(before: .requiresApproval, after: .notFound))
+        let future = try XCTUnwrap(SMAppService.Status(rawValue: 999))
+        XCTAssertFalse(loginItemUnregisterAccepted(before: future, after: .notFound))
+    }
+
+    // The prior-status gate is the "no live registration going in" test
+    // on its own; an unknown future status fails closed.
+    func testLoginItemRegistrationAbsent() throws {
+        XCTAssertTrue(loginItemRegistrationAbsent(.notRegistered))
+        XCTAssertTrue(loginItemRegistrationAbsent(.notFound))
+        XCTAssertFalse(loginItemRegistrationAbsent(.enabled))
+        XCTAssertFalse(loginItemRegistrationAbsent(.requiresApproval))
+        let future = try XCTUnwrap(SMAppService.Status(rawValue: 999))
+        XCTAssertFalse(loginItemRegistrationAbsent(future))
+    }
+
     // Log names stay stable so the reconciliation transition line is
     // greppable across releases.
     func testLoginItemStatusName() throws {

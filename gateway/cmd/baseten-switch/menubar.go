@@ -39,6 +39,11 @@ const menubarPayloadName = menubarAppName + ".zip"
 // mistaken for the app.
 const menubarProcName = "BasetenSwitch"
 
+// menubarBundleID is the stable channel's bundle identity, checked both
+// when a payload is installed (validateMaterializedMenubarApp) and when
+// the managed bundle is driven or removed (uninstallManagedApp).
+const menubarBundleID = "co.baseten.switch"
+
 // menubarKegPaths is a test seam for the pre-payload bundle source.
 // Production releases resolve the nested ZIP from the running
 // executable's Homebrew Cellar prefix. Keeping the seam lets the
@@ -329,7 +334,7 @@ func validateMaterializedMenubarApp(app string) error {
 	fields := []struct {
 		key, want string
 	}{
-		{"CFBundleIdentifier", "co.baseten.switch"},
+		{"CFBundleIdentifier", menubarBundleID},
 		{"CFBundleDisplayName", "Baseten Switch"},
 		{"CFBundleExecutable", menubarProcName},
 	}

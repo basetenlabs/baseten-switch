@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/basetenlabs/baseten-switch/gateway/internal/launchd"
 )
@@ -288,6 +292,15 @@ func uninstallQuitMenubar() error {
 	return nil
 }
 
+// uninstallManagedApp removes the managed menubar app. The bundle's
+// SMAppService login item can only be unregistered by the app itself,
+// so bundles advertising the headless login-item control (the
+// BasetenSwitchLoginItemCLI Info.plist marker written by
+// build-menubar.sh) are driven with --unregister-login-item first and
+// then removed. Bundles that predate the marker, fail the managed
+// identity check, or reject the unregister keep the manual-removal
+// requirement: a stale login item pointing at a deleted bundle is the
+// failure mode this step exists to avoid.
 func uninstallManagedApp() error {
 	if menubarGOOS != "darwin" {
 		return nil
@@ -303,7 +316,74 @@ func uninstallManagedApp() error {
 	if st.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("refusing symlink %s", appPath)
 	}
-	return fmt.Errorf("manual action required: open %s, turn off Start at Login, quit the app, then remove %s; the CLI cannot safely unregister another app's SMAppService login item", appPath, appPath)
+	if !st.IsDir() {
+		return fmt.Errorf("refusing to remove %s: not an app bundle directory", appPath)
+	}
+	if err := verifyManagedAppBundle(appPath); err != nil {
+		return err
+	}
+	if pid := menubarPid(); pid != 0 {
+		return fmt.Errorf("the menubar app is still running (pid %d); quit it and rerun uninstall", pid)
+	}
+	if !managedAppSupportsLoginItemCLI(appPath) {
+		return manualAppRemovalError(appPath, "the installed app predates CLI login-item control")
+	}
+	if out, err := runManagedAppCLI(appPath, menubarLoginItemCLIFlag); err != nil {
+		return manualAppRemovalError(appPath, fmt.Sprintf("the app's login-item unregister failed (%v %s)", err, out))
+	}
+	// The executable we just ran is part of the bundle being removed.
+	// Revalidate after it exits so a modified bundle is never deleted
+	// under the managed-app identity established before execution.
+	if err := verifyManagedAppBundle(appPath); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(appPath); err != nil {
+		return fmt.Errorf("remove %s: %w", appPath, err)
+	}
+	fmt.Fprintf(os.Stderr, "menubar: removed %s\n", appPath)
+	return nil
+}
+
+func manualAppRemovalError(appPath, reason string) error {
+	return fmt.Errorf("manual action required: %s; open %s, turn off Start at Login, quit the app, then remove it by hand", reason, appPath)
+}
+
+// verifyManagedAppBundle proves the bundle at appPath satisfies the
+// same complete integrity contract used at install time before the CLI
+// drives its executable or removes it. Anything else at the managed
+// path is left for manual removal.
+func verifyManagedAppBundle(appPath string) error {
+	if err := validateMaterializedMenubarApp(appPath); err != nil {
+		return manualAppRemovalError(appPath,
+			fmt.Sprintf("%s does not pass managed app validation (%v)", appPath, err))
+	}
+	return nil
+}
+
+// managedAppSupportsLoginItemCLI reports whether the installed bundle
+// advertises the headless --unregister-login-item mode. Only such
+// bundles can be driven to unregister their own SMAppService login
+// item; anything older requires the manual path.
+func managedAppSupportsLoginItemCLI(appPath string) bool {
+	out, err := runCmd("/usr/bin/plutil", "-extract", "BasetenSwitchLoginItemCLI", "raw",
+		filepath.Join(appPath, "Contents", "Info.plist"))
+	return err == nil && out == "true"
+}
+
+// menubarLoginItemCLIFlag is the bundle's headless one-shot mode that
+// unregisters the app's own SMAppService login item and exits.
+const menubarLoginItemCLIFlag = "--unregister-login-item"
+
+// runManagedAppCLI invokes the installed bundle's executable in a
+// headless one-shot mode, bounded so a bundle that mishandles the flag
+// (launches the UI instead of exiting) cannot hang the uninstall. A var
+// so tests can stub the exec.
+var runManagedAppCLI = func(appPath string, args ...string) (string, error) {
+	exe := filepath.Join(appPath, "Contents", "MacOS", menubarProcName)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, exe, args...).CombinedOutput()
+	return strings.TrimSpace(string(out)), err
 }
 
 func basetenSwitchDataRoot() string {
