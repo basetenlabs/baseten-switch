@@ -5,13 +5,13 @@
 // and names the FIRST failed link with a concrete fix, so a broken
 // setup never needs a manual link-by-link back-and-forth.
 //
-// doctor NEVER mutates anything: no starts, no config writes, no
-// settings writes. The only side effect is terminal output. Exit
-// codes: 0 = no check failed (warns allowed), 1 = at least one FAIL,
-// 2 = usage error. The one exception is the opt-in `--fix` repair
-// loop (doctor_fix.go), which mutates only by running existing
-// baseten-switch verbs as confirmed child processes; runDoctor itself
-// stays read-only in both modes.
+// doctor NEVER mutates config, journal/terminal recovery state, router state,
+// or installed settings. It may create or secure coordination metadata while
+// acquiring the mutation status lock. Exit codes: 0 = no check failed (warns
+// allowed), 1 = at least one FAIL, 2 = usage error. The one exception is the
+// opt-in `--fix` repair loop (doctor_fix.go), which mutates only by running
+// existing baseten-switch verbs as confirmed child processes; runDoctor
+// itself stays read-only with respect to managed state in both modes.
 //
 // Test override points (the same seams the rest of the CLI uses):
 // BASETEN_SWITCH_CONFIG_PATH, BASETEN_SWITCH_ADMIN_ADDR, BASETEN_SWITCH_GATEWAY_PIDFILE,
@@ -32,6 +32,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -52,6 +53,10 @@ const (
 	docFail = "fail"
 	docSkip = "skip"
 )
+
+// doctorInspectRoutingMutationStatus is a seam for exercising the doctor's
+// rendering and repair policy independently from journal and router I/O.
+var doctorInspectRoutingMutationStatus = inspectRoutingMutationStatus
 
 type doctorCheck struct {
 	Section string `json:"section"`
@@ -131,8 +136,9 @@ func cmdDoctor(args []string) int {
 	return rep.ExitCode
 }
 
-// runDoctor executes every check in request-path order and returns the
-// full report. All state gathering is read-only.
+// runDoctor executes every check in request-path order and returns the full
+// report. State gathering does not mutate managed state; mutation status may
+// acquire its coordination lock.
 func runDoctor(o doctorOpts) doctorReport {
 	rep := doctorReport{}
 	var add addCheck = func(section, name, status, finding, fix string, fixArgv ...string) {
@@ -185,12 +191,20 @@ func runDoctor(o doctorOpts) doctorReport {
 	routerState := probePort(adminAddr, routerHealthPath, routerHealthMarker)
 
 	// --- 3. auth ----------------------------------------------------------
-	doctorAuthCheck(add, f, unresolved, envFile, envFilePath)
-	doctorAuthHealthCheck(add, adminAddr, routerState == portOurs)
+	storeAuth := doctorAuthCheck(add, f, unresolved, envFile, envFilePath)
+	doctorAuthHealthCheck(add, adminAddr, routerState == portOurs, storeAuth)
 	doctorBasetenCLICheck(add)
 
 	// --- 4. router --------------------------------------------------------
-	st := doctorRouterChecks(add, adminAddr, routerState)
+	// Inspect mutation recovery before attaching any automatic lifecycle
+	// repair. Starting the router can make the config currently on disk
+	// authoritative, so an unfinished or unreadable mutation must suppress
+	// every `up` fix until recovery has been handled explicitly.
+	mutationStatus, mutationStatusErr := doctorInspectRoutingMutationStatus(cfgPath)
+	allowStartupFix := mutationStatusErr == nil && mutationStatus.Classification == mutationStatusNone
+	st := doctorRouterChecks(add, adminAddr, routerState, allowStartupFix)
+	doctorMutationRecoveryCheckForStatus(add, mutationStatus, mutationStatusErr)
+	doctorRouterClientChecks(add, st)
 	boundAddrs := map[string]bool{}
 	if st != nil {
 		for _, c := range st.Clients {
@@ -201,7 +215,7 @@ func runDoctor(o doctorOpts) doctorReport {
 	}
 
 	// --- 5. door ----------------------------------------------------------
-	doorUp := doctorDoorChecks(add, doorSpecs, st != nil, boundAddrs)
+	doorUp := doctorDoorChecks(add, doorSpecs, st != nil, boundAddrs, allowStartupFix)
 
 	// Resolve the telemetry store path once: the claude subagents traffic
 	// check (section 6) and the telemetry section (9) both use it.
@@ -217,7 +231,7 @@ func runDoctor(o doctorOpts) doctorReport {
 	doctorCodexChecks(add, f, envFile, envFilePath)
 
 	// --- 7. supervision ---------------------------------------------------
-	doctorSupervisionChecks(add, routerState, doorSpecs, doorUp)
+	doctorSupervisionChecks(add, routerState, doorSpecs, doorUp, allowStartupFix)
 
 	// --- 8. e2e -----------------------------------------------------------
 	doctorE2EChecks(add, o, doorSpecs, doorUp, f, telPath)
@@ -409,21 +423,27 @@ func doctorConfigChecks(add addCheck, cfgPath string, cfgErr error, f *config.Fi
 // store (the same store the gateway reads). Not-signed-in is a FAIL
 // only when something actually depends on a Baseten credential: a
 // baseten-routed client, or an unresolved auth placeholder.
-func doctorAuthCheck(add addCheck, f *config.File, unresolved []string, envFile map[string]string, envFilePath string) {
+type doctorStoreAuth struct {
+	apiKeyProfile string
+	apiKeyReady   bool
+}
+
+func doctorAuthCheck(add addCheck, f *config.File, unresolved []string, envFile map[string]string, envFilePath string) doctorStoreAuth {
 	tok, _, err := auth.Load("")
 	var ak *auth.APIKeyProfileError
 	switch {
 	case err != nil && errors.As(err, &ak):
 		if ak.Key != "" {
 			add("auth", "signin", docOK, fmt.Sprintf("signed in with API key (profile %q)", ak.Profile), "")
+			return doctorStoreAuth{apiKeyProfile: ak.Profile, apiKeyReady: true}
 		} else {
 			add("auth", "signin", docWarn, fmt.Sprintf("profile %q uses API key auth but the key is not readable", ak.Profile),
 				"check the keyring or auth.json, or run 'baseten auth login'")
 		}
-		return
+		return doctorStoreAuth{apiKeyProfile: ak.Profile}
 	case err != nil:
 		add("auth", "signin", docWarn, fmt.Sprintf("credential store unreadable: %v", err), "baseten auth login")
-		return
+		return doctorStoreAuth{}
 	case tok != nil:
 		if !tok.Expiry.IsZero() && tok.Expiry.Before(time.Now()) {
 			add("auth", "signin", docWarn,
@@ -433,7 +453,7 @@ func doctorAuthCheck(add addCheck, f *config.File, unresolved []string, envFile 
 		} else {
 			add("auth", "signin", docOK, "signed in (OAuth)", "")
 		}
-		return
+		return doctorStoreAuth{}
 	}
 
 	// Not signed in. BASETEN_API_KEY (env or env file) still counts as
@@ -444,22 +464,23 @@ func doctorAuthCheck(add addCheck, f *config.File, unresolved []string, envFile 
 	}
 	if apiKey != "" {
 		add("auth", "signin", docOK, "no OAuth sign-in, but BASETEN_API_KEY is set (API key fallback)", "")
-		return
+		return doctorStoreAuth{}
 	}
 	bothFixes := fmt.Sprintf("baseten auth login   (or set the key in %s)", envFilePath)
 	if authVars := doctorAuthPlaceholders(f, unresolved); len(authVars) > 0 {
 		add("auth", "signin", docFail,
 			fmt.Sprintf("not signed in (no OAuth, no API key) and gateway.yaml references ${%s} which is unset; baseten-routed requests have no credential", strings.Join(authVars, "}, ${")),
 			fmt.Sprintf("baseten auth login   (or set %s=... in %s)", authVars[0], envFilePath))
-		return
+		return doctorStoreAuth{}
 	}
 	if names := doctorBasetenRouted(f); len(names) > 0 {
 		add("auth", "signin", docFail,
 			"not signed in (no OAuth, no API key); these clients route to baseten and their requests will fail: "+strings.Join(names, ", "),
 			bothFixes)
-		return
+		return doctorStoreAuth{}
 	}
 	add("auth", "signin", docWarn, "not signed in (no enabled client routes to baseten, so nothing breaks yet)", "baseten auth login")
+	return doctorStoreAuth{}
 }
 
 // doctorAuthHealthCheck reads the running router's credential health
@@ -467,7 +488,7 @@ func doctorAuthCheck(add addCheck, f *config.File, unresolved []string, envFile 
 // outcomes). The store-based signin check above cannot detect a dead
 // refresh token: the credential is present, but the token endpoint rejects
 // it. The current admin contract requires the health field.
-func doctorAuthHealthCheck(add addCheck, adminAddr string, routerUp bool) {
+func doctorAuthHealthCheck(add addCheck, adminAddr string, routerUp bool, store doctorStoreAuth) {
 	if !routerUp {
 		add("auth", "health", docSkip, "router not up; credential health is derived from the running router's refresh outcomes", "")
 		return
@@ -497,6 +518,13 @@ func doctorAuthHealthCheck(add addCheck, adminAddr string, routerUp bool) {
 	// the report, or flood the terminal.
 	lastErr := sanitizeAdminText(payload["last_refresh_error"], 200)
 	lastErrAt := sanitizeAdminText(payload["last_refresh_error_at"], 40)
+	routerSignedIn, _ := payload["signed_in"].(bool)
+	if store.apiKeyReady && (!routerSignedIn || health == "signed_out") {
+		add("auth", "health", docFail,
+			fmt.Sprintf("the credential store has readable API-key profile %q, but the running router reports signed out", store.apiKeyProfile),
+			"baseten-switch up   (adopt the current router binary and reload the selected profile)")
+		return
+	}
 	switch health {
 	case "refresh_failed":
 		detail := ""
@@ -623,19 +651,23 @@ func doctorBasetenRouted(f *config.File) []string {
 }
 
 // doctorRouterChecks probes the admin listener (ours/foreign/down, the
-// probePort semantics `up` uses), parses the admin status, and checks
-// every enabled client: bound, valid route, sane fallback_route, and a
-// listener that actually accepts TCP. Returns the parsed status (nil
-// when unavailable) for the door wiring check.
-func doctorRouterChecks(add addCheck, adminAddr string, state portState) *doctorAdminStatus {
+// probePort semantics `up` uses) and parses the admin status. Returns the
+// parsed status (nil when unavailable) for the mutation, client, and door
+// wiring checks.
+func doctorRouterChecks(add addCheck, adminAddr string, state portState, allowStartupFix bool) *doctorAdminStatus {
 	switch state {
 	case portForeign:
 		add("router", "reachable", docFail,
 			fmt.Sprintf("a foreign process (%s) owns %s (answers, but not our router)", portOwner(adminAddr), adminAddr),
 			"free the port or change BASETEN_SWITCH_ADMIN_ADDR")
 	case portDown:
-		add("router", "reachable", docFail, fmt.Sprintf("router not running (nothing listens on %s)", adminAddr),
-			"baseten-switch up", "up")
+		if allowStartupFix {
+			add("router", "reachable", docFail, fmt.Sprintf("router not running (nothing listens on %s)", adminAddr),
+				"baseten-switch up", "up")
+		} else {
+			add("router", "reachable", docFail, fmt.Sprintf("router not running (nothing listens on %s)", adminAddr),
+				"resolve the routing mutation recovery state before running 'baseten-switch up'")
+		}
 	default:
 		var h struct {
 			UptimeSeconds int64 `json:"uptime_seconds"`
@@ -652,7 +684,6 @@ func doctorRouterChecks(add addCheck, adminAddr string, state portState) *doctor
 	}
 	if state != portOurs {
 		add("router", "status", docSkip, "router not up", "")
-		add("router", "clients", docSkip, "router not up", "")
 		return nil
 	}
 
@@ -661,17 +692,95 @@ func doctorRouterChecks(add addCheck, adminAddr string, state portState) *doctor
 	if !ok {
 		add("router", "status", docFail, fmt.Sprintf("admin /v1/admin/status unreachable at %s", adminAddr),
 			"check the router log; restart with 'baseten-switch restart'")
-		add("router", "clients", docSkip, "admin status unavailable", "")
 		return nil
 	}
 	var st doctorAdminStatus
 	if err := json.Unmarshal([]byte(body), &st); err != nil {
 		add("router", "status", docFail, fmt.Sprintf("admin status does not parse: %v", err),
 			"version mismatch between CLI and router? restart with 'baseten-switch restart'")
-		add("router", "clients", docSkip, "admin status unavailable", "")
 		return nil
 	}
 	add("router", "status", docOK, "admin status parses", "")
+	return &st
+}
+
+// doctorMutationRecoveryCheck reports the read-only status classification.
+// It intentionally exposes only reviewed messages and never raw paths, target
+// values, journal bytes, or underlying filesystem and admin errors.
+func doctorMutationRecoveryCheck(add addCheck, configPath string) {
+	status, err := doctorInspectRoutingMutationStatus(configPath)
+	doctorMutationRecoveryCheckForStatus(add, status, err)
+}
+
+func doctorMutationRecoveryCheckForStatus(add addCheck, status routingMutationStatus, err error) {
+	if err != nil {
+		add("router", "mutation_recovery", docFail,
+			"routing mutation recovery state could not be inspected",
+			"run 'baseten-switch mutation status' and preserve the recovery files for manual review")
+		return
+	}
+
+	switch status.Classification {
+	case mutationStatusNone:
+		add("router", "mutation_recovery", docOK, "no unfinished routing mutation", "")
+	case mutationStatusDesiredActive:
+		add("router", "mutation_recovery", docFail,
+			"a previous routing change is active but its recovery record still needs cleanup",
+			"baseten-switch mutation recover", "mutation", "recover")
+	case mutationStatusPriorActive:
+		add("router", "mutation_recovery", docFail,
+			"a previous routing change was not applied; the prior routing state is active and its recovery record still needs cleanup",
+			"baseten-switch mutation recover", "mutation", "recover")
+	case mutationStatusCleanupPending:
+		add("router", "mutation_recovery", docFail,
+			"a completed routing change has stale recovery cleanup state",
+			"baseten-switch mutation recover", "mutation", "recover")
+	case mutationStatusDesiredPending:
+		add("router", "mutation_recovery", docFail,
+			"a pending routing change is present but is not the active router configuration",
+			"review 'baseten-switch mutation status'; explicit reconciliation is required")
+	case mutationStatusPriorPending:
+		add("router", "mutation_recovery", docFail,
+			"a pending routing change still has its prior configuration on disk",
+			"review 'baseten-switch mutation status'; explicit reconciliation is required")
+	case mutationStatusRouterUnavailable:
+		add("router", "mutation_recovery", docFail,
+			"the router is unavailable to confirm a pending routing change",
+			"start the router, then rerun 'baseten-switch doctor --fix'")
+	case mutationStatusRouterUnsupported:
+		add("router", "mutation_recovery", docFail,
+			"the running router cannot report authoritative mutation recovery state",
+			"restart with the current baseten-switch binary, then rerun doctor")
+	case mutationStatusExternalChange:
+		add("router", "mutation_recovery", docFail,
+			"the configuration changed outside the pending routing operation; both states were preserved",
+			"review 'baseten-switch mutation status' before explicit reconciliation")
+	case mutationStatusCommitRecoveryRequired:
+		add("router", "mutation_recovery", docFail,
+			"an interrupted exact-config commit requires explicit recovery",
+			"review 'baseten-switch mutation status' before explicit reconciliation")
+	case mutationStatusJournalInvalid:
+		add("router", "mutation_recovery", docFail,
+			"routing mutation recovery state is invalid",
+			"run 'baseten-switch mutation status' and preserve the recovery files for manual review")
+	case mutationStatusJournalConflict:
+		add("router", "mutation_recovery", docFail,
+			"multiple or conflicting routing mutation records require manual recovery",
+			"run 'baseten-switch mutation status' and preserve the recovery files for manual review")
+	default:
+		add("router", "mutation_recovery", docFail,
+			"routing mutation recovery state has an unsupported classification",
+			"run 'baseten-switch mutation status' and preserve the recovery files for manual review")
+	}
+}
+
+// doctorRouterClientChecks checks every enabled client: bound, valid route,
+// sane fallback_route, and a listener that actually accepts TCP.
+func doctorRouterClientChecks(add addCheck, st *doctorAdminStatus) {
+	if st == nil {
+		add("router", "clients", docSkip, "admin status unavailable", "")
+		return
+	}
 
 	checked := 0
 	for _, c := range st.Clients {
@@ -704,7 +813,6 @@ func doctorRouterChecks(add addCheck, adminAddr string, state portState) *doctor
 	if checked == 0 {
 		add("router", "clients", docSkip, "no enabled clients to check (see config section)", "")
 	}
-	return &st
 }
 
 func dialOK(addr string) bool {
@@ -720,7 +828,7 @@ func dialOK(addr string) bool {
 // ours/foreign/down semantics) and verifies the live door's router
 // target is an addr some bound client actually listens on. Returns
 // which ports answered as ours, for the supervision and e2e sections.
-func doctorDoorChecks(add addCheck, doorSpecs []door.Config, haveStatus bool, boundAddrs map[string]bool) map[string]bool {
+func doctorDoorChecks(add addCheck, doorSpecs []door.Config, haveStatus bool, boundAddrs map[string]bool, allowStartupFix bool) map[string]bool {
 	doorUp := map[string]bool{}
 	if len(doorSpecs) == 0 {
 		add("door", "ports", docSkip, "no usable door ports (see config section)", "")
@@ -730,7 +838,12 @@ func doctorDoorChecks(add addCheck, doorSpecs []door.Config, haveStatus bool, bo
 		port := portOf(sp.ListenAddr)
 		switch probePort(sp.ListenAddr, doorHealthPath, doorHealthMarker) {
 		case portDown:
-			add("door", "doorz:"+port, docFail, fmt.Sprintf("door not running (nothing listens on %s)", sp.ListenAddr), "baseten-switch up", "up")
+			if allowStartupFix {
+				add("door", "doorz:"+port, docFail, fmt.Sprintf("door not running (nothing listens on %s)", sp.ListenAddr), "baseten-switch up", "up")
+			} else {
+				add("door", "doorz:"+port, docFail, fmt.Sprintf("door not running (nothing listens on %s)", sp.ListenAddr),
+					"resolve the routing mutation recovery state before running 'baseten-switch up'")
+			}
 			add("door", "wiring:"+port, docSkip, "door not up", "")
 			continue
 		case portForeign:
@@ -1394,7 +1507,7 @@ func doctorPortTarget(raw, desiredPort string) (status, finding string) {
 // doctorSupervisionChecks reports the launchd state per label. Skipped
 // entirely under BASETEN_SWITCH_LAUNCHD=off or off darwin, matching the rest of
 // the CLI's launchd seam.
-func doctorSupervisionChecks(add addCheck, routerState portState, doorSpecs []door.Config, doorUp map[string]bool) {
+func doctorSupervisionChecks(add addCheck, routerState portState, doorSpecs []door.Config, doorUp map[string]bool, allowStartupFix bool) {
 	if runtime.GOOS != "darwin" || launchdDisabled() {
 		add("supervision", "launchd", docSkip, "launchd interaction disabled (BASETEN_SWITCH_LAUNCHD=off or non-darwin)", "")
 		return
@@ -1414,10 +1527,16 @@ func doctorSupervisionChecks(add addCheck, routerState portState, doorSpecs []do
 		case s.supervised():
 			add("supervision", c.name, docOK, "launchd job "+c.label+" loaded", "")
 		case s.installed:
-			add("supervision", c.name, docWarn,
-				"launchd plist installed but "+c.label+" is not loaded (a login-items approval in System Settings may be pending)",
-				"baseten-switch up   (re-bootstraps the job; approve it in System Settings > General > Login Items if prompted)",
-				"up")
+			if allowStartupFix {
+				add("supervision", c.name, docWarn,
+					"launchd plist installed but "+c.label+" is not loaded (a login-items approval in System Settings may be pending)",
+					"baseten-switch up   (re-bootstraps the job; approve it in System Settings > General > Login Items if prompted)",
+					"up")
+			} else {
+				add("supervision", c.name, docWarn,
+					"launchd plist installed but "+c.label+" is not loaded (a login-items approval in System Settings may be pending)",
+					"resolve the routing mutation recovery state before re-bootstrapping the job")
+			}
 		case c.up:
 			add("supervision", c.name, docWarn, c.name+" is running unsupervised (no LaunchAgent installed)",
 				"baseten-switch up --install")
@@ -1480,12 +1599,9 @@ func doctorE2EChecks(add addCheck, o doctorOpts, doorSpecs []door.Config, doorUp
 			expected := config.NativeRoute(t.ProtocolShape)
 			add("e2e", "probe:"+port, docOK,
 				fmt.Sprintf("the %s provider rejected the credential-less probe (status %d), as expected: the door-to-provider path is intact and harness requests carry their own %s credential", expected, p.Status, expected), "")
-			add("e2e", "route:"+port, docOK,
-				fmt.Sprintf("the configured route for the probe model is %q; the provider's own auth rejection stands in for a completed request", expected), "")
-			continue
 		default:
 			add("e2e", "probe:"+port, docFail,
-				fmt.Sprintf("1-token request through the door failed (status %d): %s", p.Status, orDash(p.Error)),
+				fmt.Sprintf("1-token request through the door failed (status %d%s): %s", p.Status, doctorProbeViaSuffix(p.DoorVia), orDash(p.Error)),
 				"baseten-switch status   (then check the router and door logs)")
 		}
 		doctorProbeRouteCheck(add, port, p, probeStart, f, routerTargets[t.BindAddr], t.ProtocolShape, telPath)
@@ -1501,6 +1617,10 @@ func doctorE2EChecks(add addCheck, o doctorOpts, doorSpecs []door.Config, doorUp
 // failover from making a broken router path look healthy. Only an HTTP
 // response from the far end qualifies; a transport error (status 0)
 // still fails.
+//
+// This decides the probe check only. The served route still goes through
+// doctorProbeRouteCheck, so a router that answered from some other route
+// than the configured one is still reported there.
 func doctorProbeNativeAuthOK(f *config.File, routerTarget, shape string, p *doctorProbeResult) bool {
 	if p.Status != http.StatusUnauthorized && p.Status != http.StatusForbidden {
 		return false
@@ -1520,6 +1640,15 @@ func doctorProbeNativeAuthOK(f *config.File, routerTarget, shape string, p *doct
 	return expected == config.NativeRoute(shape)
 }
 
+func doctorProbeViaSuffix(via string) string {
+	switch via {
+	case "router", "fallback":
+		return ", served via " + via
+	default:
+		return ""
+	}
+}
+
 // doctorProbeRouteCheck asserts the probe was served by the route the
 // config designates for the probe's model, so failover can no longer make
 // --probe pass while the configured path is dead. Evidence, in preference
@@ -1533,10 +1662,6 @@ func doctorProbeNativeAuthOK(f *config.File, routerTarget, shape string, p *doct
 // X-Baseten-Switch-Door stamp so the probe can be attributed safely.
 func doctorProbeRouteCheck(add addCheck, port string, p *doctorProbeResult, probeStart time.Time, f *config.File, routerTarget, shape, telPath string) {
 	name := "route:" + port
-	if !doctorProbeOK(p) {
-		add("e2e", name, docSkip, "probe failed; no served route to compare", "")
-		return
-	}
 	cli, ok := doctorClientFor(f, routerTarget, shape)
 	if !ok {
 		add("e2e", name, docSkip, "cannot resolve the configured client for door target "+routerTarget+" (see config section)", "")
@@ -1550,12 +1675,20 @@ func doctorProbeRouteCheck(add addCheck, port string, p *doctorProbeResult, prob
 	probeModel := doctorProbeRequestModel(shape)
 	expected := gateway.ExpectedPrimaryRoute(cli, globalRoutingEnabled, probeModel)
 	if p.DoorVia == "fallback" {
+		outcome := "the probe passed"
+		if !doctorProbeOK(p) {
+			outcome = fmt.Sprintf("the probe failed with status %d", p.Status)
+		}
 		add("e2e", name, docFail,
-			fmt.Sprintf("the probe passed but the door's native failover served it (X-Baseten-Switch-Door: fallback), not the configured route %q; the %s path is broken behind a passing probe", configured, configured),
+			fmt.Sprintf("%s, and the door's native failover served it (X-Baseten-Switch-Door: fallback), not the configured route %q", outcome, configured),
 			"baseten-switch status   (the door tripped; check the router and the auth/health check)")
 		return
 	}
 	if p.DoorVia != "router" {
+		if !doctorProbeOK(p) && p.Status == 0 {
+			add("e2e", name, docSkip, "the failed probe returned no HTTP response; no served route can be attributed", "")
+			return
+		}
 		add("e2e", name, docFail,
 			"the door response omitted the required X-Baseten-Switch-Door routing stamp",
 			"baseten-switch up   (restart the door onto the current binary)")
@@ -1571,9 +1704,21 @@ func doctorProbeRouteCheck(add addCheck, port string, p *doctorProbeResult, prob
 		served = row.ConfiguredRoute
 	}
 	if served != expected {
+		trigger := doctorFallbackTrigger(row)
+		if !doctorProbeOK(p) {
+			add("e2e", name, docFail,
+				fmt.Sprintf("the failed probe reached route %q while the configured route is %q%s", served, expected, trigger),
+				"check the router log "+gatewayLogPath()+" and the auth/health check; the primary upstream is failing")
+			return
+		}
 		add("e2e", name, docFail,
-			fmt.Sprintf("the probe passed but route %q served it while the configured route is %q (the router's fallback_route kicked in); the %s path is broken behind a passing probe", served, expected, expected),
+			fmt.Sprintf("the probe passed but route %q served it while the configured route is %q%s; the %s path is broken behind a passing probe", served, expected, trigger, expected),
 			"check the router log "+gatewayLogPath()+" and the auth/health check; the primary upstream is failing")
+		return
+	}
+	if !doctorProbeOK(p) {
+		add("e2e", name, docOK,
+			fmt.Sprintf("the failed probe reached the configured route (%s), status %d%s", expected, p.Status, doctorFallbackTrigger(row)), "")
 		return
 	}
 	if expected != configured {
@@ -1582,6 +1727,17 @@ func doctorProbeRouteCheck(add addCheck, port string, p *doctorProbeResult, prob
 		return
 	}
 	add("e2e", name, docOK, fmt.Sprintf("served route matches the configured route (%s)", configured), "")
+}
+
+func doctorFallbackTrigger(row telemetry.EventV1) string {
+	if row.Fallback.Trigger == nil {
+		return ""
+	}
+	trigger := sanitizeAdminText(*row.Fallback.Trigger, 80)
+	if trigger == "" {
+		return ""
+	}
+	return " (fallback trigger " + strconv.Quote(trigger) + ")"
 }
 
 // doctorClientFor picks the enabled client the probe exercised: same

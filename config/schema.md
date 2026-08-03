@@ -20,7 +20,7 @@ SIGHUP. The native Mac app edits the same file through `baseten-switch`.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `routing_enabled` | bool | `true` in new configs | The one global routing gate. It must be explicitly present. Off is absolute: native requests use the protocol-native provider, and aliases, raw Baseten slugs, Baseten model mappings, dedicated Baseten subagents, fallback, and Baseten credentials are not consulted by request resolution. Saved policy remains editable and becomes active again when On. |
-| `auth` | map[route] -> secret ref | (empty) | Backend credentials per upstream route. `${VAR}` resolves from env or `~/.config/baseten-switch/env`. |
+| `auth` | map[route] -> secret ref | (empty) | Environment fallback credentials per upstream route. The selected Baseten CLI profile supplies its OAuth or API-key credential automatically. `${VAR}` resolves from env or `~/.config/baseten-switch/env`. |
 | `telemetry_dir` | string | `~/.config/baseten-switch/telemetry` | Private directory containing versioned, monthly JSONL request segments. |
 | `telemetry_enabled` | bool | `true` | Toggle per-request telemetry collection. Disabling collection preserves existing history. |
 | `telemetry_retention_days` | int | `90` | Retention window for closed telemetry segments. The active segment is never deleted. |
@@ -100,7 +100,7 @@ Each client entry maps one harness to one local bind address.
 | `responses_compatibility` | object | (absent, all rules `off`) | OpenAI-shape clients only. Configures isolated Responses API safeguards for Baseten attempts. A present block receives the per-rule defaults below; omitting the entire block keeps every rule off. Unknown fields and modes refuse the config. Changes replace the resolved policy on SIGHUP and participate in the listener config hash. |
 | `responses_strip_tool_types` | list[string] | (empty) | OpenAI-shape clients only; the field on an Anthropic-shape client refuses the config at load. Tool types listed here are stripped from `tools[]` before a Baseten `/v1/responses` attempt. An object-form `tool_choice` referencing a stripped type is rewritten; string forms like `auto` are untouched. A native fallback keeps the original body byte-for-byte. Telemetry and stderr logs report stripping. Empty entries are invalid, list order is preserved, and a list change respawns the listener on SIGHUP. |
 | `ttft_timeout` | duration | inherit `global.ttft_timeout` | Per-harness override of the first-byte deadline (see `global.ttft_timeout` for semantics). `0` disables it for this harness even when the global value is set. |
-| `fallback_route` | enum: `anthropic`,`openai` | protocol-native in new configs | Accepts only `NativeRoute(protocol_shape)` or an absent value. It is eligible after default or mapped Baseten policy fails, but is inactive for global Off, native mappings, and explicit alias or raw-slug choices. |
+| `fallback_route` | enum: `anthropic`,`openai` | protocol-native in new configs | Accepts only `NativeRoute(protocol_shape)` or an absent value. It is eligible after default or mapped Baseten policy fails, but is inactive for global Off, native mappings, and explicit alias or raw-slug choices. Anthropic-shape 429 responses relay to the harness without fallback or cooldown; OpenAI-shape 429 responses remain fallback-eligible. |
 
 ### `responses_compatibility`
 
@@ -148,6 +148,29 @@ substituted at gateway startup from:
 Resolved values are never written back to disk. The Tauri UI never
 displays resolved secrets; it shows the `${VAR_NAME}` placeholder
 verbatim and lets the user edit only the variable name.
+
+### Baseten authentication precedence
+
+Switch reads the selected profile created by `baseten auth login`. A selected
+OAuth profile or API-key profile takes precedence over `global.auth.baseten`.
+API keys remain opaque; Baseten enforces their permissions and resource
+access.
+
+`global.auth.baseten` expands to `BASETEN_API_KEY`, which is a separate
+environment fallback. Switch uses it only when
+`BASETEN_SWITCH_API_KEY_FALLBACK=1` and the selected CLI profile has no usable
+credential. Store both values in the mode-0600 Switch environment file when
+you need this fallback:
+
+```text
+BASETEN_SWITCH_API_KEY_FALLBACK=1
+BASETEN_API_KEY=...
+```
+
+`GET /v1/admin/auth/status` and the `auth` block in `GET /v1/admin/status`
+report `auth_type` as `oauth`, `api_key`, or `none`. An environment-only
+credential reports `auth_type: api_key` with `signed_in: false` and
+`fallback_in_use: true`; it does not become a selected CLI profile.
 
 ## Reload semantics
 

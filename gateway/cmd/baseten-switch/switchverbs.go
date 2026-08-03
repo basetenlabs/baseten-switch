@@ -48,6 +48,13 @@ func runSwitch(verb string, args []string, out io.Writer) int {
 			fmt.Fprintln(os.Stderr, notice)
 		}
 	}
+	if replayed, rc := preflightTerminalReplay(path, opts, journaledMutationSpec{
+		Operation: "set_global_routing",
+		Surface:   mutationSurfaceSwitch,
+		Requested: requested,
+	}, out); replayed {
+		return rc
+	}
 	if _, err := config.Load(path); err != nil {
 		message := config.MalformedConfigMessage(path, err)
 		if errors.Is(err, os.ErrNotExist) {

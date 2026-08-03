@@ -243,6 +243,7 @@ enum LiveModelCatalogResponseState: String, Equatable, Sendable {
 enum LiveModelCatalogSignedOutReason: String, Equatable, Sendable {
     case notSignedIn = "not_signed_in"
     case sessionExpired = "session_expired"
+    case credentialRejected = "credential_rejected"
 }
 
 enum ReasoningOptionType: String, Equatable, Sendable {
@@ -590,6 +591,7 @@ struct HealthSnapshot: Equatable, Sendable {
 
 struct AuthStatus: Equatable, Sendable {
     var signedIn: Bool
+    var authType: String
     var profile: String
     var fallbackEnabled: Bool
     var fallbackInUse: Bool
@@ -598,6 +600,7 @@ struct AuthStatus: Equatable, Sendable {
 
     init(dict: [String: Any]) {
         signedIn = dict["signed_in"] as? Bool ?? false
+        authType = dict["auth_type"] as? String ?? ""
         profile = dict["profile"] as? String ?? ""
         fallbackEnabled = dict["fallback_enabled"] as? Bool ?? false
         fallbackInUse = dict["fallback_in_use"] as? Bool ?? false

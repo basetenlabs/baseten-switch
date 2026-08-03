@@ -709,6 +709,11 @@ private struct RoutingOverviewView: View {
                         symbol: "exclamationmark.triangle.fill",
                         color: .red)
                 }
+                if let message = state.mutationRecoveryMessage {
+                    mutationRecoveryWarningBanner(
+                        message,
+                        state: state)
+                }
             }
             .padding(28)
             .frame(maxWidth: 680, alignment: .leading)
@@ -1051,6 +1056,11 @@ private struct ClientRoutingView: View {
                 menuErrorLabel(error, limit: 160),
                 symbol: "exclamationmark.triangle.fill",
                 color: .red)
+        }
+        if let message = state.mutationRecoveryMessage {
+            mutationRecoveryWarningBanner(
+                message,
+                state: state)
         }
         if authNeedsReauth(auth: state.auth),
            state.displayedGlobalRoutingEnabled {
@@ -2119,4 +2129,30 @@ func warningBanner(_ text: String,
             in: RoundedRectangle(cornerRadius: 8))
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isStaticText)
+}
+
+@MainActor
+func mutationRecoveryWarningBanner(
+    _ text: String,
+    state: BasetenSwitchState
+) -> some View {
+    HStack(spacing: 10) {
+        Label(text, systemImage: "exclamationmark.triangle.fill")
+            .font(.callout)
+            .foregroundStyle(.orange)
+        Spacer()
+        if state.canRetryMutationCleanup {
+            Button("Retry cleanup") {
+                state.retryMutationCleanup()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+        }
+    }
+    .padding(10)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(
+        Color.orange.opacity(0.09),
+        in: RoundedRectangle(cornerRadius: 8))
+    .accessibilityIdentifier("mutation-recovery-warning")
 }

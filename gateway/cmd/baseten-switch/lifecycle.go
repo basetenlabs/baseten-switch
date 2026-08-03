@@ -863,6 +863,8 @@ func authLine(adminAddr string, routerUp bool) string {
 	}
 	var a struct {
 		SignedIn       bool   `json:"signed_in"`
+		AuthType       string `json:"auth_type"`
+		Profile        string `json:"profile"`
 		Email          string `json:"email"`
 		FallbackInUse  bool   `json:"fallback_in_use"`
 		FallbackEnable bool   `json:"fallback_enabled"`
@@ -871,12 +873,19 @@ func authLine(adminAddr string, routerUp bool) string {
 		return fmt.Sprintf("unknown (auth status unavailable: %v)", err)
 	}
 	switch {
+	case a.SignedIn && a.AuthType == "api_key" && a.Profile != "":
+		return a.Profile + " API key"
+	case a.SignedIn && a.AuthType == "api_key":
+		return "API key"
+	case a.SignedIn && a.Profile != "":
+		return a.Profile + " OAuth"
 	case a.SignedIn && a.Email != "":
-		return fmt.Sprintf("signed in (OAuth, %s)", a.Email)
+		return a.Email + " OAuth"
 	case a.SignedIn:
-		return "signed in (OAuth)"
+		// Routers predating auth_type only supported OAuth profiles.
+		return "OAuth"
 	case a.FallbackInUse:
-		return "API key fallback in use (no OAuth sign-in)"
+		return "API-key fallback in use"
 	default:
 		return "not signed in (run 'baseten auth login')"
 	}

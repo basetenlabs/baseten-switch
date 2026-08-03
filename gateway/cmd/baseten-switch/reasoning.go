@@ -24,6 +24,30 @@ type reasoningPreflightResult struct {
 	Warning string
 }
 
+func reasoningTerminalReplayRequest(clientName string, args []string) (mutationOptions, journaledMutationSpec, error) {
+	opts, positional, err := parseReasoningCommandOptions(args)
+	if err != nil {
+		return opts.Mutation, journaledMutationSpec{}, err
+	}
+	_, modelID, policy, useDefault, err := parseReasoningPolicy(positional)
+	if err != nil {
+		return opts.Mutation, journaledMutationSpec{}, err
+	}
+	target := "default"
+	if !useDefault {
+		target = string(policy.Mode)
+		if policy.Effort != "" {
+			target = "effort:" + policy.Effort
+		}
+	}
+	return opts.Mutation, journaledMutationSpec{
+		Operation:       "set_model_reasoning",
+		RequestedTarget: target,
+		Client:          clientName,
+		Key:             modelID,
+	}, nil
+}
+
 type reasoningPreflightClient interface {
 	Check(adminAddr, clientName, provider, modelID string, policy config.ReasoningPolicy) (reasoningPreflightResult, error)
 }
@@ -31,6 +55,7 @@ type reasoningPreflightClient interface {
 var activeReasoningPreflightClient reasoningPreflightClient = httpReasoningPreflightClient{}
 
 func runClientReasoning(
+	surface string,
 	clientName string,
 	args []string,
 	out io.Writer,
@@ -105,6 +130,7 @@ func runClientReasoning(
 
 	spec := journaledMutationSpec{
 		Operation:       "set_model_reasoning",
+		Surface:         surface,
 		RequestedTarget: result.RequestedTarget,
 		Client:          clientName,
 		Key:             modelID,

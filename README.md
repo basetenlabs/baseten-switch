@@ -35,6 +35,13 @@ user launch agents, starts the local gateway, installs Baseten Switch.app in
 sessions to the gateway. The final command checks the complete request path
 with a small live request.
 
+Baseten Switch uses the current
+[Baseten CLI profile](https://docs.baseten.co/reference/cli/baseten/auth) for
+authentication. Both browser OAuth and API-key profiles created by
+`baseten auth login` work with the gateway. Baseten controls each API key's
+permissions and resource access; Switch treats the key as an opaque
+credential.
+
 If macOS blocks the app's first launch, open **System Settings → Privacy &
 Security**, scroll to **Security**, and click **Open Anyway**. This control
 appears after a blocked launch attempt. A managed Mac may prohibit the
@@ -166,9 +173,16 @@ Baseten Switch stores configuration, local state, logs, and telemetry under
 ~/.config/baseten-switch/logs/door.log
 ```
 
-Run `baseten-switch auth login` if the Baseten credential expires. The command
-delegates authentication to the Baseten CLI, reloads the gateway, and prints
-the current identity.
+Run `baseten-switch auth login` if the Baseten credential expires, is rotated,
+or needs to change. The command delegates authentication to the Baseten CLI,
+reloads the gateway, and prints the current identity. `status` identifies the
+selected profile as OAuth or API key. The gateway also watches the selected
+CLI profile for login, logout, rotation, and profile changes.
+
+`BASETEN_API_KEY` is a separate environment fallback, not the selected CLI
+profile. Switch uses it only when `BASETEN_SWITCH_API_KEY_FALLBACK=1` and no
+selected profile credential is available. A selected OAuth or API-key profile
+always takes precedence.
 
 ## Upgrade
 
@@ -238,7 +252,9 @@ commands over direct edits; routing changes hot-reload without a restart.
 
 See [config/schema.md](config/schema.md) for every field and
 [config/gateway.example.yaml](config/gateway.example.yaml) for the generated
-shape. Store API-key overrides in
+shape. The Baseten CLI owns selected-profile credentials. If you explicitly
+enable the environment fallback, store `BASETEN_API_KEY` and
+`BASETEN_SWITCH_API_KEY_FALLBACK=1` in
 `~/.config/baseten-switch/env`, which must use mode `0600`, rather than in
 `gateway.yaml`.
 

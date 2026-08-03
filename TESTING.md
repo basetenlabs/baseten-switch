@@ -13,6 +13,9 @@ Testing runs in three layers, ordered from cheapest to most realistic:
    container exercises the source-build lifecycle and verifies the full
    install-to-first-request path.
 
+An additional opt-in live contract test validates API-key profile
+authentication against Baseten. The normal gate skips this networked lane.
+
 ## Layer 1: unit and integration tests
 
 ### Go
@@ -76,6 +79,9 @@ agents. Steps, in order:
 8. Smoke: `up`, `status`, idempotent `up`, `down`, `status` round trip on
    scratch ports with `BASETEN_SWITCH_LAUNCHD=off` and a fully sandboxed env. Never
    touches the live gateway.
+9. Validate the API-key profile live-test script in dry-run mode. The live
+   request runs only when explicitly enabled with a test key.
+
 All smoke steps isolate themselves with the env seams listed below; the gate
 never edits `~/.config/baseten-switch` or touches a running production gateway.
 
@@ -96,6 +102,45 @@ The API key enters only via `docker run -e`, never a image layer. Not
 simulated: macOS keychain OAuth, the menubar app, Gatekeeper/notarization,
 and real launchd installs.
 
+## Opt-in API-key profile contract
+
+This test creates a temporary Baseten CLI API-key profile, starts scratch
+router and door processes, and sends `GET /v1/models` plus one minimal Chat
+Completions request through the door. It verifies that admin status reports a
+healthy API-key profile, the environment fallback is disabled, and telemetry
+attributes inference to Baseten.
+
+Use an API key that may list models and invoke the selected model. The key is
+read only from the environment and is never printed. The model defaults to
+the public example model; override it when the key has access to a different
+model.
+
+```sh
+BASETEN_SWITCH_TEST_API_KEY='<test-key>' \
+BASETEN_SWITCH_TEST_MODEL='zai-org/GLM-5.2' \
+scripts/tests/test_api_key_profile_live.sh
+```
+
+To include the lane in the full gate:
+
+```sh
+BASETEN_SWITCH_RUN_API_KEY_PROFILE_LIVE=1 \
+BASETEN_SWITCH_TEST_API_KEY='<test-key>' \
+BASETEN_SWITCH_TEST_MODEL='zai-org/GLM-5.2' \
+scripts/check.sh
+```
+
+The script requires `baseten`, `curl`, `go`, and `lsof`. It uses a temporary
+`BASETEN_CONFIG_DIR`, insecure storage inside that temporary directory, an
+empty Switch environment file, scratch ports, and scratch pidfiles. It does
+not read the normal CLI profile store or operate on installed Switch
+processes. On exit it stops only the process IDs it started and removes only
+its validated temporary directory.
+
+Before cleanup, the script scans its output, logs, telemetry, and scratch
+state for the exact test key. It excludes the temporary CLI credential file,
+which intentionally contains the key.
+
 ## Writing tests: isolation seams
 
 Production code honors env overrides so tests and scratch instances never
@@ -111,6 +156,8 @@ touch real state. Any test that boots a component must set the relevant ones:
 | `BASETEN_SWITCH_GATEWAY_LOG`, `BASETEN_SWITCH_DOOR_LOG` | process log locations |
 | `BASETEN_SWITCH_TELEMETRY_DIR` | segmented telemetry store location |
 | `BASETEN_SWITCH_OAUTH_PROFILE` | named Baseten CLI profile; unset follows the CLI's current profile (point at a nonexistent name to run credential-less) |
+| `BASETEN_CONFIG_DIR` | Baseten CLI profile-store directory; live credential tests must use a scratch directory. |
+| `BASETEN_SWITCH_AUTH_NO_KEYRING=1` | prevent a scratch test from consulting the system keyring. |
 | `BASETEN_SWITCH_MENUBAR_APP` | menubar bundle path override |
 
 Hard rules for contributors and agents:

@@ -629,7 +629,7 @@ door:
 		if strings.Contains(stderr, "verified live") {
 			t.Errorf("stale admin must not verify: %q", stderr)
 		}
-		if !strings.Contains(stderr, "restored and reactivated the prior exact config") {
+		if !strings.Contains(stderr, "prior routing state was restored") {
 			t.Errorf("rollback confirmation missing: %q", stderr)
 		}
 		if strings.Contains(stderr, "warning: SIGHUP sent") {

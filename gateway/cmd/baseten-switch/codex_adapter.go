@@ -78,6 +78,9 @@ func cmdCodex(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: baseten-switch codex on|off|status|route <baseten-slug>|reasoning baseten <model> off|follow-harness|effort <value>|default  (start/stop are aliases for on/off)")
 		return 2
 	}
+	if replayed, rc := preflightCodexTerminalReplay(args); replayed {
+		return rc
+	}
 	a, err := newCodexAdapterFromEnv()
 	if err != nil {
 		if args[0] == "reasoning" || args[0] == "route" {
@@ -114,11 +117,56 @@ func cmdCodex(args []string) int {
 	case "route":
 		return a.route(args[1:], os.Stdout)
 	case "reasoning":
-		return runClientReasoning(a.clientName, args[1:], os.Stdout)
+		return runClientReasoning(mutationSurfaceCodex, a.clientName, args[1:], os.Stdout)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown codex subcommand: %s (use on|off|status|route|reasoning)\n", args[0])
 		return 2
 	}
+}
+
+func preflightCodexTerminalReplay(args []string) (bool, int) {
+	path, _ := resolveConfigPath()
+	var opts mutationOptions
+	var spec journaledMutationSpec
+	var err error
+	switch args[0] {
+	case "route":
+		var positional []string
+		opts, positional, err = parseMutationOptions(args[1:])
+		if err != nil || len(positional) != 1 {
+			return false, 0
+		}
+		spec = journaledMutationSpec{Operation: "set_codex_route", Surface: mutationSurfaceCodex, Key: "default_model", RequestedTarget: positional[0]}
+	case "reasoning":
+		opts, spec, err = reasoningTerminalReplayRequest("", args[1:])
+		if err != nil {
+			return false, 0
+		}
+		spec.Surface = mutationSurfaceCodex
+	default:
+		return false, 0
+	}
+	return preflightTerminalReplay(path, opts, spec, os.Stdout)
+}
+
+func codexTargetClientName(file *config.File) (string, error) {
+	var selected string
+	for i := range file.Clients {
+		client := &file.Clients[i]
+		if client.ProtocolShape != "openai" {
+			continue
+		}
+		if client.Name == "codex" {
+			return client.Name, nil
+		}
+		if selected == "" {
+			selected = client.Name
+		}
+	}
+	if selected == "" {
+		return "", fmt.Errorf("no openai-shape client")
+	}
+	return selected, nil
 }
 
 // codexAdapter carries the resolved paths and gateway topology for one
@@ -963,6 +1011,7 @@ func (a *codexAdapter) route(args []string, stdout io.Writer) int {
 		out,
 		journaledMutationSpec{
 			Operation:       "set_codex_route",
+			Surface:         mutationSurfaceCodex,
 			RequestedTarget: target,
 			Client:          a.clientName,
 			Key:             "default_model",

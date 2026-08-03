@@ -80,7 +80,7 @@ clients:
 	preflight := &failingReasoningPreflight{}
 	installReasoningPreflight(t, preflight)
 	var out strings.Builder
-	rc := runClientReasoning("claude-code", []string{
+	rc := runClientReasoning(mutationSurfaceClaude, "claude-code", []string{
 		"baseten", "zai-org/GLM-5.2", "default",
 		"--operation-id", "reasoning-default-test",
 	}, &out)
@@ -120,6 +120,7 @@ clients:
 	installReasoningPreflight(t, preflight)
 	var out strings.Builder
 	rc := runClientReasoning(
+		mutationSurfaceClaude,
 		"claude-code",
 		[]string{"baseten", "zai-org/GLM-5.2", "off"},
 		&out,

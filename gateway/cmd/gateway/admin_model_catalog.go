@@ -25,10 +25,12 @@ const (
 	modelCatalogMaxBody                       = 8 << 20
 	modelCatalogSignedOutReasonNotSignedIn    = "not_signed_in"
 	modelCatalogSignedOutReasonSessionExpired = "session_expired"
+	modelCatalogSignedOutReasonRejected       = "credential_rejected"
 	basetenModelAPIsAvailabilitySource        = "baseten_model_apis"
 )
 
 var errModelCatalogUnauthorized = errors.New("model catalog authorization rejected")
+var errModelCatalogForbidden = errors.New("model catalog access denied")
 var modelCatalogNow = time.Now
 
 type modelCatalogResponse struct {
@@ -61,12 +63,10 @@ func (g *Gateway) adminModelCatalog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The live catalog belongs to the signed-in OAuth session. Do not use
-	// basetenAuthClient here because it can silently fall back to an API key.
-	g.authMu.Lock()
-	client := g.oauthClient
-	g.authMu.Unlock()
-	if client == nil {
+	// The live catalog belongs to the selected Baseten CLI profile. The
+	// environment fallback is intentionally excluded from this account view.
+	selected, ok := g.basetenProfileAuth()
+	if !ok {
 		writeModelCatalogJSON(w, r.Method, modelCatalogResponse{
 			State:           "signed_out",
 			SignedOutReason: modelCatalogSignedOutReasonNotSignedIn,
@@ -77,13 +77,25 @@ func (g *Gateway) adminModelCatalog(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), modelCatalogTimeout)
 	defer cancel()
-	models, err := g.fetchModelCatalog(ctx, client)
+	models, err := g.fetchModelCatalog(ctx, selected.client, selected.authorization())
 	if err != nil {
 		if errors.Is(err, errModelCatalogUnauthorized) {
+			reason := modelCatalogSignedOutReasonSessionExpired
+			if selected.source == basetenAuthProfileAPIKey {
+				reason = modelCatalogSignedOutReasonRejected
+			}
 			writeModelCatalogJSON(w, r.Method, modelCatalogResponse{
 				State:           "signed_out",
-				SignedOutReason: modelCatalogSignedOutReasonSessionExpired,
+				SignedOutReason: reason,
 				Models:          []modelCatalogModel{},
+			})
+			return
+		}
+		if errors.Is(err, errModelCatalogForbidden) {
+			writeModelCatalogJSON(w, r.Method, modelCatalogResponse{
+				State:  "error",
+				Models: []modelCatalogModel{},
+				Error:  "The selected Baseten credential does not have access to the model catalog",
 			})
 			return
 		}
@@ -232,7 +244,7 @@ func writeModelCatalogJSON(w http.ResponseWriter, method string, response modelC
 	}
 }
 
-func (g *Gateway) fetchModelCatalog(ctx context.Context, client *http.Client) ([]modelCatalogModel, error) {
+func (g *Gateway) fetchModelCatalog(ctx context.Context, client *http.Client, authorization string) ([]modelCatalogModel, error) {
 	endpoint, err := modelCatalogEndpoint(g.runtimeConfig().OAuthHost)
 	if err != nil {
 		return nil, err
@@ -252,6 +264,9 @@ func (g *Gateway) fetchModelCatalog(ctx context.Context, client *http.Client) ([
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL.String(), nil)
 		if err != nil {
 			return nil, fmt.Errorf("build model catalog request: %w", err)
+		}
+		if authorization != "" {
+			req.Header.Set("Authorization", authorization)
 		}
 		resp, err := client.Do(req)
 		if err != nil {
@@ -314,6 +329,9 @@ func readModelCatalogBody(resp *http.Response) ([]byte, error) {
 	}
 	if resp.StatusCode == http.StatusUnauthorized {
 		return nil, errModelCatalogUnauthorized
+	}
+	if resp.StatusCode == http.StatusForbidden {
+		return nil, errModelCatalogForbidden
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return nil, fmt.Errorf("model catalog upstream returned a non-success status")

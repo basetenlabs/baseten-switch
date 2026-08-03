@@ -7,7 +7,8 @@ global:
   # One global switch. Off is absolute native passthrough; On applies saved routing policy.
   routing_enabled: true
 
-  # Upstream auth; baseten is OPTIONAL with OAuth ('baseten auth login'), see schema.md for the API-key path.
+  # The selected Baseten CLI profile supplies OAuth or API-key auth automatically.
+  # baseten below is only the explicit environment fallback; see schema.md.
   auth:
     baseten:   ${BASETEN_API_KEY}
     anthropic: ${ANTHROPIC_API_KEY}
@@ -50,7 +51,8 @@ clients:
     # Route Claude Code subagent (sidechain) traffic to a model; toggle with 'baseten-switch claude subagents'. See the subagent-routing contract.
     # subagent_model: claude-baseten-glm-5-2
     # subagent_routing: on
-    # Tried when baseten is unreachable, returns 429/5xx, or ttft_timeout expires (30s cooldown).
+    # Tried when baseten is unreachable, returns 5xx, or ttft_timeout expires (30s cooldown).
+    # Anthropic 429 responses relay to the harness without fallback or cooldown.
     fallback_route: anthropic
 
   # codex ships parked (enabled: false; no listener bound); 'baseten-switch codex on' offers to

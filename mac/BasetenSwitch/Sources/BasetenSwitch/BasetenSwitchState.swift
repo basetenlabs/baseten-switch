@@ -7,6 +7,22 @@ enum MutationPhase: String, Equatable, Sendable {
     case reconciling
 }
 
+enum MutationRecoveryState: Equatable, Sendable {
+    case disabled
+    case awaitingSnapshot
+    case checking
+    case waitingToRetry(seconds: TimeInterval)
+    case ready
+    case legacyFallback
+    case blocked(errorCode: String)
+}
+
+private struct MutationRecoveryKey: Equatable, Sendable {
+    let configIdentity: String
+    let routerBootID: String
+    let runtimeIdentity: String?
+}
+
 struct PendingGlobalRouting: Equatable, Sendable {
     let operationID: String
     let requested: Bool
@@ -38,6 +54,14 @@ private struct PolicyMutationAttempt {
     let result: CLIExecutionResult
     let receipt: GlobalMutationReceipt?
     let primaryTimedOut: Bool
+    let verifiedTerminalReplay: Bool
+}
+
+private struct PolicyMutationRequestIdentity {
+    let operation: String
+    let client: String
+    let key: String
+    let requestedTarget: String
 }
 
 @MainActor
@@ -78,6 +102,7 @@ final class BasetenSwitchState: ObservableObject {
     @Published private(set) var pendingSubagents: [String: PendingControlMutation] = [:]
     @Published private(set) var pendingReasoning: PendingReasoningMutation?
     @Published private(set) var reasoningWarnings: [String: String] = [:]
+    @Published private(set) var mutationRecoveryState: MutationRecoveryState
 
     private let reader: any AdminStatusReading
     private let modelCatalogReader: any ModelCatalogReading
@@ -88,11 +113,15 @@ final class BasetenSwitchState: ObservableObject {
     private let previewRuntimeValidator: (RuntimeProfile) -> String?
     private let pollCoordinator: PollCoordinator?
     private let mutationCoordinator: MutationCoordinator?
+    private let automaticMutationRecoveryEnabled: Bool
     private var reconcileTimers: [String: Task<Void, Never>] = [:]
     private var interactiveRefreshTask: Task<Void, Never>?
     private var interactiveStatsRequested = false
     private var modelCatalogTask: Task<Void, Never>?
     private var modelCatalogGeneration: UInt64 = 0
+    private var mutationRecoveryTask: Task<Void, Never>?
+    private var mutationRecoveryKey: MutationRecoveryKey?
+    private var unsupportedRecoveryRuntime: String?
     private(set) var menuVisible = false
     let variant: AppVariant
 
@@ -129,7 +158,8 @@ final class BasetenSwitchState: ObservableObject {
          previewRuntimeValidator: @escaping (RuntimeProfile) -> String? = {
              previewRuntimeFilesystemError(runtime: $0)
          },
-         startPolling: Bool = true) {
+         startPolling: Bool = true,
+         automaticMutationRecoveryEnabled: Bool? = nil) {
         self.variant = variant
         let apiClient = GatewayAPIClient(runtime: variant.runtime)
         self.reader = reader ?? apiClient
@@ -139,6 +169,11 @@ final class BasetenSwitchState: ObservableObject {
         self.clock = clock
         self.loginItemService = loginItemService ?? SystemLoginItemService()
         self.previewRuntimeValidator = previewRuntimeValidator
+        self.automaticMutationRecoveryEnabled =
+            automaticMutationRecoveryEnabled ?? startPolling
+        mutationRecoveryState = self.automaticMutationRecoveryEnabled
+            ? .awaitingSnapshot
+            : .disabled
         if let identityError = variant.identityError {
             runtimeTrust = .identityMismatch(reason: identityError)
             lastError = identityError
@@ -188,6 +223,8 @@ final class BasetenSwitchState: ObservableObject {
         previewRuntimeValidator = {
             previewRuntimeFilesystemError(runtime: $0)
         }
+        automaticMutationRecoveryEnabled = false
+        mutationRecoveryState = .disabled
         pollCoordinator = nil
         mutationCoordinator = nil
         if let identityError = variant.identityError {
@@ -224,6 +261,8 @@ final class BasetenSwitchState: ObservableObject {
         interactiveRefreshTask = nil
         interactiveStatsRequested = false
         invalidateModelCatalog()
+        mutationRecoveryTask?.cancel()
+        mutationRecoveryTask = nil
         Task { await pollCoordinator?.stop() }
     }
 
@@ -253,6 +292,7 @@ final class BasetenSwitchState: ObservableObject {
                     loginItemStatus = updatedStatus
                 }
             }
+            beginAutomaticMutationRecoveryIfNeeded(snapshot)
         case .unavailable:
             if !snapshotIsStale {
                 snapshotIsStale = true
@@ -265,6 +305,219 @@ final class BasetenSwitchState: ObservableObject {
         case .ignoredStaleToken:
             break
         }
+    }
+
+    private var mutationRecoveryAllowsRouting: Bool {
+        switch mutationRecoveryState {
+        case .disabled, .ready, .legacyFallback:
+            return true
+        case .awaitingSnapshot, .checking, .waitingToRetry, .blocked:
+            return false
+        }
+    }
+
+    private var mutationRecoveryDisabledReason: String? {
+        switch mutationRecoveryState {
+        case .awaitingSnapshot, .checking:
+            return "Checking for an unfinished routing change."
+        case .waitingToRetry:
+            return "Waiting to retry routing cleanup."
+        case .blocked:
+            return "Routing cleanup must finish before settings can be changed."
+        case .disabled, .ready, .legacyFallback:
+            return nil
+        }
+    }
+
+    var mutationRecoveryMessage: String? {
+        switch mutationRecoveryState {
+        case .checking:
+            return "Checking for an unfinished routing change."
+        case .waitingToRetry(let seconds):
+            return "Routing cleanup will retry in \(Int(seconds)) seconds."
+        case .blocked(let errorCode):
+            return reviewedMutationErrorMessage(
+                errorCode: errorCode,
+                fallback: "Routing cleanup could not be completed safely.")
+        case .disabled, .awaitingSnapshot, .ready, .legacyFallback:
+            return nil
+        }
+    }
+
+    var canRetryMutationCleanup: Bool {
+        if case .blocked = mutationRecoveryState {
+            return mutationRecoveryKey != nil
+        }
+        return false
+    }
+
+    func retryMutationCleanup() {
+        guard canRetryMutationCleanup,
+              let key = mutationRecoveryKey else { return }
+        mutationRecoveryTask?.cancel()
+        mutationRecoveryState = .checking
+        mutationRecoveryTask = Task { [weak self] in
+            await self?.runCleanupRecovery(for: key)
+        }
+    }
+
+    func waitForMutationRecovery() async {
+        await mutationRecoveryTask?.value
+    }
+
+    private func beginAutomaticMutationRecoveryIfNeeded(
+        _ snapshot: RoutingSnapshot
+    ) {
+        guard automaticMutationRecoveryEnabled,
+              snapshot.token.isAuthoritative,
+              !snapshot.configPath.isEmpty else { return }
+        let runtime = recoveryRuntimeIdentifier
+        let key = MutationRecoveryKey(
+            configIdentity: URL(fileURLWithPath: snapshot.configPath)
+                .standardizedFileURL.path,
+            routerBootID: snapshot.token.routerBootID,
+            runtimeIdentity: runtime)
+        guard key != mutationRecoveryKey else { return }
+
+        mutationRecoveryTask?.cancel()
+        mutationRecoveryKey = key
+        if let runtime,
+           unsupportedRecoveryRuntime == runtime {
+            mutationRecoveryState = .legacyFallback
+            return
+        }
+
+        mutationRecoveryState = .checking
+        mutationRecoveryTask = Task { [weak self] in
+            await self?.probeAndRecoverMutation(for: key, runtime: runtime)
+        }
+    }
+
+    private var recoveryRuntimeIdentifier: String? {
+        guard let binary = Self.locateBasetenSwitchBinary(variant: variant)?
+            .standardizedFileURL else { return nil }
+        let attributes = try? FileManager.default.attributesOfItem(
+            atPath: binary.path)
+        let modified = (attributes?[.modificationDate] as? Date)?
+            .timeIntervalSince1970 ?? 0
+        let size = attributes?[.size] as? NSNumber
+        let inode = attributes?[.systemFileNumber] as? NSNumber
+        return "\(binary.path):\(inode?.uint64Value ?? 0):\(modified):\(size?.int64Value ?? 0)"
+    }
+
+    private func probeAndRecoverMutation(
+        for key: MutationRecoveryKey,
+        runtime: String?
+    ) async {
+        let status = await executeCLI(
+            ["--json", "mutation", "status"],
+            timeout: 10)
+        guard recoveryKeyIsCurrent(key), !Task.isCancelled else { return }
+        let receipt = MutationRecoveryReceipt(json: status.standardOutput)
+        if mutationStatusIsUnsupported(status, receipt: receipt) {
+            unsupportedRecoveryRuntime = runtime
+            await finishMutationRecovery(for: key, state: .legacyFallback)
+            return
+        }
+        if !status.succeeded,
+           !status.timedOut,
+           receipt?.errorRetryable != true,
+           !isTransientRecoveryError(receipt?.errorCode ?? "") {
+            await finishMutationRecovery(
+                for: key,
+                state: .blocked(
+                    errorCode: receipt?.errorCode ?? "status_unavailable"))
+            return
+        }
+        await runCleanupRecovery(for: key)
+    }
+
+    private func runCleanupRecovery(for key: MutationRecoveryKey) async {
+        let retryDelays: [TimeInterval] = [1, 2, 4, 8, 16]
+        var finalErrorCode = "cleanup_failed"
+        for attempt in 0...retryDelays.count {
+            guard recoveryKeyIsCurrent(key), !Task.isCancelled else { return }
+            if attempt > 0 {
+                let delay = retryDelays[attempt - 1]
+                mutationRecoveryState = .waitingToRetry(seconds: delay)
+                do {
+                    try await clock.sleep(seconds: delay)
+                } catch {
+                    return
+                }
+                guard recoveryKeyIsCurrent(key), !Task.isCancelled else { return }
+                mutationRecoveryState = .checking
+            }
+
+            let result = await executeCLI(
+                ["--json", "mutation", "recover"],
+                timeout: 10)
+            guard recoveryKeyIsCurrent(key), !Task.isCancelled else { return }
+            let receipt = MutationRecoveryReceipt(json: result.standardOutput)
+            if result.succeeded, receipt?.ok == true {
+                if receipt?.cleanupPending == true {
+                    finalErrorCode = "cleanup_pending"
+                    guard attempt < retryDelays.count else {
+                        await finishMutationRecovery(
+                            for: key,
+                            state: .blocked(errorCode: finalErrorCode))
+                        return
+                    }
+                    continue
+                } else {
+                    await finishMutationRecovery(for: key, state: .ready)
+                    return
+                }
+            }
+
+            if result.timedOut && (receipt?.errorCode.isEmpty != false) {
+                finalErrorCode = "cleanup_timed_out"
+            } else {
+                finalErrorCode = receipt?.errorCode ?? "cleanup_failed"
+            }
+            let shouldRetry = (result.timedOut
+                && (receipt?.errorCode.isEmpty != false))
+                || receipt?.errorRetryable == true
+                || isTransientRecoveryError(finalErrorCode)
+            guard shouldRetry,
+                  attempt < retryDelays.count else {
+                await finishMutationRecovery(
+                    for: key,
+                    state: .blocked(errorCode: finalErrorCode))
+                return
+            }
+        }
+    }
+
+    private func finishMutationRecovery(
+        for key: MutationRecoveryKey,
+        state: MutationRecoveryState
+    ) async {
+        await refresh()
+        guard recoveryKeyIsCurrent(key), !Task.isCancelled else { return }
+        mutationRecoveryState = state
+    }
+
+    private func recoveryKeyIsCurrent(_ key: MutationRecoveryKey) -> Bool {
+        key == mutationRecoveryKey
+    }
+
+    private func mutationStatusIsUnsupported(
+        _ result: CLIExecutionResult,
+        receipt: MutationRecoveryReceipt?
+    ) -> Bool {
+        let unsupportedCodes = [
+            "usage", "unknown_command", "unknown_subcommand",
+            "unsupported_command",
+        ]
+        return unsupportedCodes.contains(receipt?.errorCode ?? "")
+            || (result.status == 2 && !result.timedOut)
+    }
+
+    private func isTransientRecoveryError(_ errorCode: String) -> Bool {
+        errorCode == "mutation_locked"
+            || errorCode == "router_unavailable"
+            || errorCode == "cleanup_pending"
     }
 
     func menuDidShow() {
@@ -418,6 +671,7 @@ final class BasetenSwitchState: ObservableObject {
     var canMutateRouting: Bool {
         guard gatewayUp,
               canMutate,
+              mutationRecoveryAllowsRouting,
               let snapshot = routingSnapshot else { return false }
         return snapshot.supportsGlobalRouting
             && snapshot.token.isAuthoritative
@@ -431,6 +685,9 @@ final class BasetenSwitchState: ObservableObject {
         }
         guard gatewayUp else { return "The local gateway is unavailable." }
         guard canMutate else { return runtimeTrustError }
+        if let recoveryReason = mutationRecoveryDisabledReason {
+            return recoveryReason
+        }
         guard let snapshot = routingSnapshot,
               snapshot.supportsGlobalRouting else {
             return "Update the local gateway to configure global routing."
@@ -497,10 +754,10 @@ final class BasetenSwitchState: ObservableObject {
             lastError = nil
         } else if attempt.primaryTimedOut {
             lastError = "The routing change timed out and could not be confirmed."
-        } else if let message = receipt?.errorMessage, !message.isEmpty {
-            lastError = menuErrorLabel(redactDiagnosticText(message), limit: 180)
         } else {
-            lastError = "The routing change failed and the last confirmed setting was restored."
+            lastError = mutationFailureMessage(
+                receipt,
+                fallback: "The routing change failed and the last confirmed setting was restored.")
         }
         clearPending(key: "global", operationID: pending.operationID)
         pendingGlobalRouting = nil
@@ -516,6 +773,22 @@ final class BasetenSwitchState: ObservableObject {
             && current.activeConfigHash == expected
             && current.desiredConfigHash == expected
             && receipt.activeToken == current.token.cliValue
+    }
+
+    private func receiptRequestIdentityConfirms(
+        _ receipt: GlobalMutationReceipt?,
+        key: String,
+        requestedTarget: String,
+        verifiedTerminalReplay: Bool
+    ) -> Bool {
+        guard let receipt else { return false }
+        if receipt.key == key
+            && receipt.requestedTarget == requestedTarget {
+            return true
+        }
+        return verifiedTerminalReplay
+            && receipt.identityStrength == "exact"
+            && !receipt.requestFingerprint.isEmpty
     }
 
     // MARK: - Client model routing
@@ -573,7 +846,12 @@ final class BasetenSwitchState: ObservableObject {
             command: codexRouteDispatchArgs(model: model))
         let attempt = await executePolicyMutation(
             arguments,
-            operationID: pending.operationID)
+            operationID: pending.operationID,
+            requestIdentity: PolicyMutationRequestIdentity(
+                operation: "set_codex_route",
+                client: client.name,
+                key: "default_model",
+                requestedTarget: model.slug))
         await refresh()
         let receipt = attempt.receipt
         let confirmed = !snapshotIsStale
@@ -582,8 +860,11 @@ final class BasetenSwitchState: ObservableObject {
             && receipt?.operationID == pending.operationID
             && receipt?.operation == "set_codex_route"
             && receipt?.client == client.name
-            && receipt?.key == "default_model"
-            && receipt?.requestedTarget == model.slug
+            && receiptRequestIdentityConfirms(
+                receipt,
+                key: "default_model",
+                requestedTarget: model.slug,
+                verifiedTerminalReplay: attempt.verifiedTerminalReplay)
             && receipt?.applied == true
             && hashesConfirm(receipt)
             && codexRouteMutationConfirmed(
@@ -665,7 +946,12 @@ final class BasetenSwitchState: ObservableObject {
                 choice: choice))
         let attempt = await executePolicyMutation(
             arguments,
-            operationID: pending.operationID)
+            operationID: pending.operationID,
+            requestIdentity: PolicyMutationRequestIdentity(
+                operation: "set_claude_route",
+                client: client.name,
+                key: family,
+                requestedTarget: requestedTarget))
         await refresh()
         let receipt = attempt.receipt
         let confirmed = !snapshotIsStale
@@ -674,8 +960,11 @@ final class BasetenSwitchState: ObservableObject {
             && receipt?.operationID == pending.operationID
             && receipt?.operation == "set_claude_route"
             && receipt?.client == client.name
-            && receipt?.key == family
-            && receipt?.requestedTarget == requestedTarget
+            && receiptRequestIdentityConfirms(
+                receipt,
+                key: family,
+                requestedTarget: requestedTarget,
+                verifiedTerminalReplay: attempt.verifiedTerminalReplay)
             && receipt?.applied == true
             && hashesConfirm(receipt)
             && familyMutationConfirmed(
@@ -741,7 +1030,12 @@ final class BasetenSwitchState: ObservableObject {
             command: subagentDispatchArgs(client: client.name, choice: choice))
         let attempt = await executePolicyMutation(
             arguments,
-            operationID: pending.operationID)
+            operationID: pending.operationID,
+            requestIdentity: PolicyMutationRequestIdentity(
+                operation: "set_claude_subagents",
+                client: client.name,
+                key: "subagents",
+                requestedTarget: requestedTarget))
         await refresh()
         let receipt = attempt.receipt
         let confirmed = !snapshotIsStale
@@ -750,8 +1044,11 @@ final class BasetenSwitchState: ObservableObject {
             && receipt?.operationID == pending.operationID
             && receipt?.operation == "set_claude_subagents"
             && receipt?.client == client.name
-            && receipt?.key == "subagents"
-            && receipt?.requestedTarget == requestedTarget
+            && receiptRequestIdentityConfirms(
+                receipt,
+                key: "subagents",
+                requestedTarget: requestedTarget,
+                verifiedTerminalReplay: attempt.verifiedTerminalReplay)
             && receipt?.applied == true
             && hashesConfirm(receipt)
             && subagentMutationConfirmed(
@@ -786,6 +1083,7 @@ final class BasetenSwitchState: ObservableObject {
     var canMutateReasoning: Bool {
         guard gatewayUp,
               canMutate,
+              mutationRecoveryAllowsRouting,
               let snapshot = routingSnapshot else { return false }
         return snapshot.token.isAuthoritative
             && snapshot.token.activeGeneration > 0
@@ -932,6 +1230,9 @@ final class BasetenSwitchState: ObservableObject {
         let requestedTarget = reasoningRequestedTarget(policy)
         let command = reasoningDispatchArgs(
             client: client,
+            protocolShape: snapshot.clients
+                .first(where: { $0.name == client })?
+                .protocolShape,
             provider: provider,
             model: model,
             policy: policy)
@@ -941,7 +1242,12 @@ final class BasetenSwitchState: ObservableObject {
             command: command)
         let attempt = await executePolicyMutation(
             arguments,
-            operationID: operationID)
+            operationID: operationID,
+            requestIdentity: PolicyMutationRequestIdentity(
+                operation: "set_model_reasoning",
+                client: client,
+                key: model,
+                requestedTarget: requestedTarget))
         await refresh()
         let receipt = attempt.receipt
         let confirmed = !snapshotIsStale
@@ -950,8 +1256,11 @@ final class BasetenSwitchState: ObservableObject {
             && receipt?.operationID == operationID
             && receipt?.operation == "set_model_reasoning"
             && receipt?.client == client
-            && receipt?.key == model
-            && receipt?.requestedTarget == requestedTarget
+            && receiptRequestIdentityConfirms(
+                receipt,
+                key: model,
+                requestedTarget: requestedTarget,
+                verifiedTerminalReplay: attempt.verifiedTerminalReplay)
             && receipt?.applied == true
             && hashesConfirm(receipt)
             && reasoningMutationConfirmed(
@@ -1059,29 +1368,66 @@ final class BasetenSwitchState: ObservableObject {
         ] + command
     }
 
-    /// Every policy mutation receives one reconciliation attempt before its
-    /// pending UI is cleared. Reconciliation is mandatory for a timeout,
-    /// malformed receipt, failed command, or an otherwise-successful receipt
-    /// whose journal cleanup remains indeterminate.
+    private func receiptMatchesDispatchedRequest(
+        _ receipt: GlobalMutationReceipt?,
+        identity: PolicyMutationRequestIdentity?
+    ) -> Bool {
+        guard let receipt, let identity else { return false }
+        return receipt.operation == identity.operation
+            && receipt.client == identity.client
+            && receipt.key == identity.key
+            && receipt.requestedTarget == identity.requestedTarget
+    }
+
+    /// Policy mutations reconcile only when their result is missing or
+    /// explicitly indeterminate. A valid deterministic failure is primary
+    /// evidence and must not be replaced by a failed secondary lookup.
     private func executePolicyMutation(
         _ arguments: [String],
-        operationID: String
+        operationID: String,
+        requestIdentity: PolicyMutationRequestIdentity? = nil
     ) async -> PolicyMutationAttempt {
         let primary = await executeCLI(arguments, timeout: 30)
         let primaryReceipt = GlobalMutationReceipt(
             json: primary.standardOutput)
+        let primaryReceiptMatches = primaryReceipt?.operationID == operationID
+        let primaryRequiresRecovery = receiptRequiresMutationRecovery(
+            primaryReceipt)
+        if primaryRequiresRecovery {
+            mutationRecoveryState = .checking
+        }
+        let primaryTypedError = primaryReceiptMatches
+            && primaryReceipt?.errorCode.isEmpty == false
+        if primaryReceiptMatches,
+           primaryReceipt?.errorCode == "unfinished_mutation",
+           primaryReceipt?.blockingOperationID.isEmpty == false {
+            retainMutationRecoveryGateIfNeeded(primaryReceipt)
+            return PolicyMutationAttempt(
+                result: primary,
+                receipt: primaryReceipt,
+                primaryTimedOut: false,
+                verifiedTerminalReplay: false)
+        }
+        if primaryReceiptMatches,
+           primaryReceipt?.reconciliationRequired == false,
+           !primary.timedOut || primaryTypedError {
+            retainMutationRecoveryGateIfNeeded(primaryReceipt)
+            return PolicyMutationAttempt(
+                result: primary,
+                receipt: primaryReceipt,
+                primaryTimedOut: primary.timedOut && !primaryTypedError,
+                verifiedTerminalReplay: false)
+        }
+
         let needsReconciliation = primary.timedOut
-            || !primary.succeeded
-            || primaryReceipt == nil
-            || primaryReceipt?.ok != true
-            || primaryReceipt?.applied != true
-            || primaryReceipt?.operationID != operationID
+            || !primaryReceiptMatches
             || primaryReceipt?.reconciliationRequired == true
         guard needsReconciliation else {
             return PolicyMutationAttempt(
                 result: primary,
                 receipt: primaryReceipt,
-                primaryTimedOut: false)
+                primaryTimedOut: primary.timedOut && !primaryTypedError,
+                verifiedTerminalReplay: false)
         }
 
         markReconciling(operationID: operationID)
@@ -1090,20 +1436,73 @@ final class BasetenSwitchState: ObservableObject {
             timeout: 10)
         let reconciledReceipt = GlobalMutationReceipt(
             json: reconciled.standardOutput)
-        let shouldUseReconciliation = reconciledReceipt?.operationID == operationID
-            && (reconciledReceipt?.ok == true
-                || primaryReceipt == nil
-                || primaryReceipt?.reconciliationRequired == true)
+        let shouldUseReconciliation = reconciled.succeeded
+            && reconciledReceipt?.operationID == operationID
+            && reconciledReceipt?.ok == true
+            && reconciledReceipt?.reconciliationRequired == false
+            && reconciledReceipt?.cleanupPending == false
+        let verifiedTerminalReplay = shouldUseReconciliation
+            && receiptMatchesDispatchedRequest(
+                primaryReceipt,
+                identity: requestIdentity)
+            && primaryReceipt?.identityStrength == "exact"
+            && reconciledReceipt?.identityStrength == "exact"
+            && isValidMutationRequestFingerprint(
+                primaryReceipt?.requestFingerprint ?? "")
+            && primaryReceipt?.requestFingerprint
+                == reconciledReceipt?.requestFingerprint
         if shouldUseReconciliation {
+            if primaryRequiresRecovery {
+                mutationRecoveryState = .ready
+            }
             return PolicyMutationAttempt(
                 result: reconciled,
                 receipt: reconciledReceipt,
-                primaryTimedOut: primary.timedOut)
+                primaryTimedOut: false,
+                verifiedTerminalReplay: verifiedTerminalReplay)
         }
+        let unresolvedReceipt: GlobalMutationReceipt?
+        if receiptRequiresMutationRecovery(reconciledReceipt) {
+            unresolvedReceipt = reconciledReceipt
+        } else if primaryRequiresRecovery {
+            unresolvedReceipt = primaryReceipt
+        } else {
+            unresolvedReceipt = reconciledReceipt ?? primaryReceipt
+        }
+        retainMutationRecoveryGate(unresolvedReceipt)
         return PolicyMutationAttempt(
             result: primary,
             receipt: primaryReceipt,
-            primaryTimedOut: primary.timedOut)
+            primaryTimedOut: primary.timedOut && !primaryTypedError,
+            verifiedTerminalReplay: false)
+    }
+
+    private func receiptRequiresMutationRecovery(
+        _ receipt: GlobalMutationReceipt?
+    ) -> Bool {
+        receipt?.cleanupPending == true
+            || receipt?.reconciliationRequired == true
+    }
+
+    private func retainMutationRecoveryGateIfNeeded(
+        _ receipt: GlobalMutationReceipt?
+    ) {
+        guard receiptRequiresMutationRecovery(receipt) else { return }
+        retainMutationRecoveryGate(receipt)
+    }
+
+    private func retainMutationRecoveryGate(
+        _ receipt: GlobalMutationReceipt?
+    ) {
+        let errorCode: String
+        if receipt?.cleanupPending == true {
+            errorCode = "cleanup_pending"
+        } else if receipt?.errorCode.isEmpty == false {
+            errorCode = receipt?.errorCode ?? "reconciliation_required"
+        } else {
+            errorCode = "reconciliation_required"
+        }
+        mutationRecoveryState = .blocked(errorCode: errorCode)
     }
 
     private func markReconciling(operationID: String) {
@@ -1130,10 +1529,49 @@ final class BasetenSwitchState: ObservableObject {
         _ receipt: GlobalMutationReceipt?,
         fallback: String
     ) -> String {
-        guard let message = receipt?.errorMessage, !message.isEmpty else {
+        reviewedMutationErrorMessage(
+            errorCode: receipt?.errorCode ?? "",
+            fallback: fallback)
+    }
+
+    private func reviewedMutationErrorMessage(
+        errorCode: String,
+        fallback: String
+    ) -> String {
+        switch errorCode {
+        case "mutation_locked":
+            return "Another routing change is still in progress. Try again shortly."
+        case "unfinished_mutation":
+            return "A previous routing change still needs cleanup."
+        case "router_unavailable":
+            return "The local gateway is unavailable. Try again after it reconnects."
+        case "router_unsupported":
+            return "Update the local gateway before changing routing settings."
+        case "journal_not_found":
+            return "The routing change outcome is no longer available. Refresh and try again."
+        case "journal_invalid", "journal_conflict", "terminal_conflict":
+            return "Saved routing recovery data needs manual attention."
+        case "commit_recovery_required":
+            return "A configuration update needs manual recovery before routing can change."
+        case "external_change":
+            return "The configuration changed outside Baseten Switch. Refresh before trying again."
+        case "stale_active_token", "stale_config_hash", "precondition_failed":
+            return "Routing settings changed before this request completed. Refresh and try again."
+        case "operation_id_conflict":
+            return "This routing request conflicts with an earlier request. Try again."
+        case "activation_failed_rolled_back", "mutation_not_applied":
+            return "The routing change was not applied. The last confirmed setting remains active."
+        case "terminal_write_failed", "activation_indeterminate":
+            return "The routing change could not be confirmed safely. Retry cleanup."
+        case "status_unavailable":
+            return "Routing cleanup status could not be checked."
+        case "cleanup_failed":
+            return "Routing cleanup could not be completed safely."
+        case "cleanup_pending":
+            return "Routing cleanup is still pending."
+        default:
             return fallback
         }
-        return menuErrorLabel(redactDiagnosticText(message), limit: 180)
     }
 
     private func executeCLI(
@@ -1293,11 +1731,20 @@ final class BasetenSwitchState: ObservableObject {
 
 func reasoningDispatchArgs(
     client: String,
+    protocolShape: String? = nil,
     provider: String,
     model: String,
     policy: ReasoningPolicyValue
 ) -> [String] {
-    let harness = client == "claude-code" ? "claude" : client
+    let harness: String
+    switch protocolShape {
+    case "anthropic":
+        harness = "claude"
+    case "openai":
+        harness = "codex"
+    default:
+        harness = client == "claude-code" ? "claude" : client
+    }
     var arguments = [harness, "reasoning", provider, model]
     switch policy.mode {
     case .off:

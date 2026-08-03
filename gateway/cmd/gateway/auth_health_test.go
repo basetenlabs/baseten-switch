@@ -87,6 +87,28 @@ func writeOAuthProfileExpiry(t *testing.T, remoteURL, refreshToken string, expir
 	}
 }
 
+func writeAPIKeyProfile(t *testing.T, apiKey string) {
+	t.Helper()
+	path := os.Getenv("BASETEN_SWITCH_AUTH_FILE")
+	if path == "" {
+		t.Fatal("BASETEN_SWITCH_AUTH_FILE not set (call testConfig first)")
+	}
+	blob := fmt.Sprintf(`{
+  "version": 1,
+  "current": "p",
+  "profiles": {
+    "p": {
+      "remote_url": "https://app.baseten.co",
+      "auth_type": "api_key",
+      "api_key": %q
+    }
+  }
+}`, apiKey)
+	if err := os.WriteFile(path, []byte(blob), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func adminAuthBlock(t *testing.T, g *Gateway) map[string]any {
 	t.Helper()
 	resp, err := http.Get(adminURL(g, "/v1/admin/status"))
