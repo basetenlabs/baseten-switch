@@ -151,6 +151,74 @@ baseten-switch codex off
 Do not override the managed profile's compatibility model with `-m`. Select
 the upstream Baseten model with `baseten-switch codex route` instead.
 
+## Known limitations
+
+The Claude Code integration was validated by capturing the harness's own
+traffic at the same interception point the gateway uses
+(`ANTHROPIC_BASE_URL`). A Claude Code session is not a stream of plain chat
+completions: every request streams over SSE and carries prompt-cache
+breakpoints (including one-hour TTLs), adaptive thinking with signed thinking
+blocks replayed in history, server-side context-management edits,
+mid-conversation system messages, subscription OAuth, a large client-tool
+catalog, and more than a dozen `anthropic-beta` flags. The default
+passthrough route forwards this shape faithfully; the differences below were
+observed with Claude Code 2.1.221.
+
+- **Web search.** Claude Code executes its WebSearch tool as a separate API
+  request containing only Anthropic's server-side `web_search` tool. A
+  Baseten-served model cannot run Anthropic server tools, so WebSearch fails
+  while the session's model routes to Baseten. WebFetch is unaffected: the
+  harness downloads the page itself and summarizes it with an ordinary
+  request.
+- **Reasoning continuity.** The harness requests adaptive thinking and
+  replays signed thinking blocks from earlier assistant turns. Baseten
+  models cannot produce Anthropic thinking signatures, and the configured
+  reasoning policy normalizes `adaptive` to a mode the upstream model
+  understands. Categorical effort values are not translated. See the
+  reasoning section of [config/schema.md](config/schema.md).
+- **Token counting.** The router answers `/v1/messages/count_tokens` locally
+  with a character-based estimate and never proxies it, so harness features
+  that want exact counts, such as context tracking and compaction
+  thresholds, run on approximations while routing is on.
+- **Prompt caching.** Cache breakpoints are forwarded unchanged, and
+  `claude on` removes the attribution block and defers tool loading to keep
+  the cached prefix stable. Whether a Baseten upstream honors the
+  breakpoints, and at what discount, is a property of the serving stack.
+  Reported `input_tokens` exclude cache reads on both routes.
+- **Server-side betas.** Requests include `context_management` edits and
+  beta flags for 1M context, interleaved thinking, structured outputs, and
+  more; the gateway forwards them verbatim, and non-Anthropic upstreams
+  ignore what they do not implement. Fast mode is the exception: its `speed`
+  field and beta flag are stripped on Baseten routes, so fast mode silently
+  has no effect there.
+- **Endpoint surface.** The router implements `/v1/messages`,
+  `/v1/messages/count_tokens`, and `/v1/models`. Anything else returns 404,
+  including the harness's `HEAD /api/hello` reachability probe, which
+  Claude Code tolerates. The Message Batches and Files APIs are unavailable
+  through the gateway. During a router outage the front door's native
+  fallback covers only those three paths.
+- **Model discovery.** `/v1/models` is synthesized from configured aliases
+  and the priced catalog. The in-app model picker lists gateway aliases only
+  when Claude Code is launched with
+  `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`.
+- **Subagent detection.** Subagent requests are recognized by the
+  `x-claude-code-agent-id` header the current harness sends. If a future
+  Claude Code release stops sending it, `claude subagents` pinning silently
+  stops matching; `doctor` warns when routed traffic shows no subagent
+  requests for a day.
+- **Authentication.** Claude Code signs in with subscription OAuth. On
+  Baseten routes the gateway removes that credential and authenticates with
+  the Baseten API key, so requests bill to Baseten and subscription
+  entitlements do not apply. On native routes harness credentials pass
+  through unmodified.
+- **Cross-shape translation.** The optional `upstream_shape: openai` path
+  flattens requests to OpenAI chat completions: thinking blocks, cache
+  breakpoints, citations, and metadata are dropped, and image or document
+  content is rejected. The default Baseten route speaks the Anthropic
+  Messages shape end to end; image support then depends on the selected
+  model, with automatic native fallback when the upstream rejects multimodal
+  input and a fallback route is configured.
+
 ## Status and troubleshooting
 
 ```sh
