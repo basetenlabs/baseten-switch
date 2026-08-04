@@ -201,7 +201,7 @@ final class DisplayTests: XCTestCase {
         XCTAssertEqual(resourceURL?.lastPathComponent, "baseten-logo-white.svg")
         XCTAssertTrue(BasetenSwitchApp.menubarIcon.isTemplate)
         XCTAssertEqual(BasetenSwitchApp.menubarIcon.size,
-                       NSSize(width: 18, height: 18))
+                       NSSize(width: 20, height: 20))
         XCTAssertNotNil(BasetenSwitchApp.menubarIcon.tiffRepresentation)
     }
 
@@ -882,7 +882,7 @@ final class DisplayTests: XCTestCase {
             environment: [:])
         let image = BasetenSwitchApp.menubarIcon(for: preview)
 
-        XCTAssertEqual(image.size, NSSize(width: 18, height: 18))
+        XCTAssertEqual(image.size, NSSize(width: 20, height: 20))
         XCTAssertTrue(image.isTemplate)
     }
 
