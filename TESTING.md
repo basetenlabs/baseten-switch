@@ -162,6 +162,11 @@ touch real state. Any test that boots a component must set the relevant ones:
 
 Hard rules for contributors and agents:
 
+- Run the suite unprivileged. Tests that prove a failure path by making a
+  directory unwritable cannot do so for a writer that bypasses the mode bits
+  (uid 0, `CAP_DAC_OVERRIDE`, or a filesystem that does not enforce them). Use
+  the `denyWrites` helper, which probes the denial and skips with a diagnostic
+  instead of reporting a safety regression that has not happened.
 - Never point a test at the real `~/.claude/settings.json` or
   `~/.config/baseten-switch`; always go through the seams above.
 - Never restart or kill a running production gateway from a test.
