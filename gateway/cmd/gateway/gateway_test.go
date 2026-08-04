@@ -425,6 +425,104 @@ func TestCountTokensSynthetic(t *testing.T) {
 	}
 }
 
+func TestIsInferenceRequest(t *testing.T) {
+	tests := []struct {
+		shape  string
+		method string
+		path   string
+		want   bool
+	}{
+		{"anthropic", http.MethodPost, "/v1/messages", true},
+		{"anthropic", http.MethodPost, "/v1/messages/count_tokens", true},
+		{"openai", http.MethodPost, "/v1/chat/completions", true},
+		{"openai", http.MethodPost, "/v1/responses", true},
+		{"anthropic", http.MethodGet, "/v1/models", false},
+		{"anthropic", http.MethodGet, "/healthz", false},
+		{"openai", http.MethodPost, "/v1/messages", false},
+	}
+	for _, test := range tests {
+		if got := isInferenceRequest(test.shape, test.method, test.path); got != test.want {
+			t.Errorf("isInferenceRequest(%q, %q, %q) = %t, want %t",
+				test.shape, test.method, test.path, got, test.want)
+		}
+	}
+}
+
+func TestAdminStatusReportsActiveInferenceRequests(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseRequest := func() { releaseOnce.Do(func() { close(release) }) }
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started <- struct{}{}
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"zai-org/GLM-5.2","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	t.Cleanup(func() {
+		releaseRequest()
+		srv.Close()
+	})
+
+	cfg := testConfig(t, srv.URL, srv.URL)
+	g, adminL, _ := newGateway(t, cfg, resolvedAnthropicBaseten(t))
+	defer adminL.Close()
+	stop := start(t, g)
+	defer stop()
+	defer releaseRequest()
+
+	completed := make(chan int, 1)
+	go func() {
+		body := strings.NewReader(`{"model":"claude-opus-4-8","stream":false,"messages":[{"role":"user","content":"ping"}]}`)
+		req, _ := http.NewRequest(http.MethodPost,
+			clientURL(g, "claude-code", "/v1/messages"), body)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer tok")
+		req.Header.Set("Anthropic-Version", "2023-06-01")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			completed <- 0
+			return
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		completed <- resp.StatusCode
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("inference request did not reach upstream")
+	}
+
+	resp, err := http.Get(adminURL(g, "/v1/admin/status"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var status map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got := status["active_requests"]; got != float64(1) {
+		t.Fatalf("active_requests = %v, want 1", got)
+	}
+
+	releaseRequest()
+	select {
+	case code := <-completed:
+		if code != http.StatusOK {
+			t.Fatalf("inference response status = %d, want 200", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("inference request did not complete")
+	}
+	if got := g.activeRequests.Load(); got != 0 {
+		t.Fatalf("activeRequests after completion = %d, want 0", got)
+	}
+}
+
 func TestPostMessagesBasetenForwardsRewrittenModel(t *testing.T) {
 	gotModel := make(chan string, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import QuartzCore
 
 /// AppKit owns the status item, menu tracking, keyboard behavior, and the
 /// native global switch. The menu is rebuilt only immediately before a
@@ -10,6 +11,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let state: BasetenSwitchState
     private let variant: AppVariant
     private let isPreview: Bool
+    private let forceActivity: Bool
     private let openConfiguration: (String?) -> Void
     private let openTraffic: () -> Void
     private let statusItem: NSStatusItem
@@ -18,16 +20,19 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var menuIsOpen = false
     private var menuNeedsRebuild = true
     private var displayedIconState: MenubarIconState?
+    private var displayedActivity: Bool?
     private weak var headerView: StatusMenuHeaderView?
 
     init(state: BasetenSwitchState,
          variant: AppVariant = .current(),
          isPreview: Bool = false,
+         forceActivity: Bool = false,
          openConfiguration: @escaping (String?) -> Void = { _ in },
          openTraffic: @escaping () -> Void = {}) {
         self.state = state
         self.variant = variant
         self.isPreview = isPreview
+        self.forceActivity = forceActivity
         self.openConfiguration = openConfiguration
         self.openTraffic = openTraffic
         statusItem = NSStatusBar.system.statusItem(
@@ -405,11 +410,42 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             globalRoutingEnabled: state.confirmedGlobalRoutingEnabled,
             clients: state.clients,
             auth: state.auth)
-        guard projected != displayedIconState else { return }
+        let hasActivity = forceActivity || state.activeRequests > 0
+        guard projected != displayedIconState
+                || hasActivity != displayedActivity else { return }
         displayedIconState = projected
+        displayedActivity = hasActivity
         statusItem.button?.image = BasetenSwitchApp.menubarIcon(
             for: variant,
-            state: projected)
+            state: menubarIconState(projected, hasActivity: hasActivity))
+        updateActivityPulse(hasActivity)
+    }
+
+    private func updateActivityPulse(_ active: Bool) {
+        guard let button = statusItem.button else { return }
+        let animationKey = "baseten-switch.activityPulse"
+        button.layer?.removeAnimation(forKey: animationKey)
+        button.alphaValue = 1
+        button.toolTip = active
+            ? "\(variant.displayName) is sending or receiving data"
+            : variant.displayName
+        button.setAccessibilityLabel(active
+            ? "\(variant.displayName), sending or receiving data"
+            : variant.displayName)
+
+        guard active,
+              !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            return
+        }
+        button.wantsLayer = true
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = 1.0
+        animation.toValue = 0.35
+        animation.duration = 0.7
+        animation.autoreverses = true
+        animation.repeatCount = .infinity
+        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        button.layer?.add(animation, forKey: animationKey)
     }
 }
 
