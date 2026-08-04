@@ -110,7 +110,8 @@ final class StatsTests: XCTestCase {
     func testAdminStatusSnapshotDecodes() {
         let snap = AdminStatusSnapshot(dict: decode("""
         {
-          "uptime_seconds": 12, "version": "v0.2.1",
+          "uptime_seconds": 12, "active_requests": 2,
+          "version": "v0.2.1",
           "config_path": "/tmp/live/gateway.yaml",
           "global_routing_enabled": true,
           "auth": {"signed_in": true, "auth_type": "api_key", "profile": "example-profile",
@@ -121,6 +122,7 @@ final class StatsTests: XCTestCase {
         }
         """))
         XCTAssertEqual(snap.version, "v0.2.1")
+        XCTAssertEqual(snap.activeRequests, 2)
         XCTAssertEqual(snap.configPath, "/tmp/live/gateway.yaml")
         XCTAssertTrue(snap.globalRoutingEnabled)
         XCTAssertEqual(snap.auth?.signedIn, true)
@@ -137,6 +139,7 @@ final class StatsTests: XCTestCase {
     func testAdminStatusSnapshotAbsentKeys() {
         let snap = AdminStatusSnapshot(dict: decode("{}"))
         XCTAssertEqual(snap.version, "")
+        XCTAssertEqual(snap.activeRequests, 0)
         XCTAssertEqual(snap.configPath, "")
         XCTAssertNil(snap.auth)
         XCTAssertTrue(snap.clients.isEmpty)

@@ -34,6 +34,7 @@ struct RoutingSnapshot: Equatable, Sendable {
     let health: String
     let version: String
     let uptimeSeconds: Int64
+    let activeRequests: Int
     let configPath: String
     let capabilities: Set<String>
     let globalRoutingEnabled: Bool
@@ -60,6 +61,7 @@ struct RoutingSnapshot: Equatable, Sendable {
         health = status.health
         version = status.version
         uptimeSeconds = status.uptimeSeconds
+        activeRequests = status.activeRequests
         configPath = status.configPath
         capabilities = Set(status.capabilities)
         globalRoutingEnabled = status.globalRoutingEnabled
@@ -71,6 +73,7 @@ struct RoutingSnapshot: Equatable, Sendable {
     init(observedAt: Date,
          version: String,
          uptimeSeconds: Int64,
+         activeRequests: Int = 0,
          globalRoutingEnabled: Bool,
          auth: AuthStatus?,
          clients: [ClientStatus]) {
@@ -82,6 +85,7 @@ struct RoutingSnapshot: Equatable, Sendable {
         health = "ready"
         self.version = version
         self.uptimeSeconds = uptimeSeconds
+        self.activeRequests = activeRequests
         configPath = ""
         capabilities = []
         self.globalRoutingEnabled = globalRoutingEnabled
@@ -617,6 +621,7 @@ struct AdminStatusSnapshot: Equatable, Sendable {
     var health: String
     var version: String
     var uptimeSeconds: Int64
+    var activeRequests: Int
     var configPath: String
     var reload: ReloadStatus
     var globalRoutingEnabled: Bool
@@ -634,6 +639,7 @@ struct AdminStatusSnapshot: Equatable, Sendable {
         health = dict["health"] as? String ?? "ready"
         version = dict["version"] as? String ?? ""
         uptimeSeconds = (dict["uptime_seconds"] as? NSNumber)?.int64Value ?? 0
+        activeRequests = (dict["active_requests"] as? NSNumber)?.intValue ?? 0
         configPath = dict["config_path"] as? String ?? ""
         reload = (dict["reload"] as? [String: Any])
             .map(ReloadStatus.init)

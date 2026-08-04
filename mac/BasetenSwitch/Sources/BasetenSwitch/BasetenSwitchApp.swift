@@ -10,6 +10,13 @@ enum AppColors {
         alpha: 1.0)
 }
 
+enum MenubarIconMetrics {
+    static let canvas = NSSize(width: 18, height: 18)
+    static let glyph = NSSize(width: 11.5, height: 11.5)
+    static let borderWidth: CGFloat = 1
+    static let cornerRadius: CGFloat = 3.75
+}
+
 /// Native menu-bar shell: AppKit owns the NSStatusItem and NSMenu via
 /// StatusItemController. The SwiftUI App struct only hosts the delegate
 /// adaptor and the single-instance guard.
@@ -47,23 +54,21 @@ struct BasetenSwitchApp: App {
         Settings { EmptyView() }
     }
 
-    /// The Baseten logo as a native template image. AppKit derives the
-    /// glyph from the SVG's alpha so it adapts to light/dark and menu
-    /// highlight states. The packaged app loads it from Resources; the
-    /// source-tree candidate keeps bare Swift builds useful in development.
-    static let menubarIcon: NSImage = {
+    /// The Baseten logo loaded from the packaged resource or source tree.
+    private static let menubarLogo: NSImage = {
         guard let url = menubarIconResourceURL(),
               let img = NSImage(contentsOf: url) else {
             return NSImage(systemSymbolName: "circle.lefthalf.filled",
                            accessibilityDescription: "Baseten Switch") ?? NSImage()
         }
-        img.isTemplate = true
-        // Match the previous 22pt PNG canvas, whose logo occupied 27 of
-        // its 36 pixels. The SVG has no equivalent outer padding, so its
-        // image size is the old logo's effective 16.5pt footprint.
-        img.size = NSSize(width: 16.5, height: 16.5)
         return img
     }()
+
+    /// An 18pt rounded-square template mark. The 11.5pt Baseten glyph leaves
+    /// enough negative space that it matches neighboring system extras
+    /// optically; the thin frame gives it a bounded silhouette similar to
+    /// Notion's status item without relying on a literal light/dark color.
+    static let menubarIcon = framedMenubarIcon(menubarLogo)
 
     static func menubarIconResourceURL() -> URL? {
         if let bundled = Bundle.main.url(forResource: "baseten-logo-white",
@@ -80,6 +85,33 @@ struct BasetenSwitchApp: App {
         return FileManager.default.fileExists(atPath: sourceAsset.path)
             ? sourceAsset
             : nil
+    }
+
+    static func framedMenubarIcon(_ logo: NSImage) -> NSImage {
+        let image = NSImage(size: MenubarIconMetrics.canvas)
+        image.lockFocus()
+        NSGraphicsContext.current?.imageInterpolation = .high
+
+        let canvas = NSRect(origin: .zero, size: MenubarIconMetrics.canvas)
+        let borderRect = canvas.insetBy(dx: 0.75, dy: 0.75)
+        let border = NSBezierPath(
+            roundedRect: borderRect,
+            xRadius: MenubarIconMetrics.cornerRadius,
+            yRadius: MenubarIconMetrics.cornerRadius)
+        border.lineWidth = MenubarIconMetrics.borderWidth
+        NSColor.black.setStroke()
+        border.stroke()
+
+        let glyphOrigin = NSPoint(
+            x: (canvas.width - MenubarIconMetrics.glyph.width) / 2,
+            y: (canvas.height - MenubarIconMetrics.glyph.height) / 2)
+        logo.draw(in: NSRect(
+            origin: glyphOrigin,
+            size: MenubarIconMetrics.glyph))
+
+        image.unlockFocus()
+        image.isTemplate = true
+        return image
     }
 
     /// Baseten brand green (#16D766). The active icon is a pre-tinted
@@ -113,7 +145,7 @@ struct BasetenSwitchApp: App {
             blue: 0x23 / 255.0,
             alpha: 1.0))
 
-    /// Production Preview keeps the same 16.5pt optical footprint as Stable,
+    /// Production Preview keeps the same 18pt optical footprint as Stable,
     /// but adds a small lower-right dot so both status items remain
     /// distinguishable when they run side by side.
     static func menubarIcon(for variant: AppVariant,
@@ -138,8 +170,8 @@ struct BasetenSwitchApp: App {
         let rect = NSRect(origin: .zero, size: base.size)
         base.draw(in: rect)
         NSColor.black.setFill()
-        NSBezierPath(ovalIn: NSRect(x: 12.0, y: 0.5,
-                                    width: 4.0, height: 4.0)).fill()
+        NSBezierPath(ovalIn: NSRect(x: 13.75, y: 0.25,
+                                    width: 3.75, height: 3.75)).fill()
         image.unlockFocus()
         image.isTemplate = true
         return image
@@ -242,8 +274,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let variant = AppVariant.current()
         let state = BasetenSwitchState(preview: fixture, variant: variant)
+        let forceActivity =
+            ProcessInfo.processInfo.environment["BASETEN_SWITCH_MENUBAR_ACTIVITY"] == "1"
         let controller = StatusItemController(
-            state: state, variant: variant, isPreview: true)
+            state: state,
+            variant: variant,
+            isPreview: true,
+            forceActivity: forceActivity)
         self.state = state
         previewController = controller
         let hasHostWindow =
@@ -263,9 +300,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             host.makeKeyAndOrderFront(nil)
             previewHostWindow = host
         }
-        let menuDelay = hasHostWindow ? 2.0 : 0.35
-        DispatchQueue.main.asyncAfter(deadline: .now() + menuDelay) {
-            controller.openForPreview()
+        if ProcessInfo.processInfo.environment["BASETEN_SWITCH_POPUP_AUTO_OPEN"] != "0" {
+            let menuDelay = hasHostWindow ? 2.0 : 0.35
+            DispatchQueue.main.asyncAfter(deadline: .now() + menuDelay) {
+                controller.openForPreview()
+            }
         }
     }
 
