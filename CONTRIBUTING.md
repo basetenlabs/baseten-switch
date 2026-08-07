@@ -10,6 +10,11 @@ small and auditable.
 - Go as declared by `gateway/go.mod`
 - Swift as provided by Xcode
 
+Changes confined to `gateway/` can be developed on Linux with Go alone; see the
+Linux section of [README.md](README.md) for the runtime differences. The full
+product, the Swift app, and the release artifacts still require macOS, and
+`scripts/check.sh` skips the Swift stage elsewhere.
+
 ## Dependency policy
 
 Baseten Switch runs in the credential and prompt path, so dependency changes
