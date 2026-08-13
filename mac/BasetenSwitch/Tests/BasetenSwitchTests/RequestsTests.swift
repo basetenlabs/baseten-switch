@@ -110,7 +110,14 @@ final class RequestsTests: XCTestCase {
         XCTAssertTrue(fallback.attempted)
         XCTAssertEqual(fallback.count, 1)
         XCTAssertEqual(fallback.trigger, "image_input_unsupported")
+        let primary = try XCTUnwrap(snapshot.items.first?.primary)
+        XCTAssertEqual(primary.provider, "baseten")
+        XCTAssertEqual(primary.model, "zai-org/GLM-5.2")
+        XCTAssertTrue(primary.attempted)
+        XCTAssertEqual(primary.outcome, "image_input_unsupported")
+        XCTAssertEqual(primary.status, 400)
         XCTAssertTrue(snapshot.items[0].isFallback)
+        XCTAssertNil(snapshot.items[1].primary)
         XCTAssertNil(snapshot.items[1].status)
         XCTAssertTrue(snapshot.items[1].isError)
     }
@@ -125,6 +132,9 @@ final class RequestsTests: XCTestCase {
         XCTAssertEqual(
             requestFallbackLabel("http_503"),
             "HTTP 503")
+        XCTAssertEqual(
+            requestFallbackLabel("request_build_error"),
+            "Request setup failed")
         XCTAssertEqual(
             requestFallbackLabel("future_reason"),
             "Future Reason")
@@ -186,6 +196,25 @@ final class RequestsTests: XCTestCase {
             unixItem.completedAt.timeIntervalSince1970,
             1_785_088_860.25,
             accuracy: 0.001)
+    }
+
+    func testDecodeRejectsPartialPrimarySummary() {
+        let data = Data(
+            """
+            {
+              "event_id": "partial-primary",
+              "completed_at": 1785088860.25,
+              "primary": {
+                "provider": "baseten",
+                "model": "zai-org/GLM-5.2",
+                "outcome": "cooldown",
+                "status": null
+              }
+            }
+            """.utf8)
+
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(RequestItem.self, from: data))
     }
 
     func testMergeSortsNewestFirstAndDeduplicatesByEventID() {

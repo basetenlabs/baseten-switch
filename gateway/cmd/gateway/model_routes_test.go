@@ -24,6 +24,7 @@ import (
 
 	"github.com/basetenlabs/baseten-switch/gateway/internal/config"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/pricing"
+	"github.com/basetenlabs/baseten-switch/gateway/internal/telemetry"
 )
 
 // modelRoutesClient returns an anthropic-shape resolved client with
@@ -457,6 +458,14 @@ func TestModelRouteFallbackOriginalID(t *testing.T) {
 	// from the configured baseten route).
 	if rows[0].EffectiveProvider != "anthropic" {
 		t.Errorf("route_effective = %q, want anthropic (fallback served)", rows[0].EffectiveProvider)
+	}
+	if primary := rows[0].Primary; primary == nil ||
+		primary.Provider != "baseten" ||
+		primary.Model != "zai-org/GLM-5.2" ||
+		!primary.Attempted ||
+		primary.Outcome != telemetry.PrimaryOutcomeHTTPError ||
+		primary.Status == nil || *primary.Status != http.StatusServiceUnavailable {
+		t.Errorf("primary = %+v, want attempted baseten zai-org/GLM-5.2 HTTP 503", primary)
 	}
 }
 

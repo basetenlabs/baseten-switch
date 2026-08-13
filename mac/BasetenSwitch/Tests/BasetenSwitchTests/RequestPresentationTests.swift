@@ -24,11 +24,12 @@ final class RequestPresentationTests: XCTestCase {
 
         XCTAssertEqual(
             requestFallbackReason(fallback),
-            "Baseten could not accept the image, native provider used")
+            "Image input unsupported")
     }
 
-    func testRouteAndModelLabelsShowRequestedToServedPath() {
+    func testRouteAndModelLabelsShowRequestedToServedPath() throws {
         let item = requestItem()
+        let primary = try XCTUnwrap(item.primary)
 
         XCTAssertEqual(
             requestModelLabel(item),
@@ -39,7 +40,40 @@ final class RequestPresentationTests: XCTestCase {
         XCTAssertEqual(
             requestServedProviderLabel(item),
             "claude-opus-4-8-20260701 · Anthropic")
+        XCTAssertEqual(
+            requestPrimaryProviderLabel(primary),
+            "zai-org/GLM-5.2 · Baseten")
+        XCTAssertEqual(
+            requestPrimaryRoutingLabel(primary),
+            "zai-org/GLM-5.2 · Baseten")
+        XCTAssertEqual(
+            requestPrimaryStateLabel(primary),
+            "HTTP 503")
+        XCTAssertEqual(
+            requestRoutingAccessibilityLabel(item),
+            "Primary zai-org/GLM-5.2 · Baseten, HTTP 503. "
+                + "Served by claude-opus-4-8-20260701 · Anthropic")
         XCTAssertEqual(requestResultLabel(item), "HTTP 200")
+    }
+
+    func testBypassedPrimaryIsExplicitlyNotAttempted() throws {
+        var item = requestItem()
+        item.primary = RequestPrimaryAttempt(
+            provider: "baseten",
+            model: "zai-org/GLM-5.2",
+            attempted: false,
+            outcome: "cooldown")
+        let primary = try XCTUnwrap(item.primary)
+
+        XCTAssertEqual(
+            requestPrimaryStateLabel(primary),
+            "Not attempted")
+        XCTAssertEqual(
+            requestPrimaryRoutingLabel(primary),
+            "zai-org/GLM-5.2 · Baseten · Not attempted")
+        XCTAssertTrue(
+            requestRoutingAccessibilityLabel(item)
+                .contains("Not attempted"))
     }
 
     func testCoverageAndFilterSpecificEmptyStates() {
@@ -76,6 +110,12 @@ final class RequestPresentationTests: XCTestCase {
             fallback: RequestFallback(
                 attempted: true,
                 count: 1,
-                trigger: "image_input_unsupported"))
+                trigger: "http_503"),
+            primary: RequestPrimaryAttempt(
+                provider: "baseten",
+                model: "zai-org/GLM-5.2",
+                attempted: true,
+                outcome: "http_error",
+                status: 503))
     }
 }
