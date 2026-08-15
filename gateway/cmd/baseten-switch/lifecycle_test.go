@@ -180,7 +180,7 @@ func fakeAdmin(t *testing.T) *httptest.Server {
 		fmt.Fprint(w, `{"ok":true,"uptime_seconds":42,"version":"dev"}`)
 	})
 	mux.HandleFunc("/v1/admin/status", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"clients":[
+		fmt.Fprint(w, `{"auth_unavailable_fallback":{"count":2,"last_at":"2026-08-15T12:00:00Z","last_client":"claude-code","last_route":"anthropic"},"clients":[
 			{"name":"claude-code","enabled":true,"bind_addr":"127.0.0.1:18081","effective_route":"baseten","protocol_shape":"anthropic"},
 			{"name":"codex","enabled":true,"bind_addr":"127.0.0.1:18081","effective_route":"openai","protocol_shape":"openai"},
 			{"name":"parked","enabled":false,"bind_addr":"127.0.0.1:18082","effective_route":"baseten","protocol_shape":"openai"}
@@ -245,7 +245,9 @@ func TestPrintStatusExitCodes(t *testing.T) {
 			0,
 			[]string{"Router:  up", "claude-code", "switch ON", "codex", "switch OFF",
 				"Door:    up", "not tripped", "3 fallback rules",
-				"Auth:    user@example.com OAuth"},
+				"Auth:    user@example.com OAuth",
+				"Fallback: 2 request(s) used native fallback because Baseten auth was unavailable",
+				"last claude-code -> anthropic"},
 		},
 		{
 			"router down",
@@ -321,6 +323,24 @@ func TestAuthLineCredentialLabels(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAuthUnavailableFallbackLine(t *testing.T) {
+	t.Run("older router omits line", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, `{"clients":[]}`)
+		}))
+		defer srv.Close()
+		if got := authUnavailableFallbackLine(hostPort(t, srv.URL), true); got != "" {
+			t.Fatalf("line = %q, want empty", got)
+		}
+	})
+
+	t.Run("router down omits line", func(t *testing.T) {
+		if got := authUnavailableFallbackLine("127.0.0.1:1", false); got != "" {
+			t.Fatalf("line = %q, want empty", got)
+		}
+	})
 }
 
 // TestPrintStatusVerbose pins the --verbose output: every fact dropped

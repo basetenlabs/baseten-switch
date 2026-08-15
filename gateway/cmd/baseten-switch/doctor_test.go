@@ -90,11 +90,12 @@ type doctorFixtureCfg struct {
 	// client, requested model, and status), emulating the router's
 	// write. Empty probeTelRoute = no row (door-fallback case, or the
 	// no-row skip case).
-	probeTelRoute        string
-	probeTelEffective    string
-	probeFallbackTrigger string
-	probeStatus          int
-	probeError           string
+	probeTelRoute         string
+	probeTelEffective     string
+	probeFallbackTrigger  string
+	probeResponseFallback string
+	probeStatus           int
+	probeError            string
 	// probeConcurrentModel, when non-empty, makes the fake door append a
 	// second v1 event AFTER the probe's event: a concurrent harness
 	// request completing just behind the probe, the misattribution
@@ -237,7 +238,11 @@ func newDoctorFixture(t *testing.T, mut func(*doctorFixtureCfg)) *doctorFixture 
 					cfg.authHealth, errJSON)
 			}
 			signedIn := !cfg.routerSignedOut
-			fmt.Fprintf(w, `{"signed_in":%t,%s"profile":"doc","fallback_enabled":false,"fallback_in_use":false,"email":"doc@example.com"}`, signedIn, healthPart)
+			profile := "doc@example.com"
+			if cfg.apiKeyProfile {
+				profile = "example-profile"
+			}
+			fmt.Fprintf(w, `{"signed_in":%t,%s"profile":%q,"fallback_enabled":false,"fallback_in_use":false,"email":"doc@example.com"}`, signedIn, healthPart, profile)
 		})
 		srv := httptest.NewServer(mux)
 		t.Cleanup(srv.Close)
@@ -302,6 +307,9 @@ func newDoctorFixture(t *testing.T, mut func(*doctorFixtureCfg)) *doctorFixture 
 				}
 				if cfg.doorProbe != "none" {
 					w.Header().Set("X-Baseten-Switch-Door", cfg.doorProbe)
+				}
+				if cfg.probeResponseFallback != "" {
+					w.Header().Set("X-Baseten-Switch-Fallback", cfg.probeResponseFallback)
 				}
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(probeStatus)
@@ -550,6 +558,8 @@ func newDoctorFixture(t *testing.T, mut func(*doctorFixtureCfg)) *doctorFixture 
 	t.Setenv("BASETEN_SWITCH_LAUNCHD", "off")
 	t.Setenv("ANTHROPIC_BASE_URL", "")
 	t.Setenv("BASETEN_API_KEY", "")
+	t.Setenv("BASETEN_SWITCH_API_KEY_FALLBACK", "")
+	t.Setenv("BASETEN_SWITCH_OAUTH_PROFILE", "")
 	t.Setenv(claudeSubagentEnvKey, "")
 	// Clear the harness env slots the model_env check scans for, so the
 	// green run does not pick up a real shell value.
@@ -1462,6 +1472,96 @@ func TestDoctorUnresolvedAPIKeyNoOAuth(t *testing.T) {
 	}
 }
 
+func TestDoctorEnvironmentAPIKeyRequiresFallbackFlag(t *testing.T) {
+	t.Run("process environment key without flag fails", func(t *testing.T) {
+		newDoctorFixture(t, func(c *doctorFixtureCfg) { c.signedIn = false })
+		t.Setenv("BASETEN_API_KEY", "synthetic-ignored-key")
+
+		rep := runDoctor(doctorOpts{})
+		c := findCheck(t, rep, "auth", "signin")
+		if c.Status != docFail ||
+			!strings.Contains(c.Finding, "BASETEN_API_KEY is set but ignored") ||
+			!strings.Contains(c.Finding, "BASETEN_SWITCH_API_KEY_FALLBACK") {
+			t.Fatalf("signin = %+v, want ignored-key failure naming the opt-in flag", c)
+		}
+	})
+
+	t.Run("process environment key and truthy flag pass", func(t *testing.T) {
+		newDoctorFixture(t, func(c *doctorFixtureCfg) { c.signedIn = false })
+		t.Setenv("BASETEN_API_KEY", "synthetic-enabled-key")
+		t.Setenv("BASETEN_SWITCH_API_KEY_FALLBACK", "yes")
+
+		rep := runDoctor(doctorOpts{})
+		c := findCheck(t, rep, "auth", "signin")
+		if c.Status != docOK || !strings.Contains(c.Finding, "enabled BASETEN_API_KEY fallback") {
+			t.Fatalf("signin = %+v, want enabled environment fallback", c)
+		}
+	})
+
+	t.Run("Switch env file key and flag pass", func(t *testing.T) {
+		newDoctorFixture(t, func(c *doctorFixtureCfg) { c.signedIn = false })
+		envPath := os.Getenv("BASETEN_SWITCH_ENV_FILE")
+		if err := os.WriteFile(envPath, []byte("BASETEN_API_KEY='synthetic-file-key'\nBASETEN_SWITCH_API_KEY_FALLBACK=\"true\"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		rep := runDoctor(doctorOpts{})
+		c := findCheck(t, rep, "auth", "signin")
+		if c.Status != docOK || !strings.Contains(c.Finding, "enabled BASETEN_API_KEY fallback") {
+			t.Fatalf("signin = %+v, want enabled env-file fallback", c)
+		}
+	})
+
+	t.Run("process environment takes precedence over Switch env file", func(t *testing.T) {
+		newDoctorFixture(t, func(c *doctorFixtureCfg) { c.signedIn = false })
+		envPath := os.Getenv("BASETEN_SWITCH_ENV_FILE")
+		if err := os.WriteFile(envPath, []byte("BASETEN_API_KEY=synthetic-file-key\nBASETEN_SWITCH_API_KEY_FALLBACK=1\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("BASETEN_SWITCH_API_KEY_FALLBACK", "0")
+
+		rep := runDoctor(doctorOpts{})
+		c := findCheck(t, rep, "auth", "signin")
+		if c.Status != docFail || !strings.Contains(c.Finding, "is set but ignored") {
+			t.Fatalf("signin = %+v, want process flag to disable env-file fallback", c)
+		}
+	})
+}
+
+func TestDoctorNamesCredentialStoreFailure(t *testing.T) {
+	t.Run("malformed JSON", func(t *testing.T) {
+		newDoctorFixture(t, func(c *doctorFixtureCfg) { c.signedIn = false })
+		path := os.Getenv("BASETEN_SWITCH_AUTH_FILE")
+		if err := os.WriteFile(path, []byte(`{"version":`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		check := findCheck(t, runDoctor(doctorOpts{}), "auth", "signin")
+		if check.Status != docFail || !strings.Contains(check.Finding, path) || !strings.Contains(check.Finding, "cannot parse") {
+			t.Fatalf("signin = %+v, want failure naming malformed store %q", check, path)
+		}
+		if strings.Contains(check.Finding, "BASETEN_API_KEY") {
+			t.Fatalf("malformed store was misattributed to the environment key: %+v", check)
+		}
+	})
+
+	t.Run("unreadable path", func(t *testing.T) {
+		newDoctorFixture(t, func(c *doctorFixtureCfg) { c.signedIn = false })
+		path := os.Getenv("BASETEN_SWITCH_AUTH_FILE")
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+
+		check := findCheck(t, runDoctor(doctorOpts{}), "auth", "signin")
+		if check.Status != docFail || !strings.Contains(check.Finding, path) || !strings.Contains(check.Finding, "cannot read") {
+			t.Fatalf("signin = %+v, want failure naming unreadable store %q", check, path)
+		}
+	})
+}
+
 func TestDoctorReadableAPIKeyProfileRouterSignedOutFails(t *testing.T) {
 	newDoctorFixture(t, func(c *doctorFixtureCfg) {
 		c.apiKeyProfile = true
@@ -1478,6 +1578,70 @@ func TestDoctorReadableAPIKeyProfileRouterSignedOutFails(t *testing.T) {
 	}
 	if rep.FirstFailure != "auth/health" {
 		t.Fatalf("first failure = %q, want auth/health", rep.FirstFailure)
+	}
+}
+
+func TestDoctorReadableOAuthProfileRouterSignedOutFails(t *testing.T) {
+	newDoctorFixture(t, func(c *doctorFixtureCfg) {
+		c.routerSignedOut = true
+		c.authHealth = "signed_out"
+	})
+	rep := runDoctor(doctorOpts{})
+	if c := findCheck(t, rep, "auth", "signin"); c.Status != docOK || !strings.Contains(c.Finding, "OAuth") {
+		t.Fatalf("signin = %+v, want readable OAuth profile", c)
+	}
+	c := findCheck(t, rep, "auth", "health")
+	if c.Status != docFail ||
+		!strings.Contains(c.Finding, "OAuth profile") ||
+		!strings.Contains(c.Finding, "doc@example.com") ||
+		!strings.Contains(c.Finding, "router reports signed out") {
+		t.Fatalf("health = %+v, want OAuth store/router inconsistency failure", c)
+	}
+	if rep.FirstFailure != "auth/health" {
+		t.Fatalf("first failure = %q, want auth/health", rep.FirstFailure)
+	}
+}
+
+func TestDoctorUsesRouterSelectedCredentialProfile(t *testing.T) {
+	writeAuthJSON(t, `{
+  "version": 1,
+  "current": "current-oauth",
+  "profiles": {
+    "current-oauth": {
+      "remote_url": "https://app.example.com",
+      "auth_type": "oauth",
+      "oauth_credential": {"access_token": "at", "refresh_token": "rt"}
+    },
+    "selected-api-key": {
+      "remote_url": "https://api.example.com",
+      "auth_type": "api_key",
+      "api_key": "synthetic-selected-key"
+    }
+  }
+}`)
+	t.Setenv("BASETEN_SWITCH_OAUTH_PROFILE", "selected-api-key")
+	t.Setenv("BASETEN_API_KEY", "")
+	t.Setenv("BASETEN_SWITCH_API_KEY_FALLBACK", "")
+
+	var check doctorCheck
+	store := doctorAuthCheck(func(section, name, status, finding, fix string, fixArgv ...string) {
+		check = doctorCheck{Section: section, Name: name, Status: status, Finding: finding, Fix: fix}
+	}, &config.File{}, nil, map[string]string{}, filepath.Join(t.TempDir(), "env"), "", false)
+	if check.Status != docOK || !strings.Contains(check.Finding, "selected-api-key") {
+		t.Fatalf("signin = %+v, want explicitly selected API-key profile", check)
+	}
+	if !store.ready || store.authType != "API-key" || store.profile != "selected-api-key" {
+		t.Fatalf("store = %+v, want selected API-key profile metadata", store)
+	}
+}
+
+func TestDoctorUsesRunningRouterCredentialProfile(t *testing.T) {
+	newDoctorFixture(t, nil)
+	t.Setenv("BASETEN_SWITCH_OAUTH_PROFILE", "shell-profile-not-used-by-router")
+
+	check := findCheck(t, runDoctor(doctorOpts{}), "auth", "signin")
+	if check.Status != docOK || !strings.Contains(check.Finding, "OAuth") {
+		t.Fatalf("signin = %+v, want the running router's readable OAuth profile", check)
 	}
 }
 
@@ -2243,6 +2407,48 @@ func TestDoctorFailedProbeNamesDoorFallback(t *testing.T) {
 	routeCheck := findCheck(t, rep, "e2e", "route:"+fx.doorPort)
 	if routeCheck.Status != docFail || !strings.Contains(routeCheck.Finding, "native failover served it") || !strings.Contains(routeCheck.Finding, `"baseten"`) {
 		t.Fatalf("route = %+v, want configured-versus-fallback attribution", routeCheck)
+	}
+}
+
+func TestDoctorProbeFindingNamesAuthUnavailableResponseMarker(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		want   string
+	}{
+		{name: "successful fallback", status: http.StatusOK, want: docFail},
+		{name: "failed fallback", status: http.StatusUnauthorized, want: docFail},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newDoctorFixture(t, func(c *doctorFixtureCfg) {
+				c.doorProbe = "router"
+				c.probeStatus = tc.status
+				c.probeError = `{"error":"synthetic native credential failure"}`
+				c.probeTelRoute = "baseten"
+				c.probeTelEffective = "anthropic"
+				c.probeFallbackTrigger = "auth_unavailable"
+				c.probeResponseFallback = "auth_unavailable"
+			})
+			rep := runDoctor(doctorOpts{probe: true, yes: true, timeoutSec: 5})
+			probe := findCheck(t, rep, "e2e", "probe:"+fx.doorPort)
+			if probe.Status != tc.want || !strings.Contains(probe.Finding, `fallback trigger "auth_unavailable"`) {
+				t.Fatalf("probe = %+v, want %s finding naming auth_unavailable response marker", probe, tc.want)
+			}
+		})
+	}
+}
+
+func TestDoctorIgnoresFallbackMarkerWithoutRouterProvenance(t *testing.T) {
+	fx := newDoctorFixture(t, func(c *doctorFixtureCfg) {
+		c.doorProbe = "fallback"
+		c.probeStatus = http.StatusUnauthorized
+		c.probeError = `{"error":"synthetic native failure"}`
+		c.probeResponseFallback = "auth_unavailable"
+	})
+	rep := runDoctor(doctorOpts{probe: true, yes: true, timeoutSec: 5})
+	probe := findCheck(t, rep, "e2e", "probe:"+fx.doorPort)
+	if strings.Contains(probe.Finding, "auth_unavailable") {
+		t.Fatalf("probe trusted a native fallback response marker: %+v", probe)
 	}
 }
 

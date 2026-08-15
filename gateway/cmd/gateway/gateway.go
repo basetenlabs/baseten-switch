@@ -577,6 +577,15 @@ type Gateway struct {
 	fallbackMu    sync.Mutex
 	fallbackUntil map[string]time.Time
 
+	// authUnavailableFallbackCount and its last-occurrence fields make the
+	// otherwise successful auth_unavailable fallback visible in admin status.
+	// The count is process-local, so it naturally represents this gateway boot.
+	authUnavailableFallbackCount  uint64
+	authUnavailableFallbackMu     sync.RWMutex
+	authUnavailableFallbackAt     time.Time
+	authUnavailableFallbackClient string
+	authUnavailableFallbackRoute  string
+
 	// Active routing snapshot. Admin status reads this exact accepted
 	// configuration instead of independently parsing gateway.yaml.
 	stateMu          sync.RWMutex
@@ -682,6 +691,9 @@ func newGatewayWithSnapshot(
 	g.mu.Unlock()
 	if snapshot != nil {
 		g.activateConfigSnapshot(snapshot.file, snapshot.raw)
+	}
+	if err := auth.CheckStore(); err != nil {
+		fmt.Fprintf(os.Stderr, "[gateway] auth: credential store load failed at boot: %v\n", err)
 	}
 	g.refreshAuth()
 	return g, nil
@@ -2120,6 +2132,39 @@ func (g *Gateway) tripFallback(name string) {
 	g.fallbackUntil[name] = time.Now().Add(fallbackCooldown)
 }
 
+const authUnavailableFallbackHeader = "X-Baseten-Switch-Fallback"
+
+// noteAuthUnavailableFallback marks a response served by a configured native
+// fallback because the Baseten primary had no usable credential. This remains
+// an allowed fallback, but callers and local operators can now distinguish it
+// from a response served by the configured primary.
+func (g *Gateway) noteAuthUnavailableFallback(
+	w http.ResponseWriter,
+	cl *clientListener,
+	at upstreamAttempt,
+) {
+	if at.fallbackTrigger != fallbackTriggerAuthUnavailable {
+		return
+	}
+	g.authUnavailableFallbackMu.Lock()
+	now := time.Now().UTC()
+	g.authUnavailableFallbackCount++
+	count := g.authUnavailableFallbackCount
+	g.authUnavailableFallbackAt = now
+	g.authUnavailableFallbackClient = cl.cfg.Name
+	g.authUnavailableFallbackRoute = at.route
+	g.authUnavailableFallbackMu.Unlock()
+	w.Header().Set(authUnavailableFallbackHeader, fallbackTriggerAuthUnavailable)
+	fmt.Fprintf(
+		os.Stderr,
+		"[gateway] fallback client=%s route=baseten trigger=%s -> serving %s count=%d\n",
+		cl.cfg.Name,
+		fallbackTriggerAuthUnavailable,
+		at.route,
+		count,
+	)
+}
+
 // errNeedsLogin marks an attempt whose route has no usable credentials
 // (baseten without a CLI login or API-key fallback).
 var errNeedsLogin = errors.New("baseten route needs login")
@@ -3240,6 +3285,8 @@ attemptLoop:
 		break
 	}
 	res := at.res
+	resp.Header.Del(authUnavailableFallbackHeader)
+	g.noteAuthUnavailableFallback(w, cl, at)
 	defer resp.Body.Close()
 
 	if at.translate {

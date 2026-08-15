@@ -150,6 +150,77 @@ func TestLoadMissingReturnsNil(t *testing.T) {
 	}
 }
 
+func TestLoadDetailedDiagnostics(t *testing.T) {
+	tests := []struct {
+		name       string
+		prepare    func(t *testing.T, path string)
+		wantReason error
+	}{
+		{
+			name: "store unreadable",
+			prepare: func(t *testing.T, path string) {
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantReason: ErrStoreUnreadable,
+		},
+		{
+			name: "store malformed",
+			prepare: func(t *testing.T, path string) {
+				if err := os.WriteFile(path, []byte(`{"version":`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantReason: ErrStoreMalformed,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := setAuthFile(t, t.TempDir())
+			tc.prepare(t, path)
+			if err := CheckStore(); !errors.Is(err, tc.wantReason) {
+				t.Fatalf("CheckStore error = %v, want errors.Is(_, %v)", err, tc.wantReason)
+			}
+
+			tok, loc, err := LoadDetailed("svc")
+			if tok != nil || loc != nil {
+				t.Fatalf("LoadDetailed returned token=%v locator=%+v, want neither", tok != nil, loc)
+			}
+			if !errors.Is(err, tc.wantReason) {
+				t.Fatalf("LoadDetailed error = %v, want errors.Is(_, %v)", err, tc.wantReason)
+			}
+			var diagnostic *StoreLoadError
+			if !errors.As(err, &diagnostic) {
+				t.Fatalf("LoadDetailed error %v is not *StoreLoadError", err)
+			}
+			if diagnostic.Path != path {
+				t.Fatalf("diagnostic path = %q, want %q", diagnostic.Path, path)
+			}
+
+			legacyToken, legacyLocator, legacyErr := Load("svc")
+			if legacyToken != nil || legacyLocator != nil {
+				t.Fatalf("legacy Load returned token=%v locator=%+v, want neither", legacyToken != nil, legacyLocator)
+			}
+			if legacyErr != nil {
+				t.Fatalf("legacy Load error = %v, want nil", legacyErr)
+			}
+		})
+	}
+
+	t.Run("missing store remains signed out", func(t *testing.T) {
+		setAuthFile(t, t.TempDir())
+		if err := CheckStore(); err != nil {
+			t.Fatalf("CheckStore missing = %v, want nil", err)
+		}
+		tok, loc, err := LoadDetailed("svc")
+		if tok != nil || loc != nil || err != nil {
+			t.Fatalf("LoadDetailed missing = token:%v locator:%+v err:%v, want signed out", tok != nil, loc, err)
+		}
+	})
+}
+
 // TestLoadEmptyProfileResolvesCurrent verifies that Load("") falls back to the
 // auth.json `current` field when no profile name is supplied, mirroring how the
 // gateway now invokes Load when BASETEN_SWITCH_OAUTH_PROFILE is unset.
