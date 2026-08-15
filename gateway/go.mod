@@ -2,6 +2,8 @@ module github.com/basetenlabs/baseten-switch/gateway
 
 go 1.26
 
+toolchain go1.26.6
+
 require (
 	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/oauth2 v0.36.0
