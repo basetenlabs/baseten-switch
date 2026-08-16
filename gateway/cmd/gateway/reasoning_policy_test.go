@@ -17,6 +17,7 @@ import (
 	"github.com/basetenlabs/baseten-switch/gateway/internal/config"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/pricing"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/reasoning"
+	"github.com/basetenlabs/baseten-switch/gateway/internal/telemetry"
 )
 
 func reasoningTestGateway(t *testing.T) *Gateway {
@@ -899,6 +900,14 @@ func TestReasoningPolicyConfiguredOffOpenAIShapesPreflightFallbackHTTP(
 					"fallback trigger = %v, want reasoning_policy_error",
 					rows[0].Fallback.Trigger,
 				)
+			}
+			if primary := rows[0].Primary; primary == nil ||
+				primary.Provider != "baseten" ||
+				primary.Model != "zai-org/GLM-5.2" ||
+				primary.Attempted ||
+				primary.Outcome != telemetry.PrimaryOutcomeReasoningPolicyError ||
+				primary.Status != nil {
+				t.Fatalf("reasoning preflight primary = %+v", primary)
 			}
 		})
 	}

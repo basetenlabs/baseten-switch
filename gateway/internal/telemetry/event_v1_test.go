@@ -64,6 +64,144 @@ func TestEventV1NullAndZeroSemantics(t *testing.T) {
 		strings.Contains(value, `"cache_write_input"`) {
 		t.Fatalf("encoded event retained generic cache-write fields: %s", value)
 	}
+	if strings.Contains(value, `"primary"`) {
+		t.Fatalf("event without fallback unexpectedly emitted primary: %s", value)
+	}
+}
+
+func TestEventV1PrimarySummaryRoundTrip(t *testing.T) {
+	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
+	event := validEventV1(now)
+	event.EffectiveProvider = "anthropic"
+	event.Fallback = FallbackV1{Attempted: true, Count: 1}
+	status := 503
+	event.Primary = &PrimaryV1{
+		Provider:  "baseten",
+		Model:     "zai-org/GLM-5.2",
+		Attempted: true,
+		Outcome:   PrimaryOutcomeHTTPError,
+		Status:    &status,
+	}
+	if err := event.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded EventV1
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Primary == nil ||
+		decoded.Primary.Provider != "baseten" ||
+		decoded.Primary.Model != "zai-org/GLM-5.2" ||
+		!decoded.Primary.Attempted ||
+		decoded.Primary.Outcome != PrimaryOutcomeHTTPError ||
+		decoded.Primary.Status == nil || *decoded.Primary.Status != 503 {
+		t.Fatalf("primary round trip = %+v", decoded.Primary)
+	}
+}
+
+func TestPrimaryV1Validation(t *testing.T) {
+	status := func(value int) *int { return &value }
+	tests := []struct {
+		name    string
+		primary PrimaryV1
+		wantErr bool
+	}{
+		{
+			name: "HTTP fallback",
+			primary: PrimaryV1{Provider: "baseten", Model: "model", Attempted: true,
+				Outcome: PrimaryOutcomeHTTPError, Status: status(503)},
+		},
+		{
+			name: "HTTP fallback accepts rate limit",
+			primary: PrimaryV1{Provider: "baseten", Model: "model", Attempted: true,
+				Outcome: PrimaryOutcomeHTTPError, Status: status(429)},
+		},
+		{
+			name: "HTTP fallback rejects ineligible client error",
+			primary: PrimaryV1{Provider: "baseten", Model: "model", Attempted: true,
+				Outcome: PrimaryOutcomeHTTPError, Status: status(400)},
+			wantErr: true,
+		},
+		{
+			name: "HTTP fallback rejects success status",
+			primary: PrimaryV1{Provider: "baseten", Model: "model", Attempted: true,
+				Outcome: PrimaryOutcomeHTTPError, Status: status(200)},
+			wantErr: true,
+		},
+		{
+			name: "HTTP fallback requires status",
+			primary: PrimaryV1{Provider: "baseten", Model: "model", Attempted: true,
+				Outcome: PrimaryOutcomeHTTPError},
+			wantErr: true,
+		},
+		{
+			name: "reactive image requires exact rejection status",
+			primary: PrimaryV1{Provider: "baseten", Model: "model", Attempted: true,
+				Outcome: PrimaryOutcomeImageInputUnsupported, Status: status(400)},
+		},
+		{
+			name: "reactive image rejects success status",
+			primary: PrimaryV1{Provider: "baseten", Model: "model", Attempted: true,
+				Outcome: PrimaryOutcomeImageInputUnsupported, Status: status(200)},
+			wantErr: true,
+		},
+		{
+			name: "attempted image requires status",
+			primary: PrimaryV1{Provider: "baseten", Model: "model", Attempted: true,
+				Outcome: PrimaryOutcomeImageInputUnsupported},
+			wantErr: true,
+		},
+		{
+			name: "preflight image has no status",
+			primary: PrimaryV1{Provider: "baseten", Model: "model",
+				Outcome: PrimaryOutcomeImageInputUnsupported},
+		},
+		{
+			name: "unattempted status rejected",
+			primary: PrimaryV1{Provider: "baseten", Model: "model",
+				Outcome: PrimaryOutcomeCooldown, Status: status(503)},
+			wantErr: true,
+		},
+		{
+			name: "nonstandard three-digit server error accepted",
+			primary: PrimaryV1{Provider: "baseten", Model: "model", Attempted: true,
+				Outcome: PrimaryOutcomeHTTPError, Status: status(600)},
+		},
+		{
+			name: "status above three-digit range rejected",
+			primary: PrimaryV1{Provider: "baseten", Model: "model", Attempted: true,
+				Outcome: PrimaryOutcomeHTTPError, Status: status(1000)},
+			wantErr: true,
+		},
+		{
+			name: "transport requires dispatch",
+			primary: PrimaryV1{Provider: "baseten", Model: "model",
+				Outcome: PrimaryOutcomeTransportError},
+			wantErr: true,
+		},
+		{
+			name: "request build is pre-dispatch",
+			primary: PrimaryV1{Provider: "baseten", Model: "model",
+				Outcome: PrimaryOutcomeRequestBuildError},
+		},
+		{
+			name: "expired TTFT budget is pre-dispatch",
+			primary: PrimaryV1{Provider: "baseten", Model: "model",
+				Outcome: PrimaryOutcomeTTFTTimeout},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.primary.validate()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validate() = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
 }
 
 func TestEventV1CacheWriteBucketsPreserveMissingVersusZero(t *testing.T) {

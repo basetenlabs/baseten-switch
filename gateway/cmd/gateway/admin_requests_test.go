@@ -147,6 +147,14 @@ func TestAdminRequestsProjectsFallbackAndNullableFields(t *testing.T) {
 		Count:     1,
 		Trigger:   &trigger,
 	}
+	primaryStatus := http.StatusBadRequest
+	event.Primary = &telemetry.PrimaryV1{
+		Provider:  "baseten",
+		Model:     "zai-org/GLM-5.2",
+		Attempted: true,
+		Outcome:   telemetry.PrimaryOutcomeImageInputUnsupported,
+		Status:    &primaryStatus,
+	}
 	writeAdminRequestEvents(t, dir, event)
 
 	recorder, response := requestAdminRequests(
@@ -178,7 +186,13 @@ func TestAdminRequestsProjectsFallbackAndNullableFields(t *testing.T) {
 		!row.Fallback.Attempted ||
 		row.Fallback.Count != 1 ||
 		row.Fallback.Trigger == nil ||
-		*row.Fallback.Trigger != trigger {
+		*row.Fallback.Trigger != trigger ||
+		row.Primary == nil ||
+		row.Primary.Provider != "baseten" ||
+		row.Primary.Model != "zai-org/GLM-5.2" ||
+		!row.Primary.Attempted ||
+		row.Primary.Outcome != telemetry.PrimaryOutcomeImageInputUnsupported ||
+		row.Primary.Status == nil || *row.Primary.Status != http.StatusBadRequest {
 		t.Fatalf("row = %+v", row)
 	}
 	body := recorder.Body.String()

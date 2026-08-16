@@ -75,6 +75,7 @@ type telemetryCompletionV1 struct {
 	providerStopReason       *string
 	fallbackCount            int
 	fallbackTrigger          *string
+	primary                  *telemetry.PrimaryV1
 	subagent                 bool
 	subagentModel            *string
 	sanitized                bool
@@ -317,6 +318,7 @@ func (request telemetryRequestCaptureV1) event(
 			Count:     completion.fallbackCount,
 			Trigger:   cloneStringPointer(completion.fallbackTrigger),
 		},
+		Primary:           clonePrimaryV1(completion.primary),
 		Subagent:          completion.subagent,
 		SubagentModel:     cloneStringPointer(completion.subagentModel),
 		Sanitized:         completion.sanitized,
@@ -335,6 +337,15 @@ func (request telemetryRequestCaptureV1) event(
 		return telemetry.EventV1{}, err
 	}
 	return event, nil
+}
+
+func clonePrimaryV1(in *telemetry.PrimaryV1) *telemetry.PrimaryV1 {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Status = cloneIntPointer(in.Status)
+	return &out
 }
 
 func cloneResponsesCompatibilityV1(
@@ -797,6 +808,9 @@ func (g *Gateway) recordTelemetryV1(
 	completion.fallbackCount = at.fallbackCount
 	if completion.fallbackTrigger == nil && at.fallbackTrigger != "" {
 		completion.fallbackTrigger = stringPointer(at.fallbackTrigger)
+	}
+	if completion.primary == nil {
+		completion.primary = at.primary
 	}
 	completion.subagent = at.subagent
 	if at.subagentModel != "" {

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/basetenlabs/baseten-switch/gateway/internal/config"
+	"github.com/basetenlabs/baseten-switch/gateway/internal/telemetry"
 )
 
 // subagentAgentIDHeader mirrors the gateway const so tests stay
@@ -431,6 +432,14 @@ func TestSubagentNativeTargetFallbackWaterfall(t *testing.T) {
 	}
 	if row.RequestedModel != "claude-opus-4-8" {
 		t.Errorf("requested_model = %q, want original claude-opus-4-8", row.RequestedModel)
+	}
+	if primary := row.Primary; primary == nil ||
+		primary.Provider != "baseten" ||
+		primary.Model != "zai-org/GLM-5.2" ||
+		!primary.Attempted ||
+		primary.Outcome != telemetry.PrimaryOutcomeHTTPError ||
+		primary.Status == nil || *primary.Status != http.StatusServiceUnavailable {
+		t.Errorf("subagent primary = %+v, want attempted Baseten default target HTTP 503", primary)
 	}
 }
 

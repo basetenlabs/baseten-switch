@@ -203,11 +203,11 @@ private enum RequestTableMetrics {
     static let time: CGFloat = 128
     static let harness: CGFloat = 132
     static let requested: CGFloat = 190
-    static let served: CGFloat = 250
+    static let routing: CGFloat = 330
     static let result: CGFloat = 120
     static let duration: CGFloat = 86
-    static let fallback: CGFloat = 350
-    static let totalWidth = time + harness + requested + served
+    static let fallback: CGFloat = 270
+    static let totalWidth = time + harness + requested + routing
         + result + duration + fallback
 }
 
@@ -217,9 +217,7 @@ private struct RequestTableHeader: View {
             headerCell("Time", width: RequestTableMetrics.time)
             headerCell("Harness", width: RequestTableMetrics.harness)
             headerCell("Requested", width: RequestTableMetrics.requested)
-            headerCell(
-                "Served / Provider",
-                width: RequestTableMetrics.served)
+            headerCell("Routing", width: RequestTableMetrics.routing)
             headerCell("Result", width: RequestTableMetrics.result)
             headerCell("Duration", width: RequestTableMetrics.duration)
             headerCell("Fallback", width: RequestTableMetrics.fallback)
@@ -277,11 +275,8 @@ private struct RequestTableRow: View {
                 .help(item.requestedModel)
                 .requestTableCell(width: RequestTableMetrics.requested)
 
-            Text(requestServedProviderLabel(item))
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .help(requestServedProviderLabel(item))
-                .requestTableCell(width: RequestTableMetrics.served)
+            RequestRoutingCell(item: item)
+                .requestTableCell(width: RequestTableMetrics.routing)
 
             RequestResultBadge(item: item)
                 .requestTableCell(width: RequestTableMetrics.result)
@@ -322,6 +317,35 @@ private struct RequestTableRow: View {
         .overlay(alignment: .bottom) {
             Divider()
         }
+    }
+}
+
+private struct RequestRoutingCell: View {
+    let item: RequestItem
+
+    var body: some View {
+        Group {
+            if let primary = item.primary {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(requestPrimaryRoutingLabel(primary))
+                        .font(.caption)
+                        .foregroundStyle(
+                            primary.attempted ? Color.orange : Color.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text("→ \(requestServedProviderLabel(item))")
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            } else {
+                Text(requestServedProviderLabel(item))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        }
+        .help(requestRoutingAccessibilityLabel(item))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(requestRoutingAccessibilityLabel(item))
     }
 }
 
@@ -367,6 +391,42 @@ func requestServedProviderLabel(_ item: RequestItem) -> String {
     }
 }
 
+func requestPrimaryProviderLabel(_ primary: RequestPrimaryAttempt) -> String {
+    let model = primary.model
+    let provider = primary.provider.capitalized
+    switch (model.isEmpty, provider.isEmpty) {
+    case (false, false):
+        return "\(model) · \(provider)"
+    case (false, true):
+        return model
+    case (true, false):
+        return provider
+    case (true, true):
+        return "Unknown primary"
+    }
+}
+
+func requestPrimaryStateLabel(_ primary: RequestPrimaryAttempt) -> String {
+    guard primary.attempted else { return "Not attempted" }
+    if primary.outcome == "http_error" {
+        return primary.status.map { "HTTP \($0)" } ?? "HTTP error"
+    }
+    let label = requestFallbackLabel(primary.outcome)
+    return label == "Fallback" ? "Attempted" : label
+}
+
+func requestPrimaryRoutingLabel(_ primary: RequestPrimaryAttempt) -> String {
+    let route = requestPrimaryProviderLabel(primary)
+    return primary.attempted ? route : "\(route) · Not attempted"
+}
+
+func requestRoutingAccessibilityLabel(_ item: RequestItem) -> String {
+    let served = requestServedProviderLabel(item)
+    guard let primary = item.primary else { return served }
+    return "Primary \(requestPrimaryProviderLabel(primary)), "
+        + "\(requestPrimaryStateLabel(primary)). Served by \(served)"
+}
+
 func requestResultLabel(_ item: RequestItem) -> String {
     if let status = item.status {
         return "HTTP \(status)"
@@ -390,33 +450,7 @@ func requestIsError(_ item: RequestItem) -> Bool {
 
 func requestFallbackReason(_ fallback: RequestFallback?) -> String? {
     guard fallback?.attempted == true else { return nil }
-    let trigger = fallback?.trigger ?? ""
-    switch trigger {
-    case "image_input_unsupported":
-        return "Baseten could not accept the image, native provider used"
-    case "ttft_timeout":
-        return "Baseten timed out before the first token, native provider used"
-    case "cooldown":
-        return "Baseten health cooldown was active, native provider used"
-    case "auth_unavailable":
-        return "Baseten credentials were unavailable, native provider used"
-    case "transport_error":
-        return "Baseten connection failed, native provider used"
-    case "reasoning_policy_error":
-        return "Reasoning policy could not be applied, native provider used"
-    case "":
-        return "Fallback provider used"
-    default:
-        if trigger.hasPrefix("http_"),
-           let status = Int(trigger.dropFirst("http_".count)) {
-            if status == 429 {
-                return "Baseten rate limited the request, native provider used"
-            }
-            return "Baseten returned HTTP \(status), native provider used"
-        }
-        let readable = trigger.replacingOccurrences(of: "_", with: " ")
-        return "Fallback provider used (\(readable))"
-    }
+    return requestFallbackLabel(fallback?.trigger)
 }
 
 func requestModelLabel(_ item: RequestItem) -> String {
