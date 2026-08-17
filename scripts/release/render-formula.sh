@@ -15,8 +15,7 @@ Usage: scripts/release/render-formula.sh \
   --tag v<major>.<minor>.<patch> \
   --sha256 <64 lowercase or uppercase hex characters> \
   --approved-license-spdx <SPDX-ID> \
-  --output <Formula/baseten-switch.rb path> \
-  --patch-output <patch path>
+  --output <Formula/baseten-switch.rb path>
 
 The license is intentionally mandatory. Pass only the SPDX identifier approved
 for the repository. This script does not infer or select a license.
@@ -27,7 +26,6 @@ tag=""
 sha256=""
 approved_license_spdx=""
 output=""
-patch_output=""
 
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
@@ -56,12 +54,6 @@ while [[ "$#" -gt 0 ]]; do
             output="$2"
             shift 2
             ;;
-        --patch-output)
-            [[ "$#" -ge 2 ]] || fail "--patch-output requires a value"
-            [[ -z "$patch_output" ]] || fail "--patch-output was provided more than once"
-            patch_output="$2"
-            shift 2
-            ;;
         -h|--help)
             usage
             exit 0
@@ -80,23 +72,16 @@ done
     || fail "--approved-license-spdx must be one explicit SPDX identifier"
 [[ -n "$output" ]] || fail "--output is required"
 [[ "$output" != -* ]] || fail "--output may not begin with '-'"
-[[ -n "$patch_output" ]] || fail "--patch-output is required"
-[[ "$patch_output" != -* ]] || fail "--patch-output may not begin with '-'"
-[[ "$patch_output" != "$output" ]] || fail "--output and --patch-output must differ"
 [[ ! -e "$output" ]] || fail "refusing to replace existing output: $output"
-[[ ! -e "$patch_output" ]] || fail "refusing to replace existing output: $patch_output"
 
 version="${tag#v}"
 sha256="$(tr '[:upper:]' '[:lower:]' <<<"$sha256")"
 artifact_name="baseten-switch_${version}_darwin_universal.zip"
 artifact_url="https://github.com/basetenlabs/baseten-switch/releases/download/${tag}/${artifact_name}"
 output_dir="$(dirname "$output")"
-patch_output_dir="$(dirname "$patch_output")"
 mkdir -p "$output_dir"
-mkdir -p "$patch_output_dir"
 tmp="$(mktemp "$output_dir/.baseten-switch-formula.XXXXXX")"
-patch_tmp="$(mktemp "$patch_output_dir/.baseten-switch-formula-patch.XXXXXX")"
-trap 'rm -f "$tmp" "$patch_tmp"' EXIT
+trap 'rm -f "$tmp"' EXIT
 
 cat >"$tmp" <<EOF
 # typed: strict
@@ -148,19 +133,7 @@ if command -v ruby >/dev/null 2>&1; then
         || fail "rendered formula failed Ruby syntax validation"
 fi
 
-formula_lines="$(wc -l <"$tmp" | tr -d '[:space:]')"
-{
-    printf 'diff --git a/Formula/baseten-switch.rb b/Formula/baseten-switch.rb\n'
-    printf 'new file mode 100644\n'
-    printf '%s\n' '--- /dev/null'
-    printf '%s\n' '+++ b/Formula/baseten-switch.rb'
-    printf '@@ -0,0 +1,%s @@\n' "$formula_lines"
-    sed 's/^/+/' "$tmp"
-} >"$patch_tmp"
-
 chmod 0644 "$tmp"
-chmod 0644 "$patch_tmp"
 mv "$tmp" "$output"
-mv "$patch_tmp" "$patch_output"
 trap - EXIT
-printf '%s\n' "$output" "$patch_output"
+printf '%s\n' "$output"
