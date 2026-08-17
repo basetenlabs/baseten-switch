@@ -36,6 +36,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -191,6 +192,10 @@ type claudeAdapter struct {
 // claudeBeforeSettingsMutation is a test seam for changes after the adapter
 // has staged recovery state but before safefile revalidates the preimage.
 var claudeBeforeSettingsMutation func()
+
+// claudeBeforeMigratedBackupReplace is a test seam for a change after one
+// migrated-backup generation has been captured but before the next atomic CAS.
+var claudeBeforeMigratedBackupReplace func(action string)
 
 func (a *claudeAdapter) acquireSettingsMutationLock() (*configMutationLock, error) {
 	if err := os.MkdirAll(filepath.Dir(a.backupPath), 0o700); err != nil {
@@ -580,15 +585,40 @@ func loadClaudeBackup(path string) (*claudeBackup, error) {
 	return &bak, nil
 }
 
+// loadClaudeBackupSnapshot parses a backup from the same safe-file snapshot
+// that a legacy migration later replaces. The snapshot prevents a concurrent
+// backup writer from being overwritten between load and migration.
+func loadClaudeBackupSnapshot(path string) (*claudeBackup, *safefile.Snapshot, error) {
+	snap, err := safefile.Read(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read backup %s: %w", path, err)
+	}
+	if !snap.Exists {
+		return nil, snap, nil
+	}
+	var bak claudeBackup
+	if err := json.Unmarshal(snap.Data, &bak); err != nil {
+		return nil, nil, fmt.Errorf("parse backup %s: %w", path, err)
+	}
+	return &bak, snap, nil
+}
+
+func marshalClaudeBackup(bak *claudeBackup) ([]byte, error) {
+	b, err := json.MarshalIndent(bak, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(b, '\n'), nil
+}
+
 // saveClaudeBackup writes dir 0700 / file 0600: snapshots can embed
 // other providers' base URLs and sit next to future codex snapshots
 // that embed credentials.
 func saveClaudeBackup(path string, bak *claudeBackup) error {
-	b, err := json.MarshalIndent(bak, "", "  ")
+	b, err := marshalClaudeBackup(bak)
 	if err != nil {
 		return err
 	}
-	b = append(b, '\n')
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -672,6 +702,94 @@ func recordClaudeBackupFile(bak *claudeBackup, snap *safefile.Snapshot) {
 	}
 }
 
+func replaceClaudeBackupSnapshot(snap *safefile.Snapshot, bak *claudeBackup) (*safefile.Snapshot, error) {
+	if snap == nil {
+		return nil, fmt.Errorf("missing backup snapshot")
+	}
+	b, err := marshalClaudeBackup(bak)
+	if err != nil {
+		return nil, err
+	}
+	return snap.Replace(b, 0o600)
+}
+
+func replaceMigratedClaudeBackup(snap *safefile.Snapshot, bak *claudeBackup, action string) (*safefile.Snapshot, error) {
+	if claudeBeforeMigratedBackupReplace != nil {
+		claudeBeforeMigratedBackupReplace(action)
+	}
+	committed, err := replaceClaudeBackupSnapshot(snap, bak)
+	if err == nil {
+		return committed, nil
+	}
+	if safefile.CommitApplied(err) {
+		if errors.Is(err, safefile.ErrConflict) {
+			return committed, fmt.Errorf("%s was applied, but post-commit verification found that the migrated backup changed concurrently; the concurrent backup was not overwritten: %w", action, err)
+		}
+		return committed, fmt.Errorf("%s was applied, but its durability or post-commit verification failed: %w", action, err)
+	}
+	if errors.Is(err, safefile.ErrConflict) {
+		return nil, fmt.Errorf("%s refused because the migrated backup changed concurrently and was not overwritten: %w", action, err)
+	}
+	return nil, fmt.Errorf("%s failed before backup replacement, so the replacement was not applied: %w", action, err)
+}
+
+// migrateLegacyLinkedBackupSnapshot upgrades a pre-link-aware backup only when
+// its recorded file hash proves that the current linked target is the exact file
+// generation the backup describes. The settings snapshot supplies the bytes,
+// resolved path, identity, and pre-save verification. The backup snapshot binds
+// the parsed backup preimage to its atomic replacement. Migration changes only
+// target provenance and persists it before the caller may mutate settings.
+func (a *claudeAdapter) migrateLegacyLinkedBackupSnapshot(bak *claudeBackup, backupSnap, settingsSnap *safefile.Snapshot) (*claudeBackup, bool, *safefile.Snapshot, error) {
+	if bak == nil {
+		return nil, false, backupSnap, nil
+	}
+	if bak.ConfigPath != a.settingsPath {
+		return bak, false, backupSnap, fmt.Errorf("refusing to modify %s because backup %s is for %s, not %s; settings and backup left intact", a.settingsPath, a.backupPath, bak.ConfigPath, a.settingsPath)
+	}
+
+	resolvedRecorded := bak.ResolvedPath != ""
+	identityRecorded := bak.WrittenIdentity != nil
+	if resolvedRecorded != identityRecorded {
+		return bak, false, backupSnap, fmt.Errorf("refusing to modify %s because the backup has incomplete linked-target metadata; link and backup left intact", a.settingsPath)
+	}
+	if resolvedRecorded || !settingsSnap.Linked {
+		return bak, false, backupSnap, nil
+	}
+	if backupSnap == nil || !backupSnap.Exists {
+		return bak, false, backupSnap, fmt.Errorf("refusing to migrate the legacy backup for %s because its snapshotted backup file is missing; settings left intact", a.settingsPath)
+	}
+	if !settingsSnap.Exists || bak.WrittenHash == "" || sha256Hex(settingsSnap.Data) != bak.WrittenHash {
+		return bak, false, backupSnap, fmt.Errorf("refusing to modify %s because its legacy backup predates linked-settings support and the current linked target does not exactly match its recorded file generation; link and backup left intact; restore the link to the file managed by the earlier 'claude on' and retry, or restore the backed-up values manually; do not delete the backup", a.settingsPath)
+	}
+
+	migrated := cloneClaudeBackup(bak)
+	recordClaudeBackupFile(migrated, settingsSnap)
+	if err := settingsSnap.Verify(); err != nil {
+		return bak, false, backupSnap, fmt.Errorf("verify linked target before migrating legacy backup: %w; link and backup left intact", err)
+	}
+	committedBackup, err := replaceClaudeBackupSnapshot(backupSnap, migrated)
+	if err != nil {
+		if safefile.CommitApplied(err) {
+			if errors.Is(err, safefile.ErrConflict) {
+				return migrated, true, committedBackup, fmt.Errorf("legacy backup migration was applied, but post-commit verification found that the backup changed concurrently; the concurrent backup was not overwritten: %w; settings untouched; inspect %s before retrying", err, a.backupPath)
+			}
+			return migrated, true, committedBackup, fmt.Errorf("legacy backup migration was applied, but its durability or post-commit verification failed: %w; settings untouched; inspect %s before retrying", err, a.backupPath)
+		}
+		if errors.Is(err, safefile.ErrConflict) {
+			return bak, false, backupSnap, fmt.Errorf("legacy backup changed concurrently and was not overwritten: %w; settings untouched", err)
+		}
+		return bak, false, backupSnap, fmt.Errorf("atomically migrate legacy backup: %w; settings untouched and backup replacement was not applied", err)
+	}
+	return migrated, true, committedBackup, nil
+}
+
+// migrateLegacyLinkedBackup keeps the focused migration contract used by
+// tests and callers that do not perform later backup writes.
+func (a *claudeAdapter) migrateLegacyLinkedBackup(bak *claudeBackup, backupSnap, settingsSnap *safefile.Snapshot) (*claudeBackup, bool, error) {
+	migrated, changed, _, err := a.migrateLegacyLinkedBackupSnapshot(bak, backupSnap, settingsSnap)
+	return migrated, changed, err
+}
+
 // claudeBackupMatchesFile binds a link-aware backup to the file committed by
 // `on`. Legacy backups remain valid for direct regular paths. A legacy backup
 // is not allowed to clean-restore through a link because it does not identify
@@ -720,12 +838,29 @@ func (a *claudeAdapter) on() int {
 	envExistedPre := env != nil
 	baseManaged, _ := a.claudeOnState(env)
 
-	bak, err := loadClaudeBackup(a.backupPath)
+	bak, backupSnap, err := loadClaudeBackupSnapshot(a.backupPath)
 	if err != nil {
 		fmt.Fprintf(a.out, "claude on: %v\n", err)
 		return 1
 	}
+	bak, migratedBackup, backupSnap, err := a.migrateLegacyLinkedBackupSnapshot(bak, backupSnap, snap)
+	if err != nil {
+		fmt.Fprintf(a.out, "claude on: %v\n", err)
+		return 1
+	}
+	// Adoption is independently durable. Roll back later additive snapshots to
+	// this provenance-bearing baseline, never to the ambiguous legacy backup.
 	originalBackup := cloneClaudeBackup(bak)
+	saveExistingBackup := func(next *claudeBackup, action string) error {
+		if !migratedBackup {
+			return saveClaudeBackup(a.backupPath, next)
+		}
+		committedBackup, replaceErr := replaceMigratedClaudeBackup(backupSnap, next, action)
+		if committedBackup != nil {
+			backupSnap = committedBackup
+		}
+		return replaceErr
+	}
 	if bak != nil && !claudeBackupTargetSafe(bak, snap) {
 		fmt.Fprintf(a.out, "claude on: refusing to modify %s because it no longer resolves to the target recorded by the backup; link and backup left intact\n",
 			a.settingsPath)
@@ -753,7 +888,7 @@ func (a *claudeAdapter) on() int {
 	// but the fixed-value keys are backed up even in a base-only legacy
 	// state so custom or manually-added values restore exactly.
 	var nb *claudeBackup
-	backupChanged := false
+	backupChanged := migratedBackup
 	if bak == nil && changed {
 		nb = &claudeBackup{
 			ConfigPath:  a.settingsPath,
@@ -792,7 +927,7 @@ func (a *claudeAdapter) on() int {
 		if backupChanged {
 			bak.WrittenHash = sha256Hex(raw)
 			recordClaudeBackupFile(bak, snap)
-			if err := saveClaudeBackup(a.backupPath, bak); err != nil {
+			if err := saveExistingBackup(bak, "migrated backup additive update"); err != nil {
 				fmt.Fprintf(a.out, "claude on: write backup: %v (settings untouched)\n", err)
 				return 1
 			}
@@ -820,8 +955,8 @@ func (a *claudeAdapter) on() int {
 					// Nothing was modified; drop the staged backup.
 					_ = os.Remove(a.backupPath)
 				case backupChanged && originalBackup != nil:
-					if restoreErr := saveClaudeBackup(a.backupPath, originalBackup); restoreErr != nil {
-						fmt.Fprintf(a.out, "claude on: warning: settings were untouched, but the prior backup could not be restored: %v\n", restoreErr)
+					if restoreErr := saveExistingBackup(originalBackup, "migrated backup rollback"); restoreErr != nil {
+						fmt.Fprintf(a.out, "claude on: warning: settings were untouched, but backup rollback did not complete cleanly: %v\n", restoreErr)
 					}
 				}
 			}
@@ -839,8 +974,14 @@ func (a *claudeAdapter) on() int {
 				if hashTarget != nil && committed != nil {
 					hashTarget.WrittenHash = sha256Hex(newRaw)
 					recordClaudeBackupFile(hashTarget, committed)
-					if saveErr := saveClaudeBackup(a.backupPath, hashTarget); saveErr != nil {
-						fmt.Fprintf(a.out, "claude on: warning: could not bind the retained backup to the committed file: %v\n", saveErr)
+					var saveErr error
+					if nb != nil {
+						saveErr = saveClaudeBackup(a.backupPath, hashTarget)
+					} else {
+						saveErr = saveExistingBackup(hashTarget, "migrated backup commit binding")
+					}
+					if saveErr != nil {
+						fmt.Fprintf(a.out, "claude on: warning: backup binding after the settings commit did not complete cleanly: %v\n", saveErr)
 					}
 				}
 				fmt.Fprintln(a.out, "claude on: settings changed, but post-commit verification failed; original backup retained")
@@ -856,8 +997,8 @@ func (a *claudeAdapter) on() int {
 		}
 		if err := snap.Verify(); err != nil {
 			if originalBackup != nil {
-				if restoreErr := saveClaudeBackup(a.backupPath, originalBackup); restoreErr != nil {
-					fmt.Fprintf(a.out, "claude on: warning: settings changed concurrently and the prior backup could not be restored: %v\n", restoreErr)
+				if restoreErr := saveExistingBackup(originalBackup, "migrated backup rollback"); restoreErr != nil {
+					fmt.Fprintf(a.out, "claude on: warning: settings changed concurrently and backup rollback did not complete cleanly: %v\n", restoreErr)
 				}
 			}
 			fmt.Fprintf(a.out, "claude on: %v\n", err)
@@ -875,8 +1016,14 @@ func (a *claudeAdapter) on() int {
 		}
 		hashTarget.WrittenHash = sha256Hex(newRaw)
 		recordClaudeBackupFile(hashTarget, committed)
-		if err := saveClaudeBackup(a.backupPath, hashTarget); err != nil {
-			fmt.Fprintf(a.out, "claude on: warning: could not refresh the backup drift hash: %v\n", err)
+		var refreshErr error
+		if nb != nil {
+			refreshErr = saveClaudeBackup(a.backupPath, hashTarget)
+		} else {
+			refreshErr = saveExistingBackup(hashTarget, "migrated backup drift-hash refresh")
+		}
+		if refreshErr != nil {
+			fmt.Fprintf(a.out, "claude on: warning: backup drift-hash refresh did not complete cleanly: %v\n", refreshErr)
 		}
 	}
 
@@ -911,7 +1058,7 @@ func (a *claudeAdapter) off() int {
 	}
 	raw := snap.Data
 	existed := snap.Exists
-	bak, err := loadClaudeBackup(a.backupPath)
+	bak, backupSnap, err := loadClaudeBackupSnapshot(a.backupPath)
 	if err != nil {
 		fmt.Fprintf(a.out, "claude off: %v\n", err)
 		return 1
@@ -919,8 +1066,9 @@ func (a *claudeAdapter) off() int {
 	if bak != nil && bak.ConfigPath != a.settingsPath {
 		// Should be unreachable given the hash-keyed filename; refuse
 		// to restore a snapshot of a different file.
-		fmt.Fprintf(a.out, "warning: backup %s is for %s, not %s; ignoring it\n", a.backupPath, bak.ConfigPath, a.settingsPath)
-		bak = nil
+		fmt.Fprintf(a.out, "claude off: refusing to modify %s because backup %s is for %s; settings and backup left intact\n",
+			a.settingsPath, a.backupPath, bak.ConfigPath)
+		return 1
 	}
 	if bak != nil && a.poisonedBackup(bak) {
 		fmt.Fprintf(a.out, "warning: backup %s itself points at a gateway port; discarding it instead of restoring (poisoned-backup guard)\n", a.backupPath)
@@ -933,6 +1081,11 @@ func (a *claudeAdapter) off() int {
 
 	if bak == nil {
 		return a.offStripOnly(root, snap, nil)
+	}
+	bak, _, err = a.migrateLegacyLinkedBackup(bak, backupSnap, snap)
+	if err != nil {
+		fmt.Fprintf(a.out, "claude off: %v\n", err)
+		return 1
 	}
 
 	if !claudeBackupTargetSafe(bak, snap) {
