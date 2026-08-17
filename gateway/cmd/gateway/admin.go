@@ -53,6 +53,7 @@ func (g *Gateway) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/admin/stats", g.adminStats)
 	mux.HandleFunc("/v1/admin/analytics", g.adminAnalytics)
 	mux.HandleFunc("/v1/admin/requests", g.adminRequests)
+	mux.HandleFunc("/v1/admin/auth/reload", g.handleAuthReload)
 	mux.HandleFunc("/v1/admin/auth/status", g.handleAuthStatus)
 }
 

@@ -653,6 +653,10 @@ protocol AdminStatusReading: Sendable {
     func fetchStats(windowSeconds: Int, bucketSeconds: Int) async throws -> StatsSnapshot
 }
 
+protocol AuthReloading: Sendable {
+    func reloadAuth() async throws -> AuthStatus
+}
+
 protocol ModelCatalogReading: Sendable {
     func fetchModelCatalog() async throws -> LiveModelCatalogSnapshot
 }
@@ -666,9 +670,12 @@ protocol ReasoningPreflightReading: Sendable {
     ) async throws -> ReasoningPreflightSnapshot
 }
 
-final class GatewayAPIClient: AdminStatusReading, ModelCatalogReading,
+final class GatewayAPIClient: AdminStatusReading, AuthReloading,
+                              ModelCatalogReading,
                               ReasoningPreflightReading,
                               @unchecked Sendable {
+    private static let adminRequestTimeout: TimeInterval = 2
+    private static let modelCatalogRequestTimeout: TimeInterval = 4
     private let runtime: RuntimeProfile
     private let session: URLSession
 
@@ -707,8 +714,18 @@ final class GatewayAPIClient: AdminStatusReading, ModelCatalogReading,
         return StatsSnapshot(dict: dict)
     }
 
+    func reloadAuth() async throws -> AuthStatus {
+        let object = try await postEmptyJSON("v1/admin/auth/reload")
+        guard let dict = object as? [String: Any] else {
+            throw GatewayClientError.invalidPayload
+        }
+        return AuthStatus(dict: dict)
+    }
+
     func fetchModelCatalog() async throws -> LiveModelCatalogSnapshot {
-        let object = try await getJSON("v1/admin/model-catalog")
+        let object = try await getJSON(
+            "v1/admin/model-catalog",
+            timeoutInterval: Self.modelCatalogRequestTimeout)
         guard let dict = object as? [String: Any],
               let snapshot = LiveModelCatalogSnapshot(dict: dict) else {
             throw GatewayClientError.invalidPayload
@@ -739,7 +756,10 @@ final class GatewayAPIClient: AdminStatusReading, ModelCatalogReading,
     }
 
     private func getJSON(_ path: String,
-                         query: [URLQueryItem] = []) async throws -> Any {
+                         query: [URLQueryItem] = [],
+                         timeoutInterval: TimeInterval =
+                            GatewayAPIClient.adminRequestTimeout) async throws
+        -> Any {
         var url = adminBaseURL(runtime: runtime)
         url.appendPathComponent(path)
         if !query.isEmpty,
@@ -749,7 +769,9 @@ final class GatewayAPIClient: AdminStatusReading, ModelCatalogReading,
                 url = queriedURL
             }
         }
-        let (data, response) = try await session.data(from: url)
+        var request = URLRequest(url: url)
+        request.timeoutInterval = timeoutInterval
+        let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse,
               (200..<300).contains(http.statusCode) else {
             throw GatewayClientError.badResponse(
@@ -771,6 +793,22 @@ final class GatewayAPIClient: AdminStatusReading, ModelCatalogReading,
             forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(
             withJSONObject: body)
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode) else {
+            throw GatewayClientError.badResponse(
+                (response as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+        return try JSONSerialization.jsonObject(with: data)
+    }
+
+    private func postEmptyJSON(_ path: String) async throws -> Any {
+        var request = URLRequest(
+            url: adminBaseURL(runtime: runtime)
+                .appendingPathComponent(path))
+        request.httpMethod = "POST"
+        request.setValue("1", forHTTPHeaderField: "X-Baseten-Switch-Admin")
+        request.httpBody = Data()
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse,
               (200..<300).contains(http.statusCode) else {

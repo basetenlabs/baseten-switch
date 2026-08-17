@@ -21,20 +21,56 @@ struct RuntimeProfile: Equatable {
 
     static func stable(environment: [String: String] = ProcessInfo.processInfo.environment)
         -> RuntimeProfile {
-        let binaryEnvironment = environment["BASETEN_SWITCH_GATEWAY_BIN"]
-            .flatMap { $0.isEmpty ? nil : ["BASETEN_SWITCH_GATEWAY_BIN": $0] }
-            ?? [:]
+        let adminBaseURL = endpointURL(
+            url: environment["BASETEN_SWITCH_ADMIN_URL"],
+            address: environment["BASETEN_SWITCH_ADMIN_ADDR"],
+            defaultPort: 45273)
+        // Retain only explicit local-runtime coordination overrides. The
+        // child-process allowlist still strips credentials and unrelated
+        // ambient state, while these values keep a Stable development build
+        // connected to the same isolated router for reads and mutations.
+        let coordinationKeys = [
+            "BASETEN_SWITCH_GATEWAY_BIN",
+            "BASETEN_SWITCH_CONFIG_PATH",
+            "BASETEN_SWITCH_ADMIN_ADDR",
+            "BASETEN_SWITCH_ADMIN_URL",
+            "BASETEN_SWITCH_GATEWAY_ADMIN",
+            "BASETEN_SWITCH_GATEWAY_PIDFILE",
+        ]
+        var coordinationEnvironment: [String: String] = [:]
+        for key in coordinationKeys {
+            if let value = environment[key], !value.isEmpty {
+                coordinationEnvironment[key] = value
+            }
+        }
+        let hasExplicitAdminEndpoint =
+            environment["BASETEN_SWITCH_ADMIN_URL"]?.isEmpty == false
+            || environment["BASETEN_SWITCH_ADMIN_ADDR"]?.isEmpty == false
+        if hasExplicitAdminEndpoint,
+           let address = loopbackAdminAddress(adminBaseURL) {
+            // The app accepts ADMIN_URL as the higher-precedence read
+            // endpoint, while the CLI consumes ADMIN_ADDR. Canonicalize both
+            // inputs to the same loopback endpoint for child mutations.
+            coordinationEnvironment["BASETEN_SWITCH_ADMIN_ADDR"] = address
+        }
         return RuntimeProfile(
-            adminBaseURL: endpointURL(
-                url: environment["BASETEN_SWITCH_ADMIN_URL"],
-                address: environment["BASETEN_SWITCH_ADMIN_ADDR"],
-                defaultPort: 45273),
+            adminBaseURL: adminBaseURL,
             doorURLs: doorEndpointURLs(
                 urls: environment["BASETEN_SWITCH_DOOR_URLS"],
                 ports: environment["BASETEN_SWITCH_DOOR_PORTS"],
                 defaultPorts: [45271]),
             expectedConfigPath: nil,
-            environment: binaryEnvironment)
+            environment: coordinationEnvironment)
+    }
+
+    private static func loopbackAdminAddress(_ url: URL) -> String? {
+        guard url.scheme?.lowercased() == "http",
+              let host = url.host?.lowercased(),
+              host == "127.0.0.1" || host == "localhost" || host == "::1",
+              let port = url.port else {
+            return nil
+        }
+        return host == "::1" ? "[::1]:\(port)" : "\(host):\(port)"
     }
 
     static func preview(
