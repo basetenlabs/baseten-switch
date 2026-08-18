@@ -92,6 +92,8 @@ func dispatch(args []string) int {
 		return cmdStatus(args[1:])
 	case "spend":
 		return cmdSpend(args[1:])
+	case "traces":
+		return cmdTraces(args[1:])
 	case "healthz":
 		return cmdHealthz(args[1:])
 	case "whoami":
@@ -154,9 +156,9 @@ menubar shutdown step.
 
 Restore only provably managed Claude Code and Codex settings, stop the current
 door and router, remove the current launchd agents and runtime residue, and
-quit the current menubar app. Config, secrets, telemetry, logs, and backups are
-retained by default. Baseten CLI credentials and keychain entries are never
-removed.
+quit the current menubar app. Config, secrets, telemetry, captured traces,
+trace packages, logs, and backups are retained by default. Baseten CLI
+credentials and keychain entries are never removed.
 
   --dry-run  Print every intended action without changing anything
   --purge    Also remove ~/.config/baseten-switch permanently
@@ -264,6 +266,31 @@ setup does not start daemons or change any coding harness configuration.
 	{"spend", "Summarize spend from local telemetry segments", `Usage: baseten-switch spend
 
 Print the spend summary calculated from local telemetry segments.
+`},
+	{"traces", "Manage disabled-by-default local request and response capture", `Usage:
+  baseten-switch traces status
+  baseten-switch traces enable --client NAME [--client NAME] [--retention-days N]
+  baseten-switch traces disable
+  baseten-switch traces package --since TIME --client NAME [options]
+  baseten-switch traces purge --yes [--packages]
+  baseten-switch traces cleanup IDENTIFIER
+
+Trace capture is disabled by default. Captured bodies can contain prompts,
+responses, reasoning summaries, tool input and output, source code, credentials,
+personal data, and regulated data. Switch never uploads trace packages.
+
+Package options:
+  --since TIME                 Required RFC 3339 timestamp or Go duration
+  --until TIME                 Optional exclusive bound, defaults to command start
+  --client NAME                Required and repeatable client selector
+  --output PATH                Optional new ZIP destination; never overwritten
+  --include-native             Include only high-confidence linked native turns
+  --native-session-selector P  Private mode-0600 explicit native selector file
+  --include-codex-archived     Opt in to recognized archived Codex sessions
+  --dry-run                    Print content-free counts without creating a ZIP
+  --yes                        Acknowledge sensitive content noninteractively
+  --allow-unscanned-content    Publish despite explicitly reported scan gaps
+  --allow-detected-secrets     Publish despite detected credential categories
 `},
 	{"whoami", "Show the signed-in Baseten identity and token expiry", `Usage: baseten-switch whoami [--profile NAME] [--host URL] [--refresh]
 

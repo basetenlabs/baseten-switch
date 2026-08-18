@@ -238,6 +238,12 @@ credentials, headers, or request bodies. Disable future records by setting
 Delete existing records from
 `~/.config/baseten-switch/telemetry/`.
 
+Request and response body capture is a separate, disabled-by-default local
+feature. If an operator explicitly enables `global.trace_capture`, Switch can
+store exact bodies in a separate private trace store. Those bodies can contain
+prompts, responses, reasoning content, tool data, source code, credentials,
+personal data, and regulated data. Switch does not upload captured traces.
+
 Public model-catalog refreshes from models.dev send no credential or
 user-derived data. The unauthenticated administration API binds to loopback
 and must never be exposed on a network interface.
