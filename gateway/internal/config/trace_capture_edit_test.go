@@ -47,6 +47,28 @@ func TestSetTraceCaptureReplacesOnlySubtree(t *testing.T) {
 	}
 }
 
+func TestSetTraceCapturePreservesFourSpaceIndentation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway.yaml")
+	before := "global:\n    routing_enabled: false\n    retry_max: 3\nclients:\n    - name: claude-code\n      enabled: true\n      bind_addr: 127.0.0.1:18081\n      protocol_shape: anthropic\n      default_model: example/model\n"
+	if err := os.WriteFile(path, []byte(before), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetTraceCapture(path, TraceCapture{
+		Enabled: true, Clients: []string{"claude-code"}, RetentionDays: 7,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(body)
+	want := "    trace_capture:\n        enabled: true\n        clients:\n            - \"claude-code\"\n        retention_days: 7\nclients:\n"
+	if !strings.Contains(got, want) {
+		t.Fatalf("edited config does not preserve four-space indentation:\n%s", got)
+	}
+}
+
 func TestSetTraceCaptureRejectsUnsafePolicyWithoutWriting(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gateway.yaml")
 	before := "global:\n  routing_enabled: false\nclients:\n  - name: claude-code\n    enabled: true\n    bind_addr: 0.0.0.0:18081\n    protocol_shape: anthropic\n    default_model: example/model\n"

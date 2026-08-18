@@ -46,12 +46,18 @@ func SetTraceCapture(path string, policy TraceCapture) error {
 		return fmt.Errorf("%s: global must be a block mapping", path)
 	}
 
-	block, err := renderTraceCaptureBlock(policy)
+	key, value := mappingEntry(global, "trace_capture")
+	indentWidth := 2
+	if key != nil && key.Column > 1 {
+		indentWidth = key.Column - 1
+	} else if len(global.Content) > 0 && global.Content[0].Column > 1 {
+		indentWidth = global.Content[0].Column - 1
+	}
+	block, err := renderTraceCaptureBlock(policy, indentWidth)
 	if err != nil {
 		return err
 	}
 	lines := bytes.SplitAfter(data, []byte("\n"))
-	key, value := mappingEntry(global, "trace_capture")
 	var output []byte
 	if key != nil {
 		start := key.Line
@@ -100,21 +106,32 @@ func SetTraceCapture(path string, policy TraceCapture) error {
 	return writeFileAtomic(path, output, info.Mode().Perm())
 }
 
-func renderTraceCaptureBlock(policy TraceCapture) ([]byte, error) {
+func renderTraceCaptureBlock(policy TraceCapture, indentWidth int) ([]byte, error) {
+	if indentWidth < 1 {
+		indentWidth = 2
+	}
+	indent := strings.Repeat(" ", indentWidth)
+	nested := indent + indent
+	listItem := nested + indent
 	var out strings.Builder
-	out.WriteString("  trace_capture:\n")
-	out.WriteString("    enabled: ")
+	out.WriteString(indent)
+	out.WriteString("trace_capture:\n")
+	out.WriteString(nested)
+	out.WriteString("enabled: ")
 	out.WriteString(strconv.FormatBool(policy.Enabled))
 	out.WriteByte('\n')
 	if len(policy.Clients) == 0 {
-		out.WriteString("    clients: []\n")
+		out.WriteString(nested)
+		out.WriteString("clients: []\n")
 	} else {
-		out.WriteString("    clients:\n")
+		out.WriteString(nested)
+		out.WriteString("clients:\n")
 		for _, client := range policy.Clients {
 			if strings.ContainsAny(client, "\r\n\x00") {
 				return nil, fmt.Errorf("trace capture client name contains an unsupported character")
 			}
-			out.WriteString("      - ")
+			out.WriteString(listItem)
+			out.WriteString("- ")
 			out.WriteString(strconv.Quote(client))
 			out.WriteByte('\n')
 		}
@@ -123,7 +140,8 @@ func renderTraceCaptureBlock(policy TraceCapture) ([]byte, error) {
 	if retention == 0 {
 		retention = DefaultTraceRetentionDays
 	}
-	out.WriteString("    retention_days: ")
+	out.WriteString(nested)
+	out.WriteString("retention_days: ")
 	out.WriteString(strconv.Itoa(retention))
 	out.WriteByte('\n')
 	return []byte(out.String()), nil
