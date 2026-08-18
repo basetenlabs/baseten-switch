@@ -336,7 +336,7 @@ func (c Collector) processRecord(
 		}
 		parsed.versions[record.Version] = struct{}{}
 	case "system", "progress", "file-history-snapshot", "queue-operation",
-		"custom-title", "summary", "attachment", "last-prompt", "pr-link":
+		"custom-title", "ai-title", "summary", "attachment", "last-prompt", "pr-link":
 		// These recognized records are either normalized below or deliberately
 		// excluded. They do not broaden the event allowlist.
 	default:
