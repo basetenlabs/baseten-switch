@@ -577,6 +577,15 @@ type Gateway struct {
 	fallbackMu    sync.Mutex
 	fallbackUntil map[string]time.Time
 
+	// authUnavailableFallbackCount and its last-occurrence fields make the
+	// otherwise successful auth_unavailable fallback visible in admin status.
+	// The count is process-local, so it naturally represents this gateway boot.
+	authUnavailableFallbackCount  uint64
+	authUnavailableFallbackMu     sync.RWMutex
+	authUnavailableFallbackAt     time.Time
+	authUnavailableFallbackClient string
+	authUnavailableFallbackRoute  string
+
 	// Active routing snapshot. Admin status reads this exact accepted
 	// configuration instead of independently parsing gateway.yaml.
 	stateMu          sync.RWMutex
@@ -822,20 +831,34 @@ func (g *Gateway) refreshAuth() {
 func (g *Gateway) refreshAuthLocked() {
 	cfg := g.runtimeConfig()
 	g.authMu.Lock()
-	// Each build is a new lineage: outcomes from clients built before
-	// this swap are stale and noteAuthRefresh drops them by generation.
-	g.authGen++
-	gen := g.authGen
+	previousGen := g.authGen
+	gen := previousGen + 1
 	g.authMu.Unlock()
 
 	notify := func(fp string, err error) { g.noteAuthRefresh(gen, fp, err) }
-	client, tick, credFP, err := auth.HTTPClientWithNotify(context.Background(), cfg.OAuthProfile, cfg.OAuthHost, notify)
+	client, tick, credFP, err := auth.HTTPClientWithNotifyDetailed(context.Background(), cfg.OAuthProfile, cfg.OAuthHost, notify)
+	storeFailure := ""
+	switch {
+	case errors.Is(err, auth.ErrStoreUnreadable):
+		storeFailure = "unreadable"
+	case errors.Is(err, auth.ErrStoreMalformed):
+		storeFailure = "malformed"
+	}
+	if storeFailure != "" {
+		fmt.Fprintf(os.Stderr, "[gateway] auth: credential store %s; preserving current auth: %v\n", storeFailure, err)
+		return
+	}
 
 	g.authMu.Lock()
 	defer g.authMu.Unlock()
-	if gen != g.authGen {
+	if previousGen != g.authGen {
 		return
 	}
+	// Publishing a successfully resolved credential starts a new lineage.
+	// Outcomes from clients built before this swap are stale and
+	// noteAuthRefresh drops them by generation. A classified store failure
+	// returns above without invalidating the client that remains in use.
+	g.authGen = gen
 	previousStoreFP := g.authStoreFP
 	g.cliProfileAPIKey = ""
 	g.authStoreFP = ""
@@ -2156,6 +2179,30 @@ func (g *Gateway) tripFallback(name string) {
 	g.fallbackUntil[name] = time.Now().Add(fallbackCooldown)
 }
 
+const authUnavailableFallbackHeader = "X-Baseten-Switch-Fallback"
+
+// noteAuthUnavailableFallback marks a response served by a configured native
+// fallback because the Baseten primary had no usable credential. This remains
+// an allowed fallback, but callers and local operators can now distinguish it
+// from a response served by the configured primary.
+func (g *Gateway) noteAuthUnavailableFallback(
+	w http.ResponseWriter,
+	cl *clientListener,
+	at upstreamAttempt,
+) {
+	if at.fallbackTrigger != fallbackTriggerAuthUnavailable {
+		return
+	}
+	g.authUnavailableFallbackMu.Lock()
+	now := time.Now().UTC()
+	g.authUnavailableFallbackCount++
+	g.authUnavailableFallbackAt = now
+	g.authUnavailableFallbackClient = cl.cfg.Name
+	g.authUnavailableFallbackRoute = at.route
+	g.authUnavailableFallbackMu.Unlock()
+	w.Header().Set(authUnavailableFallbackHeader, fallbackTriggerAuthUnavailable)
+}
+
 // errNeedsLogin marks an attempt whose route has no usable credentials
 // (baseten without a CLI login or API-key fallback).
 var errNeedsLogin = errors.New("baseten route needs login")
@@ -3348,6 +3395,8 @@ attemptLoop:
 		break
 	}
 	res := at.res
+	resp.Header.Del(authUnavailableFallbackHeader)
+	g.noteAuthUnavailableFallback(w, cl, at)
 	defer resp.Body.Close()
 
 	if at.translate {

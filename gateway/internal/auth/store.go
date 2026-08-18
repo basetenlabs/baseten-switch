@@ -22,12 +22,43 @@ var (
 	errNoLocator       = errors.New("baseten-switch: no save locator (cannot persist credential)")
 	errKeyringNotFound = errors.New("keyring: not found")
 
+	// LoadDetailed exposes filesystem and JSON failures that Load preserves as
+	// the historical signed-out result.
+	ErrStoreUnreadable = errors.New("baseten-switch: credential store unreadable")
+	ErrStoreMalformed  = errors.New("baseten-switch: credential store malformed")
+
 	// ErrAPIKeyProfile is the sentinel matched by errors.Is when the
 	// resolved profile authenticates with an API key rather than OAuth.
 	// The concrete error is *APIKeyProfileError, which carries the
 	// resolved profile name and (when readable) the key itself.
 	ErrAPIKeyProfile = errors.New("baseten-switch: profile uses api_key auth (not OAuth)")
 )
+
+// StoreLoadError describes a local store read or parse failure. It never
+// contains credential values.
+type StoreLoadError struct {
+	Reason error
+	Path   string
+	Err    error
+}
+
+func (e *StoreLoadError) Error() string {
+	switch e.Reason {
+	case ErrStoreUnreadable:
+		return fmt.Sprintf("baseten-switch: cannot read credential store %q: %v", e.Path, e.Err)
+	case ErrStoreMalformed:
+		return fmt.Sprintf("baseten-switch: cannot parse credential store %q: %v", e.Path, e.Err)
+	default:
+		return "baseten-switch: credential store load failed"
+	}
+}
+
+// Is lets callers classify the failure without parsing its text.
+func (e *StoreLoadError) Is(target error) bool { return target == e.Reason }
+
+// Unwrap retains the underlying filesystem, JSON, or keyring error when one
+// exists.
+func (e *StoreLoadError) Unwrap() error { return e.Err }
 
 // APIKeyProfileError reports that the resolved profile's auth_type is
 // "api_key". It is a distinct signed-in state, not "not signed in":
@@ -149,6 +180,38 @@ func storedCredentialToToken(s *storedOAuthCredential) *StoredToken {
 // auth_type is "api_key" it returns (nil, nil, *APIKeyProfileError) so
 // callers can distinguish "signed in with API key" from "not signed in".
 func Load(profile string) (*StoredToken, *SaveLocator, error) {
+	tok, loc, err := LoadDetailed(profile)
+	var storeErr *StoreLoadError
+	if errors.As(err, &storeErr) {
+		return nil, nil, nil
+	}
+	return tok, loc, err
+}
+
+// CheckStore validates only the auth.json file. It does not resolve a profile
+// or access the keyring, so startup diagnostics can retry a transient file
+// failure without performing credential resolution twice.
+func CheckStore() error {
+	path := ProfilePath()
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return &StoreLoadError{Reason: ErrStoreUnreadable, Path: path, Err: err}
+	}
+	var store credentialStoreFile
+	if err := json.Unmarshal(data, &store); err != nil {
+		return &StoreLoadError{Reason: ErrStoreMalformed, Path: path, Err: err}
+	}
+	return nil
+}
+
+// LoadDetailed resolves a credential using the same precedence and keyring
+// fallback as Load, but returns a typed *StoreLoadError when auth.json exists
+// but cannot be read or parsed. Missing stores and profiles remain ordinary
+// signed-out states. API-key profiles still return *APIKeyProfileError.
+func LoadDetailed(profile string) (*StoredToken, *SaveLocator, error) {
 	path := ProfilePath()
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -157,10 +220,72 @@ func Load(profile string) (*StoredToken, *SaveLocator, error) {
 		if tok, loc := loadKeyringCredential(profile); tok != nil {
 			return tok, loc, nil
 		}
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil, nil
+		}
+		return nil, nil, &StoreLoadError{
+			Reason: ErrStoreUnreadable,
+			Path:   path,
+			Err:    err,
+		}
+	}
+
+	var af credentialStoreFile
+	if err := json.Unmarshal(data, &af); err != nil {
+		return nil, nil, &StoreLoadError{
+			Reason: ErrStoreMalformed,
+			Path:   path,
+			Err:    err,
+		}
+	}
+	name := profile
+	if name == "" {
+		name = af.Current
+	}
+	if name == "" || af.Profiles == nil {
 		return nil, nil, nil
 	}
-	if tok, loc, err, ok := loadCredentialProfile(data, profile); ok {
-		return tok, loc, err
+	p, ok := af.Profiles[name]
+	if !ok {
+		return nil, nil, nil
+	}
+
+	// api_key-type profile: a distinct signed-in state, not an OAuth
+	// credential. Surface the key when it is readable (plaintext auth.json
+	// first, then the keyring entry).
+	if p.AuthType == "api_key" {
+		key := p.InsecureAPIKey
+		if key == "" {
+			if value, err := keyringGet(keyringService, name); err == nil {
+				key = extractAPIKey(value)
+			}
+		}
+		return nil, nil, &APIKeyProfileError{Profile: name, Key: key}
+	}
+
+	remote := strings.TrimRight(p.RemoteURL, "/")
+	// Keyring first.
+	if value, err := keyringGet(keyringService, name); err == nil {
+		var s storedOAuthCredential
+		if err := json.Unmarshal([]byte(value), &s); err == nil && s.AccessToken != "" {
+			tok := storedCredentialToToken(&s)
+			tok.RemoteURL = remote
+			return tok, &SaveLocator{
+				Service: keyringService,
+				Account: name,
+				Source:  "keyring",
+			}, nil
+		}
+	}
+	// Plaintext fallback in auth.json.
+	if p.InsecureOAuthCredential != nil && p.InsecureOAuthCredential.AccessToken != "" {
+		tok := storedCredentialToToken(p.InsecureOAuthCredential)
+		tok.RemoteURL = remote
+		return tok, &SaveLocator{
+			Service: keyringService,
+			Account: name,
+			Source:  "auth-file",
+		}, nil
 	}
 	return nil, nil, nil
 }
@@ -184,67 +309,6 @@ func loadKeyringCredential(profile string) (*StoredToken, *SaveLocator) {
 		Account: profile,
 		Source:  "keyring",
 	}
-}
-
-// loadCredentialProfile resolves a credential from the current auth.json
-// shape. The final bool reports whether the file resolved to a profile, with
-// either a token or a typed error.
-func loadCredentialProfile(data []byte, profile string) (*StoredToken, *SaveLocator, error, bool) {
-	var af credentialStoreFile
-	if err := json.Unmarshal(data, &af); err != nil {
-		return nil, nil, nil, false
-	}
-	if af.Profiles == nil {
-		return nil, nil, nil, false
-	}
-	name := profile
-	if name == "" {
-		name = af.Current
-	}
-	if name == "" {
-		return nil, nil, nil, false
-	}
-	p, ok := af.Profiles[name]
-	if !ok {
-		return nil, nil, nil, false
-	}
-	// api_key-type profile: a distinct signed-in state, not an OAuth
-	// credential. Surface the key when it is readable (plaintext
-	// auth.json first, then the keyring entry).
-	if p.AuthType == "api_key" {
-		key := p.InsecureAPIKey
-		if key == "" {
-			if v, err := keyringGet(keyringService, name); err == nil {
-				key = extractAPIKey(v)
-			}
-		}
-		return nil, nil, &APIKeyProfileError{Profile: name, Key: key}, true
-	}
-	remote := strings.TrimRight(p.RemoteURL, "/")
-	// Keyring first.
-	if v, err := keyringGet(keyringService, name); err == nil {
-		var s storedOAuthCredential
-		if json.Unmarshal([]byte(v), &s) == nil && s.AccessToken != "" {
-			tok := storedCredentialToToken(&s)
-			tok.RemoteURL = remote
-			return tok, &SaveLocator{
-				Service: keyringService,
-				Account: name,
-				Source:  "keyring",
-			}, nil, true
-		}
-	}
-	// Plaintext fallback in auth.json.
-	if p.InsecureOAuthCredential != nil && p.InsecureOAuthCredential.AccessToken != "" {
-		tok := storedCredentialToToken(p.InsecureOAuthCredential)
-		tok.RemoteURL = remote
-		return tok, &SaveLocator{
-			Service: keyringService,
-			Account: name,
-			Source:  "auth-file",
-		}, nil, true
-	}
-	return nil, nil, nil, false
 }
 
 // extractAPIKey interprets a keyring value stored for an api_key-type

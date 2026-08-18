@@ -141,6 +141,15 @@ func HTTPClientWithNotify(ctx context.Context, profile string, host string, noti
 	return httpClient(ctx, profile, host, false, notify)
 }
 
+// HTTPClientWithNotifyDetailed is the gateway reload variant of
+// HTTPClientWithNotify. It preserves StoreLoadError so the gateway can keep a
+// previously loaded credential through a transient auth.json read or parse
+// failure. The legacy client builders continue to preserve their historical
+// signed-out behavior for the same failures.
+func HTTPClientWithNotifyDetailed(ctx context.Context, profile string, host string, notify func(fp string, err error)) (client *http.Client, tick func() error, credFP string, err error) {
+	return httpClientWithLoader(ctx, profile, host, false, notify, LoadDetailed)
+}
+
 // RefreshErrorCode classifies a token-refresh error: it returns RFC 6749's
 // error code (e.g. "invalid_grant") when err came from the token endpoint
 // rejecting the grant, "http_<status>" for a token-endpoint response with
@@ -161,7 +170,18 @@ func RefreshErrorCode(err error) string {
 }
 
 func httpClient(ctx context.Context, profile string, host string, forceRefresh bool, notify func(fp string, err error)) (*http.Client, func() error, string, error) {
-	stored, loc, err := Load(profile)
+	return httpClientWithLoader(ctx, profile, host, forceRefresh, notify, Load)
+}
+
+func httpClientWithLoader(
+	ctx context.Context,
+	profile string,
+	host string,
+	forceRefresh bool,
+	notify func(fp string, err error),
+	load func(string) (*StoredToken, *SaveLocator, error),
+) (*http.Client, func() error, string, error) {
+	stored, loc, err := load(profile)
 	if err != nil {
 		return nil, nil, "", err
 	}

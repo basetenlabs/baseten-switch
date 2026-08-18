@@ -3,9 +3,11 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,6 +15,33 @@ import (
 
 	"golang.org/x/oauth2"
 )
+
+func TestHTTPClientWithNotifyDetailedPreservesStoreErrors(t *testing.T) {
+	path := setAuthFile(t, t.TempDir())
+	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, _, err := HTTPClientWithNotifyDetailed(
+		context.Background(),
+		"p",
+		"https://api.baseten.co",
+		func(string, error) {},
+	)
+	if !errors.Is(err, ErrStoreMalformed) {
+		t.Fatalf("HTTPClientWithNotifyDetailed error = %v, want ErrStoreMalformed", err)
+	}
+
+	_, _, _, err = HTTPClientWithNotify(
+		context.Background(),
+		"p",
+		"https://api.baseten.co",
+		func(string, error) {},
+	)
+	if !errors.Is(err, ErrNotSignedIn) {
+		t.Fatalf("legacy HTTPClientWithNotify error = %v, want ErrNotSignedIn", err)
+	}
+}
 
 // refreshRecorder is an httptest server that counts POSTs to the token
 // endpoint and returns a fresh access token.

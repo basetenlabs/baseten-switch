@@ -554,6 +554,7 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	signedIn, authType, fallbackInUse := g.authState()
 	ah := g.authHealth()
+	authUnavailableFallback := g.authUnavailableFallbackStatus()
 	writeJSON(w, 200, map[string]any{
 		"router_pid":          os.Getpid(),
 		"router_boot_id":      state.bootID,
@@ -589,8 +590,24 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 			"fallback_enabled":      runtimeCfg.APIKeyFallback,
 			"fallback_in_use":       fallbackInUse,
 		},
-		"clients": clients,
+		"auth_unavailable_fallback": authUnavailableFallback,
+		"clients":                   clients,
 	})
+}
+
+func (g *Gateway) authUnavailableFallbackStatus() map[string]any {
+	g.authUnavailableFallbackMu.RLock()
+	count := g.authUnavailableFallbackCount
+	lastAt := g.authUnavailableFallbackAt
+	lastClient := g.authUnavailableFallbackClient
+	lastRoute := g.authUnavailableFallbackRoute
+	g.authUnavailableFallbackMu.RUnlock()
+	return map[string]any{
+		"count":       count,
+		"last_at":     rfc3339OrEmpty(lastAt),
+		"last_client": lastClient,
+		"last_route":  lastRoute,
+	}
 }
 
 // modelCatalogHealthJSON reports the active normalized catalog for each

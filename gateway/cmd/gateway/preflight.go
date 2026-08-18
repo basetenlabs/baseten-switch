@@ -79,11 +79,11 @@ func basetenRoutedClients(resolved []resolvedClientConfig) []string {
 }
 
 // hasBasetenCredential reports whether any Baseten credential is
-// available: a non-empty API key, an OAuth credential loadable from the
-// baseten CLI store, or an api_key-type CLI profile whose key is
-// readable.
-func hasBasetenCredential(profile, apiKey string) bool {
-	if apiKey != "" {
+// available: an enabled, non-empty environment fallback key; an OAuth
+// credential loadable from the baseten CLI store; or an api_key-type CLI
+// profile whose key is readable.
+func hasBasetenCredential(profile, apiKey string, apiKeyFallback bool) bool {
+	if apiKeyFallback && apiKey != "" {
 		return true
 	}
 	tok, _, err := auth.Load(profile)
@@ -99,20 +99,25 @@ func hasBasetenCredential(profile, apiKey string) bool {
 
 // warnMissingBasetenCreds prints a prominent banner naming the affected
 // clients and the fix. Warn-only.
-func warnMissingBasetenCreds(names []string, out io.Writer) {
+func warnMissingBasetenCreds(names []string, apiKeyIgnored bool, out io.Writer) {
 	if len(names) == 0 {
 		return
 	}
 	rule := "[gateway] =============================================================="
 	fmt.Fprintln(out, rule)
-	fmt.Fprintln(out, "[gateway] WARNING: no Baseten credential found (no OAuth login and no")
-	fmt.Fprintln(out, "[gateway] API key). These clients route to baseten and their requests")
-	fmt.Fprintln(out, "[gateway] will fail until a credential is configured:")
+	fmt.Fprintln(out, "[gateway] WARNING: no Baseten credential found that the router can use.")
+	fmt.Fprintln(out, "[gateway] These clients")
+	fmt.Fprintln(out, "[gateway] cannot use Baseten until a credential is configured;")
+	fmt.Fprintln(out, "[gateway] a configured native fallback may serve their requests instead:")
 	for _, n := range names {
 		fmt.Fprintf(out, "[gateway]   - %s\n", n)
 	}
-	fmt.Fprintln(out, "[gateway] Fix: run 'baseten auth login', or set BASETEN_API_KEY in")
-	fmt.Fprintf(out, "[gateway] %s (or via global.auth.baseten in gateway.yaml).\n", config.EnvFilePath())
+	if apiKeyIgnored {
+		fmt.Fprintln(out, "[gateway] BASETEN_API_KEY is set but ignored because")
+		fmt.Fprintln(out, "[gateway] BASETEN_SWITCH_API_KEY_FALLBACK is not enabled.")
+	}
+	fmt.Fprintln(out, "[gateway] Fix: run 'baseten auth login', or set BASETEN_API_KEY and")
+	fmt.Fprintf(out, "[gateway] BASETEN_SWITCH_API_KEY_FALLBACK=1 in %s.\n", config.EnvFilePath())
 	fmt.Fprintln(out, rule)
 }
 
@@ -127,8 +132,8 @@ func runPreflight(cfg *Config, resolved []resolvedClientConfig, out io.Writer) {
 	if len(names) == 0 {
 		return
 	}
-	if hasBasetenCredential(cfg.OAuthProfile, cfg.BasetenKey) {
+	if hasBasetenCredential(cfg.OAuthProfile, cfg.BasetenKey, cfg.APIKeyFallback) {
 		return
 	}
-	warnMissingBasetenCreds(names, out)
+	warnMissingBasetenCreds(names, cfg.BasetenKey != "" && !cfg.APIKeyFallback, out)
 }

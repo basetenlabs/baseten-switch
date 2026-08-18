@@ -422,3 +422,112 @@ func TestAdminAuthReloadClearsTransientHealthAcrossLogoutAndLogin(t *testing.T) 
 		t.Fatalf("replacement login retained transient health: %+v", health)
 	}
 }
+
+func TestAdminAuthReloadPreservesHealthyCredentialOnStoreFailure(t *testing.T) {
+	tests := []struct {
+		name       string
+		mutate     func(*testing.T, string)
+		wantReason string
+	}{
+		{
+			name: "malformed",
+			mutate: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantReason: "credential store malformed",
+		},
+		{
+			name: "unreadable",
+			mutate: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantReason: "credential store unreadable",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig(t, "http://baseten.invalid", "http://anthropic.invalid")
+			cfg.OAuthProfile = "p"
+			cfg.APIKeyFallback = false
+			cfg.BasetenKey = ""
+			g := newAuthReloadTestGateway(t, cfg)
+			writeOAuthProfileWithAccessToken(t, "http://baseten.invalid", "synthetic-access", "synthetic-refresh")
+			if recorder := authReloadRequest(t, g, http.MethodPost, nil); recorder.Code != http.StatusOK {
+				t.Fatalf("initial reload status = %d", recorder.Code)
+			}
+
+			g.authMu.Lock()
+			previousClient := g.oauthClient
+			previousStoreFP := g.authStoreFP
+			previousCredFP := g.authCredFP
+			previousGen := g.authGen
+			g.authMu.Unlock()
+			if previousClient == nil {
+				t.Fatal("initial reload did not publish OAuth client")
+			}
+
+			path := os.Getenv("BASETEN_SWITCH_AUTH_FILE")
+			tc.mutate(t, path)
+
+			stderrReader, stderrWriter, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldStderr := os.Stderr
+			os.Stderr = stderrWriter
+			defer func() {
+				os.Stderr = oldStderr
+				_ = stderrWriter.Close()
+				_ = stderrReader.Close()
+			}()
+
+			recorder := authReloadRequest(t, g, http.MethodPost, nil)
+			os.Stderr = oldStderr
+			if err := stderrWriter.Close(); err != nil {
+				t.Fatal(err)
+			}
+			stderr, err := io.ReadAll(stderrReader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(stderr), tc.wantReason) ||
+				!strings.Contains(string(stderr), "preserving current auth") {
+				t.Fatalf("stderr = %q, want classified preservation log", stderr)
+			}
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("failed-store reload status = %d, want 200; body = %s", recorder.Code, recorder.Body.String())
+			}
+			response := decodeAuthAdminResponse(t, recorder)
+			if response["signed_in"] != true || response["auth_type"] != "oauth" || response["health"] != "ok" {
+				t.Fatalf("failed-store reload response = %+v", response)
+			}
+
+			g.authMu.Lock()
+			defer g.authMu.Unlock()
+			if g.oauthClient != previousClient ||
+				g.authStoreFP != previousStoreFP ||
+				g.authCredFP != previousCredFP ||
+				g.authGen != previousGen {
+				t.Fatalf(
+					"auth snapshot changed on store failure: client_same=%t store_fp_same=%t cred_fp_same=%t gen=%d want=%d",
+					g.oauthClient == previousClient,
+					g.authStoreFP == previousStoreFP,
+					g.authCredFP == previousCredFP,
+					g.authGen,
+					previousGen,
+				)
+			}
+		})
+	}
+}

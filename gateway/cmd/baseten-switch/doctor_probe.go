@@ -17,10 +17,11 @@ type doctorProbeTarget struct {
 }
 
 type doctorProbeResult struct {
-	Status    int
-	LatencyMs int64
-	Model     string
-	Error     string
+	Status          int
+	LatencyMs       int64
+	Model           string
+	Error           string
+	FallbackTrigger string
 
 	// DoorVia is the X-Baseten-Switch-Door response header: "router" when the
 	// router answered and "fallback" when the door's native failover
@@ -71,10 +72,16 @@ func doctorProbeClient(c *http.Client, target doctorProbeTarget) *doctorProbeRes
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
+	doorVia := resp.Header.Get("X-Baseten-Switch-Door")
+	fallbackTrigger := ""
+	if doorVia == "router" {
+		fallbackTrigger = resp.Header.Get("X-Baseten-Switch-Fallback")
+	}
 	result := &doctorProbeResult{
-		Status:    resp.StatusCode,
-		LatencyMs: latency,
-		DoorVia:   resp.Header.Get("X-Baseten-Switch-Door"),
+		Status:          resp.StatusCode,
+		LatencyMs:       latency,
+		DoorVia:         doorVia,
+		FallbackTrigger: fallbackTrigger,
 	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		var payload struct {
