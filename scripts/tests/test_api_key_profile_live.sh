@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Opt-in live contract for a Baseten CLI API-key profile.
 #
-# This script creates all credentials and runtime state under one temporary
-# directory. It never starts, stops, or reconfigures an installed Switch.
+# This script creates runtime state under one temporary directory. Its optional
+# macOS Keychain mode creates one uniquely named credential and removes it
+# before exit. It never starts, stops, or reconfigures an installed Switch.
 
 set -euo pipefail
 
@@ -13,6 +14,7 @@ if [[ "${1:-}" == "--dry-run" ]]; then
     printf '%s\n' \
         "api-key profile live contract: dry run" \
         "would create an isolated Baseten CLI profile and Switch runtime" \
+        "would use a uniquely named temporary Keychain entry when requested" \
         "would test /v1/models and one minimal inference through a scratch door" \
         "would scan scratch output for credential disclosure before cleanup"
     exit 0
@@ -32,10 +34,40 @@ for command_name in baseten curl go lsof; do
         || fail "required command is unavailable: $command_name"
 done
 
+use_keyring="${BASETEN_SWITCH_TEST_USE_KEYRING:-0}"
+read_key_stdin="${BASETEN_SWITCH_TEST_API_KEY_STDIN:-0}"
+unset BASETEN_SWITCH_TEST_USE_KEYRING BASETEN_SWITCH_TEST_API_KEY_STDIN
+case "$use_keyring" in
+    0|1) ;;
+    *) fail "BASETEN_SWITCH_TEST_USE_KEYRING must be 0 or 1" ;;
+esac
+case "$read_key_stdin" in
+    0|1) ;;
+    *) fail "BASETEN_SWITCH_TEST_API_KEY_STDIN must be 0 or 1" ;;
+esac
+if [[ "$use_keyring" == 1 ]]; then
+    [[ "$(uname -s)" == "Darwin" ]] \
+        || fail "the keyring live contract currently requires macOS"
+    command -v security >/dev/null 2>&1 \
+        || fail "required command is unavailable: security"
+    keychain_home="${HOME:-}"
+    [[ -n "$keychain_home" ]] \
+        || fail "HOME must be set for the keyring live contract"
+fi
+
 api_key="${BASETEN_SWITCH_TEST_API_KEY:-}"
 unset BASETEN_SWITCH_TEST_API_KEY
+if [[ "$read_key_stdin" == 1 ]]; then
+    [[ -z "$api_key" ]] \
+        || fail "choose stdin or BASETEN_SWITCH_TEST_API_KEY, not both"
+    IFS= read -r api_key \
+        || fail "could not read the test key from stdin"
+    if IFS= read -r extra_input && [[ -n "$extra_input" ]]; then
+        fail "stdin must contain exactly one API-key line"
+    fi
+fi
 [[ -n "$api_key" ]] \
-    || fail "BASETEN_SWITCH_TEST_API_KEY must contain an inference-capable test key"
+    || fail "an inference-capable test key is required"
 
 model="${BASETEN_SWITCH_TEST_MODEL:-zai-org/GLM-5.2}"
 if [[ "$model" != */* || ! "$model" =~ ^[A-Za-z0-9._/-]+$ ]]; then
@@ -50,6 +82,19 @@ scratch_dir="$(mktemp -d "$scratch_parent/baseten-switch-api-key-live.XXXXXX")"
 chmod 700 "$scratch_dir"
 
 profile="switch-api-key-test"
+auth_no_keyring="1"
+credential_home="$scratch_dir/home"
+if [[ "$use_keyring" == 1 ]]; then
+    profile="switch-api-key-test-keyring-$$"
+    auth_no_keyring=""
+    # macOS resolves the login Keychain from the real user home. Keep Baseten
+    # configuration isolated below while allowing native Keychain access.
+    credential_home="$keychain_home"
+fi
+login_args=(auth login --with-api-key --profile "$profile" --no-switch --output none)
+if [[ "$use_keyring" == 0 ]]; then
+    login_args+=(--insecure-storage)
+fi
 baseten_config_dir="$scratch_dir/baseten"
 auth_file="$baseten_config_dir/auth.json"
 switch_dir="$scratch_dir/switch"
@@ -70,14 +115,21 @@ chmod 700 "$baseten_config_dir" "$switch_dir" "$output_dir" "$telemetry_dir"
 chmod 600 "$env_file"
 
 pids=()
+keyring_profile_owned=0
 scan_for_key() {
     local found=""
     [[ -d "$scratch_dir" && -n "$api_key" ]] || return 0
     found="$({
-        find "$scratch_dir" -type f \
-            ! -path "$auth_file" \
-            ! -path "$binary" \
-            -exec grep -Fl -- "$api_key" {} + 2>/dev/null || true
+        if [[ "$use_keyring" == 1 ]]; then
+            find "$scratch_dir" -type f \
+                ! -path "$binary" \
+                -exec grep -Fl -- "$api_key" {} + 2>/dev/null || true
+        else
+            find "$scratch_dir" -type f \
+                ! -path "$auth_file" \
+                ! -path "$binary" \
+                -exec grep -Fl -- "$api_key" {} + 2>/dev/null || true
+        fi
     } | head -1)"
     [[ -z "$found" ]]
 }
@@ -93,6 +145,25 @@ cleanup() {
             wait "$pid" 2>/dev/null || true
         fi
     done
+    if [[ "$use_keyring" == 1 && "$keyring_profile_owned" == 1 ]]; then
+        if [[ -f "$auth_file" ]]; then
+            if ! env HOME="$credential_home" BASETEN_CONFIG_DIR="$baseten_config_dir" \
+                baseten auth logout --profile "$profile" --output none \
+                > "$output_dir/logout.out" 2>&1; then
+                printf '%s\n' \
+                    "api-key profile live contract: Baseten CLI could not remove the temporary keyring profile" >&2
+                status=1
+            fi
+        fi
+        if security find-generic-password -s baseten-profile -a "$profile" \
+            >/dev/null 2>&1; then
+            security delete-generic-password -s baseten-profile -a "$profile" \
+                >/dev/null 2>&1 || true
+            printf '%s\n' \
+                "api-key profile live contract: temporary keyring entry survived normal logout" >&2
+            status=1
+        fi
+    fi
     if ! scan_for_key; then
         printf '%s\n' \
             "api-key profile live contract: test key appeared outside the temporary credential file" >&2
@@ -161,21 +232,33 @@ if [[ -z "${BASETEN_SWITCH_TEST_BINARY:-}" ]]; then
 fi
 [[ -x "$binary" ]] || fail "test binary is not executable"
 
-# The API key travels over stdin. The CLI stores it only in the isolated,
-# insecure-storage auth.json that cleanup removes.
+if [[ "$use_keyring" == 1 ]] && security find-generic-password \
+    -s baseten-profile -a "$profile" >/dev/null 2>&1; then
+    fail "refusing to overwrite an existing keyring profile"
+fi
+
+# The API key travels over stdin. The default test mode stores it only in the
+# isolated auth.json. The keyring mode omits --insecure-storage and cleanup
+# removes the exact temporary profile from the macOS Keychain.
+if [[ "$use_keyring" == 1 ]]; then
+    keyring_profile_owned=1
+fi
 printf '%s\n' "$api_key" |
-    env HOME="$scratch_dir/home" \
+    env HOME="$credential_home" \
         BASETEN_CONFIG_DIR="$baseten_config_dir" \
         BASETEN_REMOTE_URL="https://app.baseten.co" \
-        baseten auth login \
-            --with-api-key \
-            --profile "$profile" \
-            --insecure-storage \
-            --output none \
+        baseten "${login_args[@]}" \
             > "$output_dir/login.out" 2>&1 \
     || fail "Baseten CLI API-key login failed"
 
 [[ -f "$auth_file" ]] || fail "Baseten CLI did not create the isolated credential file"
+if [[ "$use_keyring" == 1 ]] && grep -Fq -- "$api_key" "$auth_file"; then
+    fail "Baseten CLI wrote the API key to auth.json in keyring mode"
+fi
+if [[ "$use_keyring" == 1 ]] && ! security find-generic-password \
+    -s baseten-profile -a "$profile" >/dev/null 2>&1; then
+    fail "Baseten CLI did not create the expected keyring entry"
+fi
 
 cat > "$config_path" <<EOF
 global:
@@ -198,12 +281,12 @@ EOF
 chmod 600 "$config_path"
 
 switch_env=(
-    "HOME=$scratch_dir/home"
+    "HOME=$credential_home"
     "BASETEN_CONFIG_DIR=$baseten_config_dir"
     "BASETEN_REMOTE_URL=https://api.baseten.co"
     "BASETEN_BASE_URL=https://inference.baseten.co"
     "BASETEN_SWITCH_AUTH_FILE="
-    "BASETEN_SWITCH_AUTH_NO_KEYRING=1"
+    "BASETEN_SWITCH_AUTH_NO_KEYRING=$auth_no_keyring"
     "BASETEN_SWITCH_OAUTH_PROFILE=$profile"
     "BASETEN_SWITCH_CONFIG_PATH=$config_path"
     "BASETEN_SWITCH_ENV_FILE=$env_file"
@@ -264,7 +347,7 @@ grep -Eq '"signed_in"[[:space:]]*:[[:space:]]*true' \
 grep -Eq '"auth_type"[[:space:]]*:[[:space:]]*"api_key"' \
     "$output_dir/auth-status.json" \
     || fail "admin auth status did not report API-key authentication"
-grep -Eq '"profile"[[:space:]]*:[[:space:]]*"switch-api-key-test"' \
+grep -Eq '"profile"[[:space:]]*:[[:space:]]*"'"$profile"'"' \
     "$output_dir/auth-status.json" \
     || fail "admin auth status did not report the isolated profile"
 grep -Eq '"health"[[:space:]]*:[[:space:]]*"ok"' \
