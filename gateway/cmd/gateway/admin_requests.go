@@ -38,6 +38,7 @@ type adminRequestRow struct {
 	TTFTMS               *int64                      `json:"ttft_ms"`
 	Subagent             bool                        `json:"subagent"`
 	Fallback             telemetry.FallbackV1        `json:"fallback"`
+	Primary              *telemetry.PrimaryV1        `json:"primary,omitempty"`
 }
 
 type adminRequestsCoverage struct {
@@ -182,6 +183,7 @@ func projectAdminRequest(event telemetry.EventV1) adminRequestRow {
 		TTFTMS:               event.TTFTMS,
 		Subagent:             event.Subagent,
 		Fallback:             event.Fallback,
+		Primary:              clonePrimaryV1(event.Primary),
 	}
 }
 

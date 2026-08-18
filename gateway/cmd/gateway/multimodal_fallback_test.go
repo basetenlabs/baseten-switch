@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/basetenlabs/baseten-switch/gateway/internal/telemetry"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/upstreamerror"
 )
 
@@ -134,6 +135,14 @@ func TestImageTranslationErrorUsesNativeFallback(t *testing.T) {
 			got,
 			fallbackTriggerImageUnsupported,
 		)
+	}
+	if primary := rows[0].Primary; primary == nil ||
+		primary.Provider != "baseten" ||
+		primary.Model != reasoningNeutralBasetenModel ||
+		primary.Attempted ||
+		primary.Outcome != telemetry.PrimaryOutcomeImageInputUnsupported ||
+		primary.Status != nil {
+		t.Fatalf("preflight image primary = %+v", primary)
 	}
 }
 
@@ -297,6 +306,14 @@ func TestReactiveImage400FallbackMessages(t *testing.T) {
 			rows[0].Fallback.Trigger,
 			fallbackTriggerImageUnsupported,
 		)
+	}
+	if primary := rows[0].Primary; primary == nil ||
+		primary.Provider != "baseten" ||
+		primary.Model != reasoningNeutralBasetenModel ||
+		!primary.Attempted ||
+		primary.Outcome != telemetry.PrimaryOutcomeImageInputUnsupported ||
+		primary.Status == nil || *primary.Status != http.StatusBadRequest {
+		t.Fatalf("reactive image primary = %+v", primary)
 	}
 
 	textBody := []byte(`{
