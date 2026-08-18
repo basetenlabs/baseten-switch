@@ -64,6 +64,45 @@ struct RequestFallback: Decodable, Equatable, Sendable {
     }
 }
 
+struct RequestPrimaryAttempt: Decodable, Equatable, Sendable {
+    var provider: String
+    var model: String
+    var attempted: Bool
+    var outcome: String
+    var status: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case provider
+        case model
+        case attempted
+        case outcome
+        case status
+    }
+
+    init(
+        provider: String,
+        model: String,
+        attempted: Bool,
+        outcome: String,
+        status: Int? = nil
+    ) {
+        self.provider = provider
+        self.model = model
+        self.attempted = attempted
+        self.outcome = outcome
+        self.status = status
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try values.decode(String.self, forKey: .provider)
+        model = try values.decode(String.self, forKey: .model)
+        attempted = try values.decode(Bool.self, forKey: .attempted)
+        outcome = try values.decode(String.self, forKey: .outcome)
+        status = try values.decodeIfPresent(Int.self, forKey: .status)
+    }
+}
+
 struct RequestItem: Decodable, Equatable, Identifiable, Sendable {
     var eventID: String
     var completedAt: Date
@@ -77,6 +116,7 @@ struct RequestItem: Decodable, Equatable, Identifiable, Sendable {
     var terminationReason: String?
     var subagent: Bool
     var fallback: RequestFallback?
+    var primary: RequestPrimaryAttempt?
 
     var id: String { eventID }
 
@@ -110,6 +150,7 @@ struct RequestItem: Decodable, Equatable, Identifiable, Sendable {
         case terminationReason = "termination_reason"
         case subagent
         case fallback
+        case primary
     }
 
     init(
@@ -124,7 +165,8 @@ struct RequestItem: Decodable, Equatable, Identifiable, Sendable {
         durationMs: Int64?,
         terminationReason: String?,
         subagent: Bool,
-        fallback: RequestFallback?
+        fallback: RequestFallback?,
+        primary: RequestPrimaryAttempt? = nil
     ) {
         self.eventID = eventID
         self.completedAt = completedAt
@@ -138,6 +180,7 @@ struct RequestItem: Decodable, Equatable, Identifiable, Sendable {
         self.terminationReason = terminationReason
         self.subagent = subagent
         self.fallback = fallback
+        self.primary = primary
     }
 
     init(from decoder: Decoder) throws {
@@ -168,6 +211,9 @@ struct RequestItem: Decodable, Equatable, Identifiable, Sendable {
         fallback = try values.decodeIfPresent(
             RequestFallback.self,
             forKey: .fallback)
+        primary = try values.decodeIfPresent(
+            RequestPrimaryAttempt.self,
+            forKey: .primary)
     }
 }
 
@@ -207,6 +253,8 @@ func requestFallbackLabel(_ trigger: String?) -> String {
         return "Authentication unavailable"
     case "reasoning_policy_error":
         return "Reasoning policy error"
+    case "request_build_error":
+        return "Request setup failed"
     case "transport_error":
         return "Transport error"
     case "cooldown":

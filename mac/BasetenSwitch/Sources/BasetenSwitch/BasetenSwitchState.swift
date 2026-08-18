@@ -105,6 +105,7 @@ final class BasetenSwitchState: ObservableObject {
     @Published private(set) var mutationRecoveryState: MutationRecoveryState
 
     private let reader: any AdminStatusReading
+    private let authReloader: any AuthReloading
     private let modelCatalogReader: any ModelCatalogReading
     private let reasoningPreflightReader: any ReasoningPreflightReading
     private let cliRunner: any CLIRunning
@@ -117,8 +118,12 @@ final class BasetenSwitchState: ObservableObject {
     private var reconcileTimers: [String: Task<Void, Never>] = [:]
     private var interactiveRefreshTask: Task<Void, Never>?
     private var interactiveStatsRequested = false
+    private var clientPageRefreshTask: Task<Void, Never>?
+    private var clientPageRefreshPending = false
     private var modelCatalogTask: Task<Void, Never>?
     private var modelCatalogGeneration: UInt64 = 0
+    private var refreshingModelCatalog: [LiveModelCatalogEntry]?
+    private var automaticCatalogRecoveryGeneration: UInt64?
     private var mutationRecoveryTask: Task<Void, Never>?
     private var mutationRecoveryKey: MutationRecoveryKey?
     private var unsupportedRecoveryRuntime: String?
@@ -150,6 +155,7 @@ final class BasetenSwitchState: ObservableObject {
 
     init(variant: AppVariant = .current(),
          reader: (any AdminStatusReading)? = nil,
+         authReloader: (any AuthReloading)? = nil,
          modelCatalogReader: (any ModelCatalogReading)? = nil,
          reasoningPreflightReader: (any ReasoningPreflightReading)? = nil,
          cliRunner: any CLIRunning = SystemCLIRunner(),
@@ -163,6 +169,7 @@ final class BasetenSwitchState: ObservableObject {
         self.variant = variant
         let apiClient = GatewayAPIClient(runtime: variant.runtime)
         self.reader = reader ?? apiClient
+        self.authReloader = authReloader ?? apiClient
         self.modelCatalogReader = modelCatalogReader ?? apiClient
         self.reasoningPreflightReader = reasoningPreflightReader ?? apiClient
         self.cliRunner = cliRunner
@@ -215,6 +222,7 @@ final class BasetenSwitchState: ObservableObject {
         self.variant = variant
         let reader = GatewayAPIClient(runtime: variant.runtime)
         self.reader = reader
+        authReloader = reader
         modelCatalogReader = reader
         reasoningPreflightReader = reader
         cliRunner = SystemCLIRunner()
@@ -260,6 +268,9 @@ final class BasetenSwitchState: ObservableObject {
         interactiveRefreshTask?.cancel()
         interactiveRefreshTask = nil
         interactiveStatsRequested = false
+        clientPageRefreshTask?.cancel()
+        clientPageRefreshTask = nil
+        clientPageRefreshPending = false
         invalidateModelCatalog()
         mutationRecoveryTask?.cancel()
         mutationRecoveryTask = nil
@@ -273,9 +284,18 @@ final class BasetenSwitchState: ObservableObject {
         apply(await pollCoordinator.refresh())
     }
 
+    /// Establishes a read barrier after a child-process mutation. A normal
+    /// refresh may join a status request that began before the mutation and
+    /// falsely report that the confirmed change is absent.
+    private func refreshAfterMutation() async {
+        guard let pollCoordinator else { return }
+        apply(await pollCoordinator.refreshFresh())
+    }
+
     private func apply(_ event: PollEvent) {
         switch event {
         case .snapshot(let snapshot):
+            let previousAuth = routingSnapshot?.auth
             let meaningfulChange = routingSnapshot.map {
                 !routingPresentationEqual($0, snapshot)
             } ?? true
@@ -293,6 +313,9 @@ final class BasetenSwitchState: ObservableObject {
                 }
             }
             beginAutomaticMutationRecoveryIfNeeded(snapshot)
+            requestAutomaticModelCatalogRecoveryIfNeeded(
+                previousAuth: previousAuth,
+                currentAuth: snapshot.auth)
         case .unavailable:
             if !snapshotIsStale {
                 snapshotIsStale = true
@@ -493,7 +516,7 @@ final class BasetenSwitchState: ObservableObject {
         for key: MutationRecoveryKey,
         state: MutationRecoveryState
     ) async {
-        await refresh()
+        await refreshAfterMutation()
         guard recoveryKeyIsCurrent(key), !Task.isCancelled else { return }
         mutationRecoveryState = state
     }
@@ -558,6 +581,46 @@ final class BasetenSwitchState: ObservableObject {
         await interactiveRefreshTask?.value
     }
 
+    /// Coalesces client-page toolbar refreshes into one ordered operation.
+    /// Auth reload is best effort for compatibility with older routers, while
+    /// status and catalog retain their existing independent error surfaces.
+    func requestClientPageRefresh() {
+        guard clientPageRefreshTask == nil else {
+            clientPageRefreshPending = true
+            return
+        }
+        beginModelCatalogLoading()
+        clientPageRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await self.authReloader.reloadAuth()
+            } catch {
+                // Older routers do not expose the reload endpoint. Continue
+                // with the normal reads so mixed-version installations remain
+                // usable and surface their existing sanitized state.
+            }
+            guard !Task.isCancelled else { return }
+            if let pollCoordinator = self.pollCoordinator {
+                self.apply(await pollCoordinator.refreshFresh())
+            }
+            guard !Task.isCancelled else { return }
+            self.requestModelCatalogRefresh()
+            await self.waitForModelCatalogRefresh()
+            guard !Task.isCancelled else { return }
+            self.clientPageRefreshTask = nil
+            if self.clientPageRefreshPending {
+                self.clientPageRefreshPending = false
+                self.requestClientPageRefresh()
+            }
+        }
+    }
+
+    func waitForClientPageRefresh() async {
+        while let task = clientPageRefreshTask {
+            await task.value
+        }
+    }
+
     // MARK: - Live model catalog
 
     func ensureModelCatalogLoaded() {
@@ -566,14 +629,15 @@ final class BasetenSwitchState: ObservableObject {
     }
 
     func routerWindowDidClose() {
+        clientPageRefreshTask?.cancel()
+        clientPageRefreshTask = nil
+        clientPageRefreshPending = false
         invalidateModelCatalog()
     }
 
     func requestModelCatalogRefresh() {
-        modelCatalogGeneration &+= 1
-        let generation = modelCatalogGeneration
-        modelCatalogTask?.cancel()
-        liveModelCatalogState = .loading
+        automaticCatalogRecoveryGeneration = nil
+        let generation = beginModelCatalogLoading()
         let reader = modelCatalogReader
         modelCatalogTask = Task { [weak self] in
             do {
@@ -583,8 +647,8 @@ final class BasetenSwitchState: ObservableObject {
                       self.modelCatalogGeneration == generation else {
                     return
                 }
-                self.applyModelCatalog(snapshot)
                 self.modelCatalogTask = nil
+                self.applyModelCatalog(snapshot, generation: generation)
             } catch is CancellationError {
                 return
             } catch {
@@ -593,6 +657,10 @@ final class BasetenSwitchState: ObservableObject {
                       self.modelCatalogGeneration == generation else {
                     return
                 }
+                if self.automaticCatalogRecoveryGeneration == generation {
+                    self.automaticCatalogRecoveryGeneration = nil
+                }
+                self.refreshingModelCatalog = nil
                 self.liveModelCatalogState = .error(
                     "Live model availability could not be loaded.")
                 self.modelCatalogTask = nil
@@ -601,17 +669,37 @@ final class BasetenSwitchState: ObservableObject {
     }
 
     func waitForModelCatalogRefresh() async {
-        await modelCatalogTask?.value
+        while let task = modelCatalogTask {
+            await task.value
+        }
     }
 
     func modelCatalogProjection(for client: ClientStatus)
         -> ModelCatalogProjection {
-        projectModelCatalog(
+        let projectionState: LiveModelCatalogLoadState
+        if case .loading = liveModelCatalogState,
+           let refreshingModelCatalog {
+            projectionState = .ready(refreshingModelCatalog)
+        } else {
+            projectionState = liveModelCatalogState
+        }
+        return projectModelCatalog(
             configured: client.modelCatalog,
-            liveState: liveModelCatalogState)
+            liveState: projectionState)
     }
 
-    private func applyModelCatalog(_ snapshot: LiveModelCatalogSnapshot) {
+    var modelCatalogAllowsMutation: Bool {
+        if case .ready = liveModelCatalogState {
+            return true
+        }
+        return false
+    }
+
+    private func applyModelCatalog(
+        _ snapshot: LiveModelCatalogSnapshot,
+        generation: UInt64
+    ) {
+        refreshingModelCatalog = nil
         switch snapshot.state {
         case .ready:
             liveModelCatalogState = .ready(snapshot.models)
@@ -628,13 +716,71 @@ final class BasetenSwitchState: ObservableObject {
                     ? "Live model availability could not be loaded."
                     : snapshot.error)
         }
+
+        guard automaticCatalogRecoveryGeneration == generation else {
+            return
+        }
+        automaticCatalogRecoveryGeneration = nil
+        if snapshot.state == .signedOut,
+           snapshot.signedOutReason == .notSignedIn {
+            requestModelCatalogRefresh()
+        }
+    }
+
+    private func requestAutomaticModelCatalogRecoveryIfNeeded(
+        previousAuth: AuthStatus?,
+        currentAuth: AuthStatus?
+    ) {
+        guard clientPageRefreshTask == nil,
+              selectedProfileIsUnavailable(previousAuth),
+              selectedProfileIsHealthy(currentAuth) else {
+            return
+        }
+        switch liveModelCatalogState {
+        case .signedOut(.notSignedIn):
+            requestModelCatalogRefresh()
+        case .loading:
+            automaticCatalogRecoveryGeneration = modelCatalogGeneration
+        case .idle, .ready, .signedOut, .error:
+            break
+        }
+    }
+
+    private func selectedProfileIsUnavailable(_ auth: AuthStatus?) -> Bool {
+        guard let auth else { return false }
+        return !auth.signedIn || auth.health == "signed_out"
+    }
+
+    private func selectedProfileIsHealthy(_ auth: AuthStatus?) -> Bool {
+        guard let auth else { return false }
+        return auth.signedIn && auth.health == "ok"
     }
 
     private func invalidateModelCatalog() {
+        refreshingModelCatalog = nil
+        automaticCatalogRecoveryGeneration = nil
         modelCatalogGeneration &+= 1
         modelCatalogTask?.cancel()
         modelCatalogTask = nil
         liveModelCatalogState = .idle
+    }
+
+    @discardableResult
+    private func beginModelCatalogLoading() -> UInt64 {
+        automaticCatalogRecoveryGeneration = nil
+        if case .ready(let models) = liveModelCatalogState {
+            refreshingModelCatalog = models
+        } else if case .loading = liveModelCatalogState {
+            // Preserve the same last confirmed catalog across an ordered
+            // auth/status/catalog refresh or a coalesced refresh rerun.
+        } else {
+            refreshingModelCatalog = nil
+        }
+        modelCatalogGeneration &+= 1
+        modelCatalogTask?.cancel()
+        modelCatalogTask = nil
+        liveModelCatalogState = .loading
+        return modelCatalogGeneration
     }
 
     func refreshStats() async {
@@ -739,7 +885,7 @@ final class BasetenSwitchState: ObservableObject {
         let attempt = await executePolicyMutation(
             arguments,
             operationID: pending.operationID)
-        await refresh()
+        await refreshAfterMutation()
 
         let receipt = attempt.receipt
         let confirmed = attempt.result.succeeded
@@ -852,7 +998,7 @@ final class BasetenSwitchState: ObservableObject {
                 client: client.name,
                 key: "default_model",
                 requestedTarget: model.slug))
-        await refresh()
+        await refreshAfterMutation()
         let receipt = attempt.receipt
         let confirmed = !snapshotIsStale
             && attempt.result.succeeded
@@ -952,7 +1098,7 @@ final class BasetenSwitchState: ObservableObject {
                 client: client.name,
                 key: family,
                 requestedTarget: requestedTarget))
-        await refresh()
+        await refreshAfterMutation()
         let receipt = attempt.receipt
         let confirmed = !snapshotIsStale
             && attempt.result.succeeded
@@ -1036,7 +1182,7 @@ final class BasetenSwitchState: ObservableObject {
                 client: client.name,
                 key: "subagents",
                 requestedTarget: requestedTarget))
-        await refresh()
+        await refreshAfterMutation()
         let receipt = attempt.receipt
         let confirmed = !snapshotIsStale
             && attempt.result.succeeded
@@ -1248,7 +1394,7 @@ final class BasetenSwitchState: ObservableObject {
                 client: client,
                 key: model,
                 requestedTarget: requestedTarget))
-        await refresh()
+        await refreshAfterMutation()
         let receipt = attempt.receipt
         let confirmed = !snapshotIsStale
             && attempt.result.succeeded
@@ -1545,6 +1691,8 @@ final class BasetenSwitchState: ObservableObject {
             return "A previous routing change still needs cleanup."
         case "router_unavailable":
             return "The local gateway is unavailable. Try again after it reconnects."
+        case "router_state_mismatch", "router_identity_mismatch":
+            return "The app and routing command are connected to different local gateways. Restart Baseten Switch and try again."
         case "router_unsupported":
             return "Update the local gateway before changing routing settings."
         case "journal_not_found":
@@ -1887,7 +2035,22 @@ func cliEnvironmentOverrides(configPath: String,
     if variant.channel == .preview {
         return variant.runtime.environment
     }
-    return cliEnvironmentOverrides(configPath: configPath)
+    let coordinationKeys = [
+        "BASETEN_SWITCH_ADMIN_ADDR",
+        "BASETEN_SWITCH_GATEWAY_PIDFILE",
+    ]
+    var overrides = variant.runtime.environment.filter {
+        coordinationKeys.contains($0.key)
+    }
+    let effectiveConfigPath = configPath.isEmpty
+        ? variant.runtime.environment["BASETEN_SWITCH_CONFIG_PATH"] ?? ""
+        : configPath
+    if !effectiveConfigPath.isEmpty {
+        // The explicit launch path is a safe pre-status fallback. Once status
+        // is available, the router-reported path is authoritative.
+        overrides["BASETEN_SWITCH_CONFIG_PATH"] = effectiveConfigPath
+    }
+    return overrides
 }
 
 func canonicalPath(_ path: String) -> String {

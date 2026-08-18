@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/basetenlabs/baseten-switch/gateway/internal/config"
+	"github.com/basetenlabs/baseten-switch/gateway/internal/telemetry"
 )
 
 func ttftPost(t *testing.T, g *Gateway, body string) (*http.Response, string) {
@@ -133,12 +134,28 @@ func TestTTFTFiresFallbackBeforeFirstByteWithCooldown(t *testing.T) {
 	if rows[0].EffectiveProvider != "anthropic" || valueOrZero(rows[0].Fallback.Trigger) != "ttft_timeout" {
 		t.Fatalf("row 0 route_effective/fallback_trigger = %q/%q, want anthropic/ttft_timeout", rows[0].EffectiveProvider, valueOrZero(rows[0].Fallback.Trigger))
 	}
+	if primary := rows[0].Primary; primary == nil ||
+		primary.Provider != "baseten" ||
+		primary.Model != "zai-org/GLM-5.2" ||
+		!primary.Attempted ||
+		primary.Outcome != telemetry.PrimaryOutcomeTTFTTimeout ||
+		primary.Status != nil {
+		t.Errorf("TTFT primary = %+v, want attempted baseten zai-org/GLM-5.2", primary)
+	}
 	if rows[1].EffectiveProvider != "anthropic" ||
 		!rows[1].Fallback.Attempted ||
 		rows[1].Fallback.Count != 1 ||
 		valueOrZero(rows[1].Fallback.Trigger) != fallbackTriggerCooldown {
 		t.Fatalf("row 1 fallback telemetry = provider %q, %+v; want anthropic cooldown bypass",
 			rows[1].EffectiveProvider, rows[1].Fallback)
+	}
+	if primary := rows[1].Primary; primary == nil ||
+		primary.Provider != "baseten" ||
+		primary.Model != "zai-org/GLM-5.2" ||
+		primary.Attempted ||
+		primary.Outcome != telemetry.PrimaryOutcomeCooldown ||
+		primary.Status != nil {
+		t.Errorf("cooldown primary = %+v, want unattempted baseten zai-org/GLM-5.2", primary)
 	}
 }
 
@@ -252,6 +269,14 @@ func TestAuthUnavailableBypassRecordsFallback(t *testing.T) {
 		if !strings.Contains(string(stderr), want) {
 			t.Fatalf("stderr missing %q, got:\n%s", want, stderr)
 		}
+	}
+	if primary := row.Primary; primary == nil ||
+		primary.Provider != "baseten" ||
+		primary.Model != "zai-org/GLM-5.2" ||
+		primary.Attempted ||
+		primary.Outcome != telemetry.PrimaryOutcomeAuthUnavailable ||
+		primary.Status != nil {
+		t.Errorf("auth-unavailable primary = %+v, want unattempted baseten zai-org/GLM-5.2", primary)
 	}
 }
 

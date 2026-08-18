@@ -820,15 +820,35 @@ func (g *Gateway) shutdownAllClients() {
 }
 
 func (g *Gateway) refreshAuth() {
+	g.reloadMu.Lock()
+	defer g.reloadMu.Unlock()
+	g.refreshAuthLocked()
+}
+
+// refreshAuthLocked reloads the selected CLI credential while reloadMu is
+// held. Config reload and explicit auth reload both use this path so an auth
+// client built for an old profile cannot publish after a newer runtime config.
+// Credential-store and Keychain reads happen outside authMu, keeping status
+// reads and in-flight request auth selection responsive while the load runs.
+// Publishing preserves the existing nonblocking catalog-refresh kick.
+func (g *Gateway) refreshAuthLocked() {
 	cfg := g.runtimeConfig()
 	g.authMu.Lock()
-	defer g.authMu.Unlock()
 	// Each build is a new lineage: outcomes from clients built before
 	// this swap are stale and noteAuthRefresh drops them by generation.
 	g.authGen++
 	gen := g.authGen
+	g.authMu.Unlock()
+
 	notify := func(fp string, err error) { g.noteAuthRefresh(gen, fp, err) }
 	client, tick, credFP, err := auth.HTTPClientWithNotify(context.Background(), cfg.OAuthProfile, cfg.OAuthHost, notify)
+
+	g.authMu.Lock()
+	defer g.authMu.Unlock()
+	if gen != g.authGen {
+		return
+	}
+	previousStoreFP := g.authStoreFP
 	g.cliProfileAPIKey = ""
 	g.authStoreFP = ""
 	switch {
@@ -852,18 +872,30 @@ func (g *Gateway) refreshAuth() {
 			g.cliProfileAPIKey = strings.TrimSpace(apiKeyProfile.Key)
 			g.authStoreFP = apiKeyStoreFingerprint(apiKeyProfile.Profile, g.cliProfileAPIKey)
 		}
-		// API-key profiles have no OAuth refresh lineage. Do not carry
-		// OAuth-only health state across a profile transition.
-		g.authDead = false
-		g.authDeadFP = ""
-		g.authLastErr = ""
-		g.authLastErrAt = time.Time{}
-		g.authLastOKAt = time.Time{}
 	default:
 		g.oauthClient = nil
 		g.authTick = nil
 		g.oauthProfileErr = err
 		fmt.Fprintf(os.Stderr, "[gateway] auth refresh failed: %v\n", err)
+	}
+	credentialChanged := previousStoreFP != g.authStoreFP
+	if credentialChanged {
+		// Health belongs to one credential identity. Login, logout, profile
+		// replacement, and auth-type transitions must not inherit a prior
+		// OAuth failure or success timestamp.
+		g.authDead = false
+		g.authDeadFP = ""
+		g.authLastErr = ""
+		g.authLastErrAt = time.Time{}
+		g.authLastOKAt = time.Time{}
+
+		// Cached identity also belongs to the credential that fetched it.
+		// Clearing on the same store identity transition prevents status from
+		// showing the previous account for up to the cache TTL.
+		g.emailMu.Lock()
+		g.emailCached = ""
+		g.emailFetchedAt = time.Time{}
+		g.emailMu.Unlock()
 	}
 	// Re-login detection: if the credential was marked dead but the
 	// store now holds a DIFFERENT refresh token than the one that died
@@ -1987,6 +2019,9 @@ type upstreamAttempt struct {
 	// an earlier attempt failure, an active cooldown, or unavailable primary
 	// credentials. It flows into telemetry as fallback_trigger.
 	fallbackTrigger string
+	// primary retains the bounded primary-route outcome on the fallback that
+	// ultimately serves. It is nil for requests that never select fallback.
+	primary *telemetry.PrimaryV1
 	// origRequestedModel is the model the harness originally sent, before
 	// the subagent rewrite replaced it. Empty unless the subagent gate
 	// fired. When set, telemetry requested_model uses this instead of
@@ -2051,6 +2086,7 @@ const (
 	fallbackTriggerCooldown         = "cooldown"
 	fallbackTriggerAuthUnavailable  = "auth_unavailable"
 	fallbackTriggerImageUnsupported = "image_input_unsupported"
+	fallbackTriggerRequestBuild     = "request_build_error"
 )
 
 func allowsImageTranslationFallback(err error) bool {
@@ -2725,17 +2761,21 @@ func (g *Gateway) resolveAttemptsLadderWithSnapshot(
 			if perr == nil && g.fallbackActive(cl.cfg.Name) {
 				fba.fallbackCount = 1
 				fba.fallbackTrigger = fallbackTriggerCooldown
+				fba.primary = primarySummary(primary, false, telemetry.PrimaryOutcomeCooldown, nil)
 				attempts = []upstreamAttempt{fba}
 			} else {
 				if errors.Is(perr, errNeedsLogin) {
 					fba.fallbackCount = 1
 					fba.fallbackTrigger = fallbackTriggerAuthUnavailable
+					fba.primary = primarySummary(primary, false, telemetry.PrimaryOutcomeAuthUnavailable, nil)
 				} else if allowsImageTranslationFallback(perr) {
 					fba.fallbackCount = 1
 					fba.fallbackTrigger = fallbackTriggerImageUnsupported
+					fba.primary = primarySummary(primary, false, telemetry.PrimaryOutcomeImageInputUnsupported, nil)
 				} else if reasoning.AllowsFallback(perr) {
 					fba.fallbackCount = 1
 					fba.fallbackTrigger = "reasoning_policy_error"
+					fba.primary = primarySummary(primary, false, telemetry.PrimaryOutcomeReasoningPolicyError, nil)
 				}
 				attempts = append(attempts, fba)
 			}
@@ -2920,8 +2960,17 @@ func (g *Gateway) resolveModelRoutePrimaryWithSnapshot(
 		requested,
 		catalogFamily,
 	)
+	planned := upstreamAttempt{route: decision.route}
+	if decision.route == pricing.ProviderBaseten {
+		planned.modelForCost = decision.model
+		if !decision.forced {
+			rc := cl.cfg
+			rc.Route = pricing.ProviderBaseten
+			planned.modelForCost = g.upstreamModelFor(rc)
+		}
+	}
 	if decision.forced {
-		return g.buildAttemptTargetWithSnapshot(
+		at, err := g.buildAttemptTargetWithSnapshot(
 			snapshot,
 			requestedReasoning,
 			requestedObserved,
@@ -2933,8 +2982,12 @@ func (g *Gateway) resolveModelRoutePrimaryWithSnapshot(
 			decision.model,
 			true,
 		)
+		if err != nil && planned.modelForCost != "" {
+			return planned, err
+		}
+		return at, err
 	}
-	return g.buildAttemptWithSnapshot(
+	at, err := g.buildAttemptWithSnapshot(
 		snapshot,
 		requestedReasoning,
 		requestedObserved,
@@ -2944,6 +2997,28 @@ func (g *Gateway) resolveModelRoutePrimaryWithSnapshot(
 		decision.route,
 		kind,
 	)
+	if err != nil && planned.modelForCost != "" {
+		return planned, err
+	}
+	return at, err
+}
+
+func primarySummary(
+	primary upstreamAttempt,
+	attempted bool,
+	outcome string,
+	status *int,
+) *telemetry.PrimaryV1 {
+	if primary.route == "" || primary.modelForCost == "" {
+		return nil
+	}
+	return &telemetry.PrimaryV1{
+		Provider:  primary.route,
+		Model:     primary.modelForCost,
+		Attempted: attempted,
+		Outcome:   outcome,
+		Status:    cloneIntPointer(status),
+	}
 }
 
 // routeEffective returns the value for the telemetry route_effective
@@ -3094,18 +3169,21 @@ attemptLoop:
 		}
 
 		ttftExpired := false
+		attemptDispatched := false
 		var err error
 		for {
 			var classifierBody []byte
 			classifierReadAttempted := false
 			classifierBodyComplete := false
 			var watch upstreamTTFTWatch
-			resp, err, ttftExpired, watch = startUpstreamSubAttempt(
+			var dispatched bool
+			resp, err, ttftExpired, dispatched, watch = startUpstreamSubAttempt(
 				reqCtx,
 				at,
 				res.NewBody,
 				ttftDeadline,
 			)
+			attemptDispatched = attemptDispatched || dispatched
 			if ttftExpired || err != nil {
 				watch.stop()
 				watch.cancel()
@@ -3131,6 +3209,12 @@ attemptLoop:
 				}
 				attempts[i+1].fallbackTrigger =
 					fmt.Sprintf("http_%d", resp.StatusCode)
+				attempts[i+1].primary = primarySummary(
+					at,
+					true,
+					telemetry.PrimaryOutcomeHTTPError,
+					&resp.StatusCode,
+				)
 				continue attemptLoop
 			}
 
@@ -3208,6 +3292,12 @@ attemptLoop:
 					}
 					attempts[i+1].fallbackTrigger =
 						fallbackTriggerImageUnsupported
+					attempts[i+1].primary = primarySummary(
+						at,
+						true,
+						telemetry.PrimaryOutcomeImageInputUnsupported,
+						&resp.StatusCode,
+					)
 					continue attemptLoop
 				}
 			}
@@ -3241,7 +3331,19 @@ attemptLoop:
 					attempts[i+1].responsesCompatibility =
 						at.responsesCompatibility
 				}
-				attempts[i+1].fallbackTrigger = "transport_error"
+				fallbackTrigger := "transport_error"
+				primaryOutcome := telemetry.PrimaryOutcomeTransportError
+				if !attemptDispatched {
+					fallbackTrigger = fallbackTriggerRequestBuild
+					primaryOutcome = telemetry.PrimaryOutcomeRequestBuildError
+				}
+				attempts[i+1].fallbackTrigger = fallbackTrigger
+				attempts[i+1].primary = primarySummary(
+					at,
+					attemptDispatched,
+					primaryOutcome,
+					nil,
+				)
 				continue
 			}
 			g.reject(w, code, "upstream unreachable: "+err.Error())
@@ -3264,6 +3366,12 @@ attemptLoop:
 						at.responsesCompatibility
 				}
 				attempts[i+1].fallbackTrigger = fallbackTriggerTTFT
+				attempts[i+1].primary = primarySummary(
+					at,
+					attemptDispatched,
+					telemetry.PrimaryOutcomeTTFTTimeout,
+					nil,
+				)
 				continue
 			}
 			fmt.Fprintf(os.Stderr,
@@ -4484,7 +4592,7 @@ func (g *Gateway) reloadConfig() {
 		}(lg)
 	}
 
-	g.refreshAuth()
+	g.refreshAuthLocked()
 	runtimeCfg := g.runtimeConfig()
 	runPreflight(&runtimeCfg, desired, os.Stderr)
 }

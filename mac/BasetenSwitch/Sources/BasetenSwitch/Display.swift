@@ -5,10 +5,9 @@ import Foundation
 // what /v1/admin/status reports.
 
 /// Menubar icon state. Precedence: degraded > active > off.
-/// - degraded: gateway up AND (the stored Baseten credential is dead
-///   (auth health "refresh_failed") OR any enabled client reports
-///   an active fallback), regardless of routes. A dead credential warns
-///   on any route state so the user notices without opening the popup.
+/// - degraded: gateway up AND shared auth attention requires action OR any
+///   enabled client reports an active fallback. Refresh failure remains
+///   route-independent; signed-out attention is route-aware.
 /// - active: gateway up AND any enabled client routes through
 ///   Baseten (route == "baseten").
 /// - off: everything else, including gateway down with stale
@@ -28,7 +27,12 @@ enum MenubarIconState: Equatable {
 func menubarIconState(gatewayUp: Bool, clients: [ClientStatus],
                       auth: AuthStatus? = nil) -> MenubarIconState {
     guard gatewayUp else { return .off }
-    if authNeedsReauth(auth: auth) {
+    if authAttention(
+        gatewayUp: gatewayUp,
+        globalRoutingEnabled: clients.contains(
+            where: clientRequiresBasetenAuth),
+        clients: clients,
+        auth: auth) != .none {
         return .degraded
     }
     if clients.contains(where: { $0.enabled && $0.fallbackActive }) {
@@ -46,7 +50,11 @@ func menubarIconState(gatewayUp: Bool,
                       clients: [ClientStatus],
                       auth: AuthStatus? = nil) -> MenubarIconState {
     guard gatewayUp else { return .off }
-    if authNeedsReauth(auth: auth)
+    if authAttention(
+        gatewayUp: gatewayUp,
+        globalRoutingEnabled: globalRoutingEnabled,
+        clients: clients,
+        auth: auth) != .none
         || clients.contains(where: { $0.enabled && $0.fallbackActive }) {
         return .degraded
     }

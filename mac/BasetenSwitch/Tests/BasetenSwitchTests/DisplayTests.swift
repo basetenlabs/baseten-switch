@@ -483,6 +483,126 @@ final class DisplayTests: XCTestCase {
             ["BASETEN_SWITCH_CONFIG_PATH": "/tmp/live/gateway.yaml"])
     }
 
+    func testStableCLIEnvironmentRetainsOnlyRuntimeCoordinationOverrides() {
+        let variant = AppVariant.resolve(
+            infoDictionary: ["BasetenSwitchBuildChannel": "stable"],
+            environment: [
+                "BASETEN_SWITCH_CONFIG_PATH": "/tmp/stale/gateway.yaml",
+                "BASETEN_SWITCH_ADMIN_ADDR": "127.0.0.1:46373",
+                "BASETEN_SWITCH_ADMIN_URL": "http://127.0.0.1:46373",
+                "BASETEN_SWITCH_GATEWAY_ADMIN": "http://127.0.0.1:46373",
+                "BASETEN_SWITCH_GATEWAY_PIDFILE": "/tmp/stale/gateway.pid",
+                "BASETEN_SWITCH_GATEWAY_BIN": "/tmp/bin/baseten-switch",
+                "BASETEN_API_KEY": "must-not-propagate",
+                "ANTHROPIC_AUTH_TOKEN": "must-not-propagate",
+                "UNRELATED": "must-not-propagate",
+            ])
+
+        let overrides = cliEnvironmentOverrides(
+            configPath: "/tmp/authoritative/gateway.yaml",
+            variant: variant)
+
+        XCTAssertEqual(
+            overrides["BASETEN_SWITCH_CONFIG_PATH"],
+            "/tmp/authoritative/gateway.yaml")
+        XCTAssertEqual(
+            overrides["BASETEN_SWITCH_ADMIN_ADDR"],
+            "127.0.0.1:46373")
+        XCTAssertNil(overrides["BASETEN_SWITCH_ADMIN_URL"])
+        XCTAssertNil(overrides["BASETEN_SWITCH_GATEWAY_ADMIN"])
+        XCTAssertEqual(
+            overrides["BASETEN_SWITCH_GATEWAY_PIDFILE"],
+            "/tmp/stale/gateway.pid")
+        XCTAssertNil(overrides["BASETEN_SWITCH_GATEWAY_BIN"])
+        XCTAssertNil(overrides["BASETEN_API_KEY"])
+        XCTAssertNil(overrides["ANTHROPIC_AUTH_TOKEN"])
+        XCTAssertNil(overrides["UNRELATED"])
+
+        let preStatusOverrides = cliEnvironmentOverrides(
+            configPath: "",
+            variant: variant)
+        XCTAssertEqual(
+            preStatusOverrides["BASETEN_SWITCH_CONFIG_PATH"],
+            "/tmp/stale/gateway.yaml")
+    }
+
+    func testStableCLIEnvironmentDerivesAddressFromURLOnly() {
+        let variant = AppVariant.resolve(
+            infoDictionary: ["BasetenSwitchBuildChannel": "stable"],
+            environment: [
+                "BASETEN_SWITCH_CONFIG_PATH": "/tmp/stale/gateway.yaml",
+                "BASETEN_SWITCH_ADMIN_URL": "http://localhost:46373",
+                "BASETEN_SWITCH_GATEWAY_PIDFILE": "/tmp/stale/gateway.pid",
+            ])
+
+        XCTAssertEqual(
+            variant.runtime.adminBaseURL,
+            URL(string: "http://localhost:46373")!)
+        XCTAssertEqual(
+            variant.runtime.environment["BASETEN_SWITCH_ADMIN_ADDR"],
+            "localhost:46373")
+        let overrides = cliEnvironmentOverrides(
+            configPath: "",
+            variant: variant)
+        XCTAssertEqual(
+            overrides["BASETEN_SWITCH_ADMIN_ADDR"],
+            "localhost:46373")
+        XCTAssertEqual(
+            overrides["BASETEN_SWITCH_CONFIG_PATH"],
+            "/tmp/stale/gateway.yaml")
+        XCTAssertEqual(
+            overrides["BASETEN_SWITCH_GATEWAY_PIDFILE"],
+            "/tmp/stale/gateway.pid")
+    }
+
+    func testStableCLIEnvironmentURLWinsOverConflictingAddress() {
+        let variant = AppVariant.resolve(
+            infoDictionary: ["BasetenSwitchBuildChannel": "stable"],
+            environment: [
+                "BASETEN_SWITCH_ADMIN_URL": "http://127.0.0.1:46373",
+                "BASETEN_SWITCH_ADMIN_ADDR": "127.0.0.1:45273",
+            ])
+
+        XCTAssertEqual(
+            variant.runtime.environment["BASETEN_SWITCH_ADMIN_ADDR"],
+            "127.0.0.1:46373")
+        XCTAssertEqual(
+            cliEnvironmentOverrides(configPath: "", variant: variant)[
+                "BASETEN_SWITCH_ADMIN_ADDR"],
+            "127.0.0.1:46373")
+    }
+
+    func testStableCLIEnvironmentCanonicalizesSchemeBearingAddress() {
+        let variant = AppVariant.resolve(
+            infoDictionary: ["BasetenSwitchBuildChannel": "stable"],
+            environment: [
+                "BASETEN_SWITCH_ADMIN_ADDR": "http://127.0.0.1:46373",
+            ])
+
+        XCTAssertEqual(
+            variant.runtime.environment["BASETEN_SWITCH_ADMIN_ADDR"],
+            "127.0.0.1:46373")
+        XCTAssertEqual(
+            cliEnvironmentOverrides(configPath: "", variant: variant)[
+                "BASETEN_SWITCH_ADMIN_ADDR"],
+            "127.0.0.1:46373")
+    }
+
+    func testStableCLIEnvironmentWithoutOverridesKeepsProductionDefaults() {
+        let variant = AppVariant.resolve(
+            infoDictionary: ["BasetenSwitchBuildChannel": "stable"],
+            environment: [:])
+
+        XCTAssertEqual(
+            cliEnvironmentOverrides(
+                configPath: "/Users/test/.config/baseten-switch/gateway.yaml",
+                variant: variant),
+            [
+                "BASETEN_SWITCH_CONFIG_PATH":
+                    "/Users/test/.config/baseten-switch/gateway.yaml",
+            ])
+    }
+
     func testRouterWindowPresentationTransitionsAreIdempotent() {
         var state = RouterWindowPresentationState()
         XCTAssertFalse(state.isOpen)
@@ -988,7 +1108,7 @@ final class DisplayTests: XCTestCase {
                                         auth: authWithHealth("refresh_failed")),
                        .off)
         // Non-dead healths and a missing auth block change nothing.
-        for health in ["ok", "error", "signed_out", ""] {
+        for health in ["ok", "error", ""] {
             XCTAssertEqual(menubarIconState(gatewayUp: true,
                                             clients: [client("claude-code", route: "baseten")],
                                             auth: authWithHealth(health)),
@@ -998,6 +1118,79 @@ final class DisplayTests: XCTestCase {
                                         clients: [client("claude-code", route: "baseten")],
                                         auth: nil),
                        .active)
+    }
+
+    func testMenubarIconStateUsesRouteAwareSignInAttention() {
+        let signedOut = AuthStatus(dict: [
+            "signed_in": false,
+            "health": "signed_out",
+            "fallback_in_use": false,
+        ])
+        let fallbackAuth = AuthStatus(dict: [
+            "signed_in": false,
+            "health": "signed_out",
+            "fallback_in_use": true,
+        ])
+        let baseten = client("claude-code", route: "baseten")
+        let native = client("claude-code", route: "anthropic")
+
+        XCTAssertEqual(menubarIconState(
+            gatewayUp: true,
+            globalRoutingEnabled: true,
+            clients: [baseten],
+            auth: signedOut), .degraded)
+        XCTAssertEqual(menubarIconState(
+            gatewayUp: true,
+            globalRoutingEnabled: false,
+            clients: [baseten],
+            auth: signedOut), .off)
+        XCTAssertEqual(menubarIconState(
+            gatewayUp: true,
+            globalRoutingEnabled: true,
+            clients: [native],
+            auth: signedOut), .active)
+        XCTAssertEqual(menubarIconState(
+            gatewayUp: false,
+            globalRoutingEnabled: true,
+            clients: [baseten],
+            auth: signedOut), .off)
+        XCTAssertEqual(menubarIconState(
+            gatewayUp: true,
+            globalRoutingEnabled: true,
+            clients: [baseten],
+            auth: fallbackAuth), .active)
+    }
+
+    func testMenubarIconStateDetectsNestedBasetenDestinations() {
+        let signedOut = AuthStatus(dict: [
+            "signed_in": false,
+            "health": "signed_out",
+        ])
+        let unmatched = ClientStatus(dict: [
+            "name": "claude-code",
+            "enabled": true,
+            "effective_route": "anthropic",
+            "unmatched_native_model": [
+                "effective_route": "baseten",
+            ],
+        ])!
+        let family = ClientStatus(dict: [
+            "name": "claude-code",
+            "enabled": true,
+            "effective_route": "anthropic",
+            "families": [[
+                "family": "sonnet",
+                "effective_route": "baseten",
+            ]],
+        ])!
+
+        for nestedClient in [unmatched, family] {
+            XCTAssertEqual(menubarIconState(
+                gatewayUp: true,
+                globalRoutingEnabled: true,
+                clients: [nestedClient],
+                auth: signedOut), .degraded)
+        }
     }
 
     // MARK: - Reauthenticate dispatch (Terminal via osascript)

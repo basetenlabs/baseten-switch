@@ -71,6 +71,7 @@ type EventV1 struct {
 	ActualCost                    CostSnapshotV1            `json:"actual_cost"`
 	NativeCounterfactualCost      *CostSnapshotV1           `json:"native_counterfactual_cost"`
 	Fallback                      FallbackV1                `json:"fallback"`
+	Primary                       *PrimaryV1                `json:"primary,omitempty"`
 	Subagent                      bool                      `json:"subagent"`
 	SubagentModel                 *string                   `json:"subagent_model"`
 	Sanitized                     bool                      `json:"sanitized"`
@@ -224,6 +225,28 @@ type FallbackV1 struct {
 	Trigger   *string `json:"trigger"`
 }
 
+// PrimaryV1 preserves the bounded outcome of the planned primary route when
+// another provider ultimately serves the logical request. It is intentionally
+// not a general attempt trace: request and response content never belong here.
+type PrimaryV1 struct {
+	Provider  string `json:"provider"`
+	Model     string `json:"model"`
+	Attempted bool   `json:"attempted"`
+	Outcome   string `json:"outcome"`
+	Status    *int   `json:"status"`
+}
+
+const (
+	PrimaryOutcomeHTTPError             = "http_error"
+	PrimaryOutcomeTransportError        = "transport_error"
+	PrimaryOutcomeRequestBuildError     = "request_build_error"
+	PrimaryOutcomeTTFTTimeout           = "ttft_timeout"
+	PrimaryOutcomeImageInputUnsupported = "image_input_unsupported"
+	PrimaryOutcomeCooldown              = "cooldown"
+	PrimaryOutcomeAuthUnavailable       = "auth_unavailable"
+	PrimaryOutcomeReasoningPolicyError  = "reasoning_policy_error"
+)
+
 func NewEventID() (string, error) {
 	var value [16]byte
 	if _, err := rand.Read(value[:]); err != nil {
@@ -278,10 +301,15 @@ func (e EventV1) Validate() error {
 		return errors.New("telemetry fallback count must be nonnegative")
 	case !e.Fallback.Attempted && e.Fallback.Count != 0:
 		return errors.New("telemetry fallback count requires attempted=true")
+	case e.Primary != nil && !e.Fallback.Attempted:
+		return errors.New("telemetry primary summary requires fallback attempted=true")
 	case e.ToolCalls < 0:
 		return errors.New("telemetry tool_calls must be nonnegative")
 	case e.RequestBytes < 0:
 		return errors.New("telemetry request_bytes must be nonnegative")
+	}
+	if err := e.Primary.validate(); err != nil {
+		return err
 	}
 	if err := e.ResponsesCompatibility.validate(); err != nil {
 		return err
@@ -301,6 +329,67 @@ func (e EventV1) Validate() error {
 		}
 	}
 	return nil
+}
+
+func (p *PrimaryV1) validate() error {
+	if p == nil {
+		return nil
+	}
+	switch {
+	case p.Provider == "":
+		return errors.New("telemetry primary provider is required")
+	case p.Model == "":
+		return errors.New("telemetry primary model is required")
+	case !validPrimaryOutcome(p.Outcome):
+		return fmt.Errorf("telemetry primary outcome = %q is invalid", p.Outcome)
+	case p.Status != nil && (*p.Status < 100 || *p.Status > 999):
+		return errors.New("telemetry primary status must be a three-digit status code or null")
+	case !p.Attempted && p.Status != nil:
+		return errors.New("telemetry unattempted primary status must be null")
+	}
+	switch p.Outcome {
+	case PrimaryOutcomeHTTPError:
+		if !p.Attempted || p.Status == nil ||
+			(*p.Status != 429 && *p.Status < 500) {
+			return errors.New("telemetry primary HTTP error requires attempted=true and fallback-eligible 429 or 5xx status")
+		}
+	case PrimaryOutcomeImageInputUnsupported:
+		if p.Attempted && (p.Status == nil || *p.Status != 400) {
+			return errors.New("telemetry attempted primary image rejection requires status 400")
+		}
+	case PrimaryOutcomeTransportError:
+		if !p.Attempted || p.Status != nil {
+			return errors.New("telemetry primary transport error requires attempted=true and null status")
+		}
+	case PrimaryOutcomeTTFTTimeout:
+		if p.Status != nil {
+			return errors.New("telemetry primary TTFT timeout requires null status")
+		}
+	case PrimaryOutcomeRequestBuildError,
+		PrimaryOutcomeCooldown,
+		PrimaryOutcomeAuthUnavailable,
+		PrimaryOutcomeReasoningPolicyError:
+		if p.Attempted || p.Status != nil {
+			return fmt.Errorf("telemetry primary outcome %q requires attempted=false and null status", p.Outcome)
+		}
+	}
+	return nil
+}
+
+func validPrimaryOutcome(outcome string) bool {
+	switch outcome {
+	case PrimaryOutcomeHTTPError,
+		PrimaryOutcomeTransportError,
+		PrimaryOutcomeRequestBuildError,
+		PrimaryOutcomeTTFTTimeout,
+		PrimaryOutcomeImageInputUnsupported,
+		PrimaryOutcomeCooldown,
+		PrimaryOutcomeAuthUnavailable,
+		PrimaryOutcomeReasoningPolicyError:
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *ResponsesCompatibilityV1) validate() error {

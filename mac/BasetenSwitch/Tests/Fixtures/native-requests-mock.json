@@ -16,6 +16,13 @@
         "attempted": true,
         "count": 1,
         "trigger": "image_input_unsupported"
+      },
+      "primary": {
+        "provider": "baseten",
+        "model": "zai-org/GLM-5.2",
+        "attempted": true,
+        "outcome": "image_input_unsupported",
+        "status": 400
       }
     },
     {

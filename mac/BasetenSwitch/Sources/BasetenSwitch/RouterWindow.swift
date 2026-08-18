@@ -230,14 +230,14 @@ final class RouterWindowController: NSObject, NSWindowDelegate, NSToolbarDelegat
             trafficStore.requestRefresh()
         } else if toolbarRefreshesRequests(selection: navigation.selection) {
             requestsStore.refresh()
+        } else if toolbarRefreshesModelCatalog(
+            selection: navigation.selection
+        ) {
+            state.requestClientPageRefresh()
         } else {
             state.requestInteractiveRefresh(includeStats: false)
             if navigation.selection == .overview {
                 doorStore.requestRefresh()
-            } else if toolbarRefreshesModelCatalog(
-                selection: navigation.selection
-            ) {
-                state.requestModelCatalogRefresh()
             }
         }
     }
@@ -1062,10 +1062,14 @@ private struct ClientRoutingView: View {
                 message,
                 state: state)
         }
-        if authNeedsReauth(auth: state.auth),
-           state.displayedGlobalRoutingEnabled {
+        let attention = authAttention(
+            gatewayUp: state.gatewayUp,
+            globalRoutingEnabled: state.confirmedGlobalRoutingEnabled,
+            clients: state.clients,
+            auth: state.auth)
+        if let message = authAttentionWarningMessage(attention) {
             warningBanner(
-                "Baseten authentication requires attention.",
+                message,
                 symbol: "key.fill",
                 color: .orange)
         }
@@ -1422,7 +1426,8 @@ private struct ClientRoutingView: View {
             .labelsHidden()
             .pickerStyle(.menu)
             .frame(width: 230, alignment: .trailing)
-            .disabled(!canEdit || pending)
+            .disabled(
+                !canEdit || pending || !state.modelCatalogAllowsMutation)
             .help(controlHelp)
             .accessibilityLabel(
                 "\(capitalizeFamily(family.family)) model mapping")
@@ -1499,7 +1504,9 @@ private struct ClientRoutingView: View {
             .labelsHidden()
             .pickerStyle(.menu)
             .frame(width: 230, alignment: .trailing)
-            .disabled(!canEdit || pending || projection.selectable.isEmpty)
+            .disabled(
+                !canEdit || pending || !state.modelCatalogAllowsMutation
+                    || projection.selectable.isEmpty)
             .help(controlHelp)
             .accessibilityLabel("Codex model")
             .accessibilityValue(codexRouteConfiguredLabel(
@@ -1606,7 +1613,8 @@ private struct ClientRoutingView: View {
                 .labelsHidden()
                 .pickerStyle(.menu)
                 .frame(width: 230, alignment: .trailing)
-                .disabled(!canEdit || pending)
+                .disabled(
+                    !canEdit || pending || !state.modelCatalogAllowsMutation)
                 .help(subagentControlHelp)
                 .accessibilityLabel("Subagent routing behavior")
                 .accessibilityValue(subagentEffectiveDescription)
@@ -1648,6 +1656,7 @@ private struct ClientRoutingView: View {
             },
             set: { selection in
                 guard !isPreview,
+                      state.modelCatalogAllowsMutation,
                       let choice = familyChoice(
                         selection,
                         catalog: catalog),
@@ -1672,6 +1681,7 @@ private struct ClientRoutingView: View {
             },
             set: { selection in
                 guard !isPreview,
+                      state.modelCatalogAllowsMutation,
                       let model = codexRouteChoice(
                         selection,
                         catalog: catalog),
@@ -1696,6 +1706,7 @@ private struct ClientRoutingView: View {
             get: { displayedSubagentSelection },
             set: { selection in
                 guard !isPreview,
+                      state.modelCatalogAllowsMutation,
                       let choice = subagentChoice(
                         selection,
                         catalog: catalog),

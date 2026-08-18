@@ -30,13 +30,15 @@ func (watch upstreamTTFTWatch) stop() {
 
 // startUpstreamSubAttempt waits for response headers under the remaining
 // absolute TTFT budget. The returned watch stays armed for the first body byte
-// and owns the sub-attempt context.
+// and owns the sub-attempt context. dispatched is true only after client.Do
+// has been started; request construction and an already-expired budget return
+// false without contacting the upstream.
 func startUpstreamSubAttempt(
 	ctx context.Context,
 	at upstreamAttempt,
 	body []byte,
 	ttftDeadline time.Time,
-) (*http.Response, error, bool, upstreamTTFTWatch) {
+) (*http.Response, error, bool, bool, upstreamTTFTWatch) {
 	attemptCtx, attemptCancel := context.WithCancel(ctx)
 	watch := upstreamTTFTWatch{cancel: attemptCancel}
 	upReq, err := http.NewRequestWithContext(
@@ -47,7 +49,7 @@ func startUpstreamSubAttempt(
 	)
 	if err != nil {
 		attemptCancel()
-		return nil, err, false, watch
+		return nil, err, false, false, watch
 	}
 	upReq.Header = at.headers
 
@@ -55,7 +57,7 @@ func startUpstreamSubAttempt(
 		remaining := time.Until(ttftDeadline)
 		if remaining <= 0 {
 			attemptCancel()
-			return nil, nil, true, watch
+			return nil, nil, true, false, watch
 		}
 		watch.timer = time.NewTimer(remaining)
 		watch.c = watch.timer.C
@@ -72,14 +74,14 @@ func startUpstreamSubAttempt(
 	}()
 	select {
 	case result := <-doCh:
-		return result.resp, result.err, false, watch
+		return result.resp, result.err, false, true, watch
 	case <-watch.c:
 		attemptCancel()
 		result := <-doCh
 		if result.resp != nil {
 			result.resp.Body.Close()
 		}
-		return result.resp, result.err, true, watch
+		return result.resp, result.err, true, true, watch
 	}
 }
 
