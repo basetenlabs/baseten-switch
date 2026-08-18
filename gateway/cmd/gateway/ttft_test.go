@@ -16,7 +16,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -183,17 +182,6 @@ func TestAuthUnavailableBypassRecordsFallback(t *testing.T) {
 	defer adminL.Close()
 	stop := start(t, g)
 	defer stop()
-	stderrReader, stderrWriter, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	oldStderr := os.Stderr
-	os.Stderr = stderrWriter
-	defer func() {
-		os.Stderr = oldStderr
-		_ = stderrWriter.Close()
-		_ = stderrReader.Close()
-	}()
 
 	resp, body := ttftPost(
 		t,
@@ -228,6 +216,14 @@ func TestAuthUnavailableBypassRecordsFallback(t *testing.T) {
 			t.Fatalf("row %d fallback telemetry = provider %q, %+v; want anthropic auth-unavailable bypass",
 				i, row.EffectiveProvider, row.Fallback)
 		}
+		if primary := row.Primary; primary == nil ||
+			primary.Provider != "baseten" ||
+			primary.Model != "zai-org/GLM-5.2" ||
+			primary.Attempted ||
+			primary.Outcome != telemetry.PrimaryOutcomeAuthUnavailable ||
+			primary.Status != nil {
+			t.Errorf("row %d auth-unavailable primary = %+v, want unattempted baseten zai-org/GLM-5.2", i, primary)
+		}
 	}
 
 	statusResp, err := http.Get(adminURL(g, "/v1/admin/status"))
@@ -252,32 +248,6 @@ func TestAuthUnavailableBypassRecordsFallback(t *testing.T) {
 		t.Fatalf("auth_unavailable_fallback status = %+v", gotStatus)
 	}
 
-	os.Stderr = oldStderr
-	if err := stderrWriter.Close(); err != nil {
-		t.Fatal(err)
-	}
-	stderr, err := io.ReadAll(stderrReader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{
-		"fallback client=claude-code",
-		"trigger=auth_unavailable",
-		"serving anthropic count=1",
-		"serving anthropic count=2",
-	} {
-		if !strings.Contains(string(stderr), want) {
-			t.Fatalf("stderr missing %q, got:\n%s", want, stderr)
-		}
-	}
-	if primary := row.Primary; primary == nil ||
-		primary.Provider != "baseten" ||
-		primary.Model != "zai-org/GLM-5.2" ||
-		primary.Attempted ||
-		primary.Outcome != telemetry.PrimaryOutcomeAuthUnavailable ||
-		primary.Status != nil {
-		t.Errorf("auth-unavailable primary = %+v, want unattempted baseten zai-org/GLM-5.2", primary)
-	}
 }
 
 // TestTTFTHeadersWithoutBodyFiresFallback: an SSE upstream that sends

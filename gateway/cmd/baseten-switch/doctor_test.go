@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -69,8 +70,10 @@ type doctorFixtureCfg struct {
 	// apiKeyProfile makes the selected local profile a readable API-key
 	// profile. routerSignedOut independently models a stale router that has
 	// not loaded that credential.
-	apiKeyProfile   bool
-	routerSignedOut bool
+	apiKeyProfile         bool
+	routerSignedOut       bool
+	routerFallbackEnabled bool
+	routerFallbackInUse   bool
 	// authLastError sets last_refresh_error alongside authHealth.
 	authLastError string
 	// basetenVersions writes one fake baseten CLI per entry (each in
@@ -168,12 +171,13 @@ func writeDoctorTelemetryEvents(dir string, events ...telemetry.EventV1) error {
 }
 
 type doctorFixture struct {
-	clientAddr string
-	doorAddr   string
-	doorPort   string
-	cfgPath    string
-	settings   string
-	codexHome  string
+	clientAddr     string
+	doorAddr       string
+	doorPort       string
+	cfgPath        string
+	settings       string
+	codexHome      string
+	authStatusHits *atomic.Int32
 }
 
 // startClientListener opens a listener that stays bound for the test:
@@ -195,7 +199,10 @@ func newDoctorFixture(t *testing.T, mut func(*doctorFixtureCfg)) *doctorFixture 
 		mut(&cfg)
 	}
 	dir := t.TempDir()
-	fx := &doctorFixture{clientAddr: startClientListener(t)}
+	fx := &doctorFixture{
+		clientAddr:     startClientListener(t),
+		authStatusHits: &atomic.Int32{},
+	}
 	// Resolved up front: the fake door's probe handler (below) appends
 	// the probe's telemetry v1 event here, emulating the router's write.
 	telDir := filepath.Join(dir, "telemetry")
@@ -220,13 +227,36 @@ func newDoctorFixture(t *testing.T, mut func(*doctorFixtureCfg)) *doctorFixture 
 			clientRoute = "baseten"
 		}
 		mux.HandleFunc("/v1/admin/status", func(w http.ResponseWriter, r *http.Request) {
-			fmt.Fprintf(w, `{"uptime_seconds":42,"version":%q,
-				"auth":{"signed_in":true,"profile":"doc","fallback_enabled":false,"fallback_in_use":false},
-				"clients":[{"name":"claude-code","enabled":true,"bind_addr":%q,"protocol_shape":"anthropic",
-					"effective_route":%q,"fallback_route":%q,"auth_set":true,"currently_bound":true}]}`,
-				version.Version, fx.clientAddr, clientRoute, cfg.fallbackRoute)
+			profile := "doc@example.com"
+			if cfg.apiKeyProfile {
+				profile = "example-profile"
+			}
+			authStatus := map[string]any{
+				"signed_in":        !cfg.routerSignedOut,
+				"profile":          profile,
+				"fallback_enabled": cfg.routerFallbackEnabled,
+				"fallback_in_use":  cfg.routerFallbackInUse,
+			}
+			if cfg.authHealth != "-" {
+				authStatus["health"] = cfg.authHealth
+				authStatus["last_refresh_error"] = cfg.authLastError
+				authStatus["last_refresh_error_at"] = "2026-07-13T09:55:00Z"
+			}
+			writeJSON := map[string]any{
+				"uptime_seconds": 42,
+				"version":        version.Version,
+				"auth":           authStatus,
+				"clients": []map[string]any{{
+					"name": "claude-code", "enabled": true,
+					"bind_addr": fx.clientAddr, "protocol_shape": "anthropic",
+					"effective_route": clientRoute, "fallback_route": cfg.fallbackRoute,
+					"auth_set": true, "currently_bound": true,
+				}},
+			}
+			_ = json.NewEncoder(w).Encode(writeJSON)
 		})
 		mux.HandleFunc("/v1/admin/auth/status", func(w http.ResponseWriter, r *http.Request) {
+			fx.authStatusHits.Add(1)
 			healthPart := ""
 			if cfg.authHealth != "-" {
 				// json.Marshal, not %q: the error text is server
@@ -1454,6 +1484,8 @@ func TestDoctorForeignAdminPort(t *testing.T) {
 func TestDoctorUnresolvedAPIKeyNoOAuth(t *testing.T) {
 	newDoctorFixture(t, func(c *doctorFixtureCfg) {
 		c.signedIn = false
+		c.routerSignedOut = true
+		c.authHealth = "signed_out"
 		c.globalAuth = "${BASETEN_API_KEY}"
 	})
 	rep := runDoctor(doctorOpts{})
@@ -1474,7 +1506,10 @@ func TestDoctorUnresolvedAPIKeyNoOAuth(t *testing.T) {
 
 func TestDoctorEnvironmentAPIKeyRequiresFallbackFlag(t *testing.T) {
 	t.Run("process environment key without flag fails", func(t *testing.T) {
-		newDoctorFixture(t, func(c *doctorFixtureCfg) { c.signedIn = false })
+		newDoctorFixture(t, func(c *doctorFixtureCfg) {
+			c.signedIn = false
+			c.adminDown = true
+		})
 		t.Setenv("BASETEN_API_KEY", "synthetic-ignored-key")
 
 		rep := runDoctor(doctorOpts{})
@@ -1487,7 +1522,10 @@ func TestDoctorEnvironmentAPIKeyRequiresFallbackFlag(t *testing.T) {
 	})
 
 	t.Run("process environment key and truthy flag pass", func(t *testing.T) {
-		newDoctorFixture(t, func(c *doctorFixtureCfg) { c.signedIn = false })
+		newDoctorFixture(t, func(c *doctorFixtureCfg) {
+			c.signedIn = false
+			c.adminDown = true
+		})
 		t.Setenv("BASETEN_API_KEY", "synthetic-enabled-key")
 		t.Setenv("BASETEN_SWITCH_API_KEY_FALLBACK", "yes")
 
@@ -1499,7 +1537,10 @@ func TestDoctorEnvironmentAPIKeyRequiresFallbackFlag(t *testing.T) {
 	})
 
 	t.Run("Switch env file key and flag pass", func(t *testing.T) {
-		newDoctorFixture(t, func(c *doctorFixtureCfg) { c.signedIn = false })
+		newDoctorFixture(t, func(c *doctorFixtureCfg) {
+			c.signedIn = false
+			c.adminDown = true
+		})
 		envPath := os.Getenv("BASETEN_SWITCH_ENV_FILE")
 		if err := os.WriteFile(envPath, []byte("BASETEN_API_KEY='synthetic-file-key'\nBASETEN_SWITCH_API_KEY_FALLBACK=\"true\"\n"), 0o600); err != nil {
 			t.Fatal(err)
@@ -1513,7 +1554,10 @@ func TestDoctorEnvironmentAPIKeyRequiresFallbackFlag(t *testing.T) {
 	})
 
 	t.Run("process environment takes precedence over Switch env file", func(t *testing.T) {
-		newDoctorFixture(t, func(c *doctorFixtureCfg) { c.signedIn = false })
+		newDoctorFixture(t, func(c *doctorFixtureCfg) {
+			c.signedIn = false
+			c.adminDown = true
+		})
 		envPath := os.Getenv("BASETEN_SWITCH_ENV_FILE")
 		if err := os.WriteFile(envPath, []byte("BASETEN_API_KEY=synthetic-file-key\nBASETEN_SWITCH_API_KEY_FALLBACK=1\n"), 0o600); err != nil {
 			t.Fatal(err)
@@ -1626,7 +1670,7 @@ func TestDoctorUsesRouterSelectedCredentialProfile(t *testing.T) {
 	var check doctorCheck
 	store := doctorAuthCheck(func(section, name, status, finding, fix string, fixArgv ...string) {
 		check = doctorCheck{Section: section, Name: name, Status: status, Finding: finding, Fix: fix}
-	}, &config.File{}, nil, map[string]string{}, filepath.Join(t.TempDir(), "env"), "", false)
+	}, &config.File{}, nil, map[string]string{}, filepath.Join(t.TempDir(), "env"), doctorRouterAuth{}, false)
 	if check.Status != docOK || !strings.Contains(check.Finding, "selected-api-key") {
 		t.Fatalf("signin = %+v, want explicitly selected API-key profile", check)
 	}
@@ -1643,6 +1687,60 @@ func TestDoctorUsesRunningRouterCredentialProfile(t *testing.T) {
 	if check.Status != docOK || !strings.Contains(check.Finding, "OAuth") {
 		t.Fatalf("signin = %+v, want the running router's readable OAuth profile", check)
 	}
+}
+
+func TestDoctorUsesRunningRouterSignedInStateWhenLocalStoreIsMissing(t *testing.T) {
+	t.Setenv("BASETEN_SWITCH_AUTH_FILE", filepath.Join(t.TempDir(), "missing-auth.json"))
+	var check doctorCheck
+	doctorAuthCheck(func(section, name, status, finding, fix string, fixArgv ...string) {
+		check = doctorCheck{Section: section, Name: name, Status: status, Finding: finding, Fix: fix}
+	}, &config.File{}, nil, map[string]string{}, filepath.Join(t.TempDir(), "env"), doctorRouterAuth{
+		SignedIn: true,
+		AuthType: "oauth",
+		Profile:  "router-profile",
+	}, true)
+	if check.Status != docOK || !strings.Contains(check.Finding, "router-profile") {
+		t.Fatalf("signin = %+v, want authoritative running-router sign-in", check)
+	}
+}
+
+func TestDoctorUsesRunningRouterEnvironmentFallbackState(t *testing.T) {
+	t.Run("later shell key is not treated as router credential", func(t *testing.T) {
+		fx := newDoctorFixture(t, func(c *doctorFixtureCfg) {
+			c.signedIn = false
+			c.routerSignedOut = true
+			c.authHealth = "signed_out"
+		})
+		t.Setenv("BASETEN_API_KEY", "synthetic-shell-only-key")
+		t.Setenv("BASETEN_SWITCH_API_KEY_FALLBACK", "1")
+
+		check := findCheck(t, runDoctor(doctorOpts{}), "auth", "signin")
+		if check.Status != docFail ||
+			!strings.Contains(check.Finding, "not loaded by the running router") {
+			t.Fatalf("signin = %+v, want running-router credential failure", check)
+		}
+		if got := fx.authStatusHits.Load(); got != 0 {
+			t.Fatalf("/v1/admin/auth/status requests = %d, want 0", got)
+		}
+	})
+
+	t.Run("router fallback in use is authoritative", func(t *testing.T) {
+		fx := newDoctorFixture(t, func(c *doctorFixtureCfg) {
+			c.signedIn = false
+			c.routerSignedOut = true
+			c.authHealth = "signed_out"
+			c.routerFallbackEnabled = true
+			c.routerFallbackInUse = true
+		})
+
+		check := findCheck(t, runDoctor(doctorOpts{}), "auth", "signin")
+		if check.Status != docOK || !strings.Contains(check.Finding, "running router") {
+			t.Fatalf("signin = %+v, want authoritative running-router fallback", check)
+		}
+		if got := fx.authStatusHits.Load(); got != 0 {
+			t.Fatalf("/v1/admin/auth/status requests = %d, want 0", got)
+		}
+	})
 }
 
 func TestDoctorJSONShape(t *testing.T) {

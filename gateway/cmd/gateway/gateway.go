@@ -692,9 +692,6 @@ func newGatewayWithSnapshot(
 	if snapshot != nil {
 		g.activateConfigSnapshot(snapshot.file, snapshot.raw)
 	}
-	if err := auth.CheckStore(); err != nil {
-		fmt.Fprintf(os.Stderr, "[gateway] auth: credential store load failed at boot: %v\n", err)
-	}
 	g.refreshAuth()
 	return g, nil
 }
@@ -834,20 +831,34 @@ func (g *Gateway) refreshAuth() {
 func (g *Gateway) refreshAuthLocked() {
 	cfg := g.runtimeConfig()
 	g.authMu.Lock()
-	// Each build is a new lineage: outcomes from clients built before
-	// this swap are stale and noteAuthRefresh drops them by generation.
-	g.authGen++
-	gen := g.authGen
+	previousGen := g.authGen
+	gen := previousGen + 1
 	g.authMu.Unlock()
 
 	notify := func(fp string, err error) { g.noteAuthRefresh(gen, fp, err) }
-	client, tick, credFP, err := auth.HTTPClientWithNotify(context.Background(), cfg.OAuthProfile, cfg.OAuthHost, notify)
+	client, tick, credFP, err := auth.HTTPClientWithNotifyDetailed(context.Background(), cfg.OAuthProfile, cfg.OAuthHost, notify)
+	storeFailure := ""
+	switch {
+	case errors.Is(err, auth.ErrStoreUnreadable):
+		storeFailure = "unreadable"
+	case errors.Is(err, auth.ErrStoreMalformed):
+		storeFailure = "malformed"
+	}
+	if storeFailure != "" {
+		fmt.Fprintf(os.Stderr, "[gateway] auth: credential store %s; preserving current auth: %v\n", storeFailure, err)
+		return
+	}
 
 	g.authMu.Lock()
 	defer g.authMu.Unlock()
-	if gen != g.authGen {
+	if previousGen != g.authGen {
 		return
 	}
+	// Publishing a successfully resolved credential starts a new lineage.
+	// Outcomes from clients built before this swap are stale and
+	// noteAuthRefresh drops them by generation. A classified store failure
+	// returns above without invalidating the client that remains in use.
+	g.authGen = gen
 	previousStoreFP := g.authStoreFP
 	g.cliProfileAPIKey = ""
 	g.authStoreFP = ""
@@ -2185,20 +2196,11 @@ func (g *Gateway) noteAuthUnavailableFallback(
 	g.authUnavailableFallbackMu.Lock()
 	now := time.Now().UTC()
 	g.authUnavailableFallbackCount++
-	count := g.authUnavailableFallbackCount
 	g.authUnavailableFallbackAt = now
 	g.authUnavailableFallbackClient = cl.cfg.Name
 	g.authUnavailableFallbackRoute = at.route
 	g.authUnavailableFallbackMu.Unlock()
 	w.Header().Set(authUnavailableFallbackHeader, fallbackTriggerAuthUnavailable)
-	fmt.Fprintf(
-		os.Stderr,
-		"[gateway] fallback client=%s route=baseten trigger=%s -> serving %s count=%d\n",
-		cl.cfg.Name,
-		fallbackTriggerAuthUnavailable,
-		at.route,
-		count,
-	)
 }
 
 // errNeedsLogin marks an attempt whose route has no usable credentials

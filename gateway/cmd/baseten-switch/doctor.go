@@ -191,9 +191,9 @@ func runDoctor(o doctorOpts) doctorReport {
 	routerState := probePort(adminAddr, routerHealthPath, routerHealthMarker)
 
 	// --- 3. auth ----------------------------------------------------------
-	routerProfile, routerProfileKnown := doctorRouterAuthProfile(adminAddr, routerState == portOurs)
-	storeAuth := doctorAuthCheck(add, f, unresolved, envFile, envFilePath, routerProfile, routerProfileKnown)
-	doctorAuthHealthCheck(add, adminAddr, routerState == portOurs, storeAuth)
+	routerAuth, routerAuthKnown := doctorRouterAuthSnapshot(adminAddr, routerState == portOurs)
+	storeAuth := doctorAuthCheck(add, f, unresolved, envFile, envFilePath, routerAuth, routerAuthKnown)
+	doctorAuthHealthCheck(add, routerState == portOurs, routerAuth, routerAuthKnown, storeAuth)
 	doctorBasetenCLICheck(add)
 
 	// --- 4. router --------------------------------------------------------
@@ -430,10 +430,10 @@ type doctorStoreAuth struct {
 	ready    bool
 }
 
-func doctorAuthCheck(add addCheck, f *config.File, unresolved []string, envFile map[string]string, envFilePath, routerProfile string, routerProfileKnown bool) doctorStoreAuth {
+func doctorAuthCheck(add addCheck, f *config.File, unresolved []string, envFile map[string]string, envFilePath string, routerAuth doctorRouterAuth, routerAuthKnown bool) doctorStoreAuth {
 	profile := doctorEnvValue("BASETEN_SWITCH_OAUTH_PROFILE", envFile)
-	if routerProfileKnown {
-		profile = routerProfile
+	if routerAuthKnown {
+		profile = routerAuth.Profile
 	}
 	tok, loc, err := auth.LoadDetailed(profile)
 	var ak *auth.APIKeyProfileError
@@ -467,6 +467,51 @@ func doctorAuthCheck(add addCheck, f *config.File, unresolved []string, envFile 
 			add("auth", "signin", docOK, "signed in (OAuth)", "")
 		}
 		return doctorStoreAuth{profile: loadedProfile, authType: "OAuth", ready: true}
+	}
+	if routerAuthKnown && routerAuth.SignedIn {
+		authType := strings.TrimSpace(routerAuth.AuthType)
+		if authType == "" {
+			authType = "credential"
+		}
+		finding := fmt.Sprintf("the running router is signed in with %s auth", authType)
+		if routerAuth.Profile != "" {
+			finding += fmt.Sprintf(" (profile %q)", routerAuth.Profile)
+		}
+		add("auth", "signin", docOK, finding, "")
+		return doctorStoreAuth{}
+	}
+
+	// A reachable router is authoritative for environment fallback state.
+	// Launchd does not inherit later shell exports, and the Switch env file can
+	// also change after the process starts. Local values are used only offline.
+	if routerAuthKnown {
+		if routerAuth.FallbackInUse {
+			add("auth", "signin", docOK, "no profile sign-in, but the running router's enabled BASETEN_API_KEY fallback is usable", "")
+			return doctorStoreAuth{}
+		}
+		if authVars := doctorAuthPlaceholders(f, unresolved); len(authVars) > 0 {
+			add("auth", "signin", docFail,
+				fmt.Sprintf("the running router is signed out and gateway.yaml references ${%s} which is unset; baseten-routed requests have no credential", strings.Join(authVars, "}, ${")),
+				fmt.Sprintf("baseten auth login   (or set %s=... in %s)", authVars[0], envFilePath))
+			return doctorStoreAuth{}
+		}
+		finding := "the running router has no usable profile credential"
+		if routerAuth.FallbackEnabled {
+			finding += " and API-key fallback is enabled but has no usable key loaded"
+		} else {
+			finding += " and API-key fallback is disabled"
+		}
+		if doctorEnvValue("BASETEN_API_KEY", envFile) != "" && doctorAPIKeyFallbackEnabled(envFile) {
+			finding += "; the current shell's BASETEN_API_KEY fallback is not loaded by the running router"
+		}
+		status := docWarn
+		if names := doctorBasetenRouted(f); len(names) > 0 {
+			status = docFail
+			finding += "; baseten-routed requests have no usable credential: " + strings.Join(names, ", ")
+		}
+		add("auth", "signin", status, finding,
+			"baseten-switch up   (reload the running router's credential state, or run 'baseten auth login')")
+		return doctorStoreAuth{}
 	}
 
 	// Not signed in. The environment fallback is usable only when both the
@@ -518,24 +563,36 @@ func doctorEnvValue(name string, envFile map[string]string) string {
 	return value
 }
 
-// doctorRouterAuthProfile returns the credential profile selected by the
-// running router. Launchd does not inherit later shell overrides, so this is
-// authoritative when available; offline doctor falls back to local env.
-func doctorRouterAuthProfile(adminAddr string, routerUp bool) (string, bool) {
+type doctorRouterAuth struct {
+	SignedIn         bool   `json:"signed_in"`
+	AuthType         string `json:"auth_type"`
+	Profile          string `json:"profile"`
+	Health           string `json:"health"`
+	LastRefreshError string `json:"last_refresh_error"`
+	LastRefreshErrAt string `json:"last_refresh_error_at"`
+	FallbackEnabled  bool   `json:"fallback_enabled"`
+	FallbackInUse    bool   `json:"fallback_in_use"`
+}
+
+// doctorRouterAuthSnapshot reads the local-only auth projection from the
+// general status endpoint. It avoids /v1/admin/auth/status, whose identity
+// fields may require a synchronous upstream request. When unavailable, doctor
+// retains its offline environment-based checks.
+func doctorRouterAuthSnapshot(adminAddr string, routerUp bool) (doctorRouterAuth, bool) {
 	if !routerUp {
-		return "", false
+		return doctorRouterAuth{}, false
 	}
-	body, ok := doctorAdminGetOK(&http.Client{Timeout: 2 * time.Second}, adminAddr, "/v1/admin/auth/status")
+	body, ok := doctorAdminGetOK(&http.Client{Timeout: 2 * time.Second}, adminAddr, "/v1/admin/status")
 	if !ok {
-		return "", false
+		return doctorRouterAuth{}, false
 	}
 	var payload struct {
-		Profile string `json:"profile"`
+		Auth *doctorRouterAuth `json:"auth"`
 	}
-	if json.Unmarshal([]byte(body), &payload) != nil {
-		return "", false
+	if json.Unmarshal([]byte(body), &payload) != nil || payload.Auth == nil {
+		return doctorRouterAuth{}, false
 	}
-	return payload.Profile, true
+	return *payload.Auth, true
 }
 
 func doctorAPIKeyFallbackEnabled(envFile map[string]string) bool {
@@ -548,27 +605,20 @@ func doctorAPIKeyFallbackEnabled(envFile map[string]string) bool {
 }
 
 // doctorAuthHealthCheck reads the running router's credential health
-// (auth.health in /v1/admin/auth/status, derived from real refresh
+// (auth.health in /v1/admin/status, derived from real refresh
 // outcomes). The store-based signin check above cannot detect a dead
 // refresh token: the credential is present, but the token endpoint rejects
 // it. The current admin contract requires the health field.
-func doctorAuthHealthCheck(add addCheck, adminAddr string, routerUp bool, store doctorStoreAuth) {
+func doctorAuthHealthCheck(add addCheck, routerUp bool, routerAuth doctorRouterAuth, routerAuthKnown bool, store doctorStoreAuth) {
 	if !routerUp {
 		add("auth", "health", docSkip, "router not up; credential health is derived from the running router's refresh outcomes", "")
 		return
 	}
-	httpC := &http.Client{Timeout: 2 * time.Second}
-	body, ok := doctorAdminGetOK(httpC, adminAddr, "/v1/admin/auth/status")
-	if !ok {
-		add("auth", "health", docSkip, "admin /v1/admin/auth/status unavailable; cannot read credential health", "")
+	if !routerAuthKnown {
+		add("auth", "health", docSkip, "admin /v1/admin/status auth projection unavailable; cannot read credential health", "")
 		return
 	}
-	var payload map[string]any
-	if err := json.Unmarshal([]byte(body), &payload); err != nil {
-		add("auth", "health", docSkip, fmt.Sprintf("auth status does not parse: %v", err), "")
-		return
-	}
-	health, _ := payload["health"].(string)
+	health := routerAuth.Health
 	if health == "" {
 		add("auth", "health", docFail,
 			"router auth status omitted the required health field",
@@ -580,9 +630,9 @@ func doctorAuthHealthCheck(add addCheck, adminAddr string, routerUp bool, store 
 	// the raw body); a hostile or misconfigured endpoint could otherwise
 	// inject newlines/ANSI sequences that forge or hide check lines in
 	// the report, or flood the terminal.
-	lastErr := sanitizeAdminText(payload["last_refresh_error"], 200)
-	lastErrAt := sanitizeAdminText(payload["last_refresh_error_at"], 40)
-	routerSignedIn, _ := payload["signed_in"].(bool)
+	lastErr := sanitizeAdminText(routerAuth.LastRefreshError, 200)
+	lastErrAt := sanitizeAdminText(routerAuth.LastRefreshErrAt, 40)
+	routerSignedIn := routerAuth.SignedIn
 	if store.ready && (!routerSignedIn || health == "signed_out") {
 		storedCredential := store.authType + " credential"
 		if store.profile != "" {
