@@ -808,15 +808,35 @@ func (g *Gateway) shutdownAllClients() {
 }
 
 func (g *Gateway) refreshAuth() {
+	g.reloadMu.Lock()
+	defer g.reloadMu.Unlock()
+	g.refreshAuthLocked()
+}
+
+// refreshAuthLocked reloads the selected CLI credential while reloadMu is
+// held. Config reload and explicit auth reload both use this path so an auth
+// client built for an old profile cannot publish after a newer runtime config.
+// Credential-store and Keychain reads happen outside authMu, keeping status
+// reads and in-flight request auth selection responsive while the load runs.
+// Publishing preserves the existing nonblocking catalog-refresh kick.
+func (g *Gateway) refreshAuthLocked() {
 	cfg := g.runtimeConfig()
 	g.authMu.Lock()
-	defer g.authMu.Unlock()
 	// Each build is a new lineage: outcomes from clients built before
 	// this swap are stale and noteAuthRefresh drops them by generation.
 	g.authGen++
 	gen := g.authGen
+	g.authMu.Unlock()
+
 	notify := func(fp string, err error) { g.noteAuthRefresh(gen, fp, err) }
 	client, tick, credFP, err := auth.HTTPClientWithNotify(context.Background(), cfg.OAuthProfile, cfg.OAuthHost, notify)
+
+	g.authMu.Lock()
+	defer g.authMu.Unlock()
+	if gen != g.authGen {
+		return
+	}
+	previousStoreFP := g.authStoreFP
 	g.cliProfileAPIKey = ""
 	g.authStoreFP = ""
 	switch {
@@ -840,18 +860,30 @@ func (g *Gateway) refreshAuth() {
 			g.cliProfileAPIKey = strings.TrimSpace(apiKeyProfile.Key)
 			g.authStoreFP = apiKeyStoreFingerprint(apiKeyProfile.Profile, g.cliProfileAPIKey)
 		}
-		// API-key profiles have no OAuth refresh lineage. Do not carry
-		// OAuth-only health state across a profile transition.
-		g.authDead = false
-		g.authDeadFP = ""
-		g.authLastErr = ""
-		g.authLastErrAt = time.Time{}
-		g.authLastOKAt = time.Time{}
 	default:
 		g.oauthClient = nil
 		g.authTick = nil
 		g.oauthProfileErr = err
 		fmt.Fprintf(os.Stderr, "[gateway] auth refresh failed: %v\n", err)
+	}
+	credentialChanged := previousStoreFP != g.authStoreFP
+	if credentialChanged {
+		// Health belongs to one credential identity. Login, logout, profile
+		// replacement, and auth-type transitions must not inherit a prior
+		// OAuth failure or success timestamp.
+		g.authDead = false
+		g.authDeadFP = ""
+		g.authLastErr = ""
+		g.authLastErrAt = time.Time{}
+		g.authLastOKAt = time.Time{}
+
+		// Cached identity also belongs to the credential that fetched it.
+		// Clearing on the same store identity transition prevents status from
+		// showing the previous account for up to the cache TTL.
+		g.emailMu.Lock()
+		g.emailCached = ""
+		g.emailFetchedAt = time.Time{}
+		g.emailMu.Unlock()
 	}
 	// Re-login detection: if the credential was marked dead but the
 	// store now holds a DIFFERENT refresh token than the one that died
@@ -4513,7 +4545,7 @@ func (g *Gateway) reloadConfig() {
 		}(lg)
 	}
 
-	g.refreshAuth()
+	g.refreshAuthLocked()
 	runtimeCfg := g.runtimeConfig()
 	runPreflight(&runtimeCfg, desired, os.Stderr)
 }

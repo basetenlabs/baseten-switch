@@ -90,6 +90,30 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                         y: button.bounds.minY - 2),
             in: button)
     }
+
+    var fixedHeaderSubtitleForTesting: String? {
+        headerView?.subtitleForTesting
+    }
+
+    var displayedIconStateForTesting: MenubarIconState? {
+        displayedIconState
+    }
+
+    var menuItemTitlesForTesting: [String] {
+        menu.items.map(\.title)
+    }
+
+    func menuWillOpenForTesting() {
+        menuWillOpen(menu)
+    }
+
+    func menuDidCloseForTesting() {
+        menuDidClose(menu)
+    }
+
+    func menuNeedsUpdateForTesting() {
+        menuNeedsUpdate(menu)
+    }
 #endif
 
     // MARK: - Menu
@@ -175,12 +199,20 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         if !state.gatewayUp {
             return "Local gateway is unavailable"
         }
-        if authNeedsReauth(auth: state.auth) {
-            return "Authentication required"
+        if let subtitle = authAttentionHeaderSubtitle(currentAuthAttention) {
+            return subtitle
         }
         return state.confirmedGlobalRoutingEnabled
             ? "Routing rules are active"
             : "Native providers only"
+    }
+
+    private var currentAuthAttention: AuthAttention {
+        authAttention(
+            gatewayUp: state.gatewayUp,
+            globalRoutingEnabled: state.confirmedGlobalRoutingEnabled,
+            clients: state.clients,
+            auth: state.auth)
     }
 
     /// Updating labels and control state in the existing custom header is
@@ -208,12 +240,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             added = true
         }
 
-        if authNeedsReauth(auth: state.auth) {
+        let attention = currentAuthAttention
+        if attention != .none,
+           let stableTitle = authAttentionActionTitle(attention) {
+            let previewTitle = attention == .signIn
+                ? "Preview Sign In Disabled"
+                : "Preview Reauthentication Disabled"
             let item = variant.channel == .preview
-                ? disabledItem("Preview Authentication Disabled")
-                : actionItem(
-                    "Authentication Required…",
-                    action: #selector(reauthenticate))
+                ? disabledItem(previewTitle)
+                : actionItem(stableTitle, action: #selector(reauthenticate))
             item.image = symbol("key.fill")
             item.isEnabled = variant.channel == .stable && !state.reauthenticating
             menu.addItem(item)
@@ -502,6 +537,12 @@ final class StatusMenuHeaderView: NSView {
                 ?? "Routes supported coding traffic using the saved model mappings.")
         toggleControl.synchronize()
     }
+
+#if DEBUG
+    var subtitleForTesting: String {
+        detail.stringValue
+    }
+#endif
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { nil }
