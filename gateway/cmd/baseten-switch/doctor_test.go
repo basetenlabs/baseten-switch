@@ -93,13 +93,20 @@ type doctorFixtureCfg struct {
 	probeTelRoute        string
 	probeTelEffective    string
 	probeFallbackTrigger string
-	probeStatus          int
-	probeError           string
+	// probeStatus, when >= 400, makes the fake door answer the probe with
+	// that status and probeError as the body instead of the 200 success
+	// payload (for example the native provider's auth rejection for the
+	// credential-less probe). 0 means 200.
+	probeStatus int
+	probeError  string
 	// probeConcurrentModel, when non-empty, makes the fake door append a
 	// second v1 event AFTER the probe's event: a concurrent harness
 	// request completing just behind the probe, the misattribution
 	// hazard for the served-route check.
 	probeConcurrentModel string
+	// routingOff writes routing_enabled: false so the configured route
+	// for every model is the native one.
+	routingOff bool
 	// codexClient adds an enabled openai-shape codex client sharing the
 	// claude listener (the real shared-listener topology) so the doctor
 	// codex section resolves instead of skipping.
@@ -321,8 +328,13 @@ func newDoctorFixture(t *testing.T, mut func(*doctorFixtureCfg)) *doctorFixture 
 
 	// Config.
 	comment := "# doctor test config\n"
+	routingEnabled := "true"
+	if cfg.routingOff {
+		routingEnabled = "false"
+	}
 	globalBlock := fmt.Sprintf(
-		"global:\n  routing_enabled: true\n  telemetry_dir: %q\n",
+		"global:\n  routing_enabled: %s\n  telemetry_dir: %q\n",
+		routingEnabled,
 		telDir,
 	)
 	if cfg.globalAuth != "" {
@@ -2377,6 +2389,161 @@ func TestDoctorProbeUnstampedDoorFails(t *testing.T) {
 		!strings.Contains(c.Finding, "required X-Baseten-Switch-Door") ||
 		!strings.Contains(c.Fix, "baseten-switch up") {
 		t.Fatalf("route = %s (%s), fix %q; want current-contract failure", c.Status, c.Finding, c.Fix)
+	}
+}
+
+// TestDoctorProbeNativeRouteAuthRejectionOK pins the native-passthrough
+// contract: with routing off the probe goes to the native provider
+// carrying no credential, so the provider's 401 is the expected answer
+// on a healthy chain and must not fail doctor (README: doctor exits 0
+// when nothing fails).
+func TestDoctorProbeNativeRouteAuthRejectionOK(t *testing.T) {
+	fx := newDoctorFixture(t, func(c *doctorFixtureCfg) {
+		c.routingOff = true
+		c.clientRoute = "anthropic" // keep the fake admin view consistent
+		c.doorProbe = "router"
+		c.probeStatus = http.StatusUnauthorized
+		c.probeError = `{"error":{"type":"authentication_error","message":"invalid x-api-key"}}`
+		c.probeTelRoute = "anthropic"
+	})
+	rep := runDoctor(doctorOpts{probe: true, yes: true, timeoutSec: 5})
+	if c := findCheck(t, rep, "e2e", "probe:"+fx.doorPort); c.Status != docOK {
+		t.Fatalf("probe = %s (%s), want ok: the provider's 401 proves the native path", c.Status, c.Finding)
+	}
+	// The served route is still attributed from the router's telemetry, so
+	// the probe allowance cannot mask a router that answered elsewhere.
+	c := findCheck(t, rep, "e2e", "route:"+fx.doorPort)
+	if c.Status != docOK || !strings.Contains(c.Finding, "reached the configured route (anthropic)") {
+		t.Fatalf("route = %s (%s), want ok naming the native route", c.Status, c.Finding)
+	}
+	if rep.ExitCode != 0 {
+		t.Errorf("exit = %d, want 0 on a healthy native-passthrough chain\nchecks: %+v", rep.ExitCode, rep.Checks)
+	}
+}
+
+// TestDoctorProbePinnedNativeRouteAuthRejectionOK covers the same
+// credential-less rejection with routing ON but the probe's model
+// pinned native: the pin designates the native route, so a 401 from
+// the provider is the healthy answer here too.
+func TestDoctorProbePinnedNativeRouteAuthRejectionOK(t *testing.T) {
+	fx := newDoctorFixture(t, func(c *doctorFixtureCfg) {
+		c.modelRoutes = map[string]string{"opus": "native"}
+		c.doorProbe = "router"
+		c.probeStatus = http.StatusUnauthorized
+		c.probeError = `{"error":{"type":"authentication_error","message":"invalid x-api-key"}}`
+		c.probeTelRoute = "anthropic"
+	})
+	rep := runDoctor(doctorOpts{probe: true, yes: true, timeoutSec: 5})
+	if c := findCheck(t, rep, "e2e", "probe:"+fx.doorPort); c.Status != docOK {
+		t.Fatalf("probe = %s (%s), want ok on the pin-designated native route", c.Status, c.Finding)
+	}
+	c := findCheck(t, rep, "e2e", "route:"+fx.doorPort)
+	if c.Status != docOK || !strings.Contains(c.Finding, "reached the configured route (anthropic)") {
+		t.Fatalf("route = %s (%s), want ok naming the native route", c.Status, c.Finding)
+	}
+}
+
+// TestDoctorProbeNativeAuthRejectionRouterFallbackServedFails pins the
+// boundary between the two halves of the probe verdict: the credential-less
+// rejection may pass the probe check, but the served route is still
+// attributed from the router's telemetry. A router that answered the probe
+// from its fallback_route instead of the native route it was configured for
+// must still fail the chain.
+func TestDoctorProbeNativeAuthRejectionRouterFallbackServedFails(t *testing.T) {
+	fx := newDoctorFixture(t, func(c *doctorFixtureCfg) {
+		c.routingOff = true
+		c.clientRoute = "anthropic"
+		c.doorProbe = "router"
+		c.probeStatus = http.StatusUnauthorized
+		c.probeError = `{"error":{"type":"authentication_error","message":"invalid x-api-key"}}`
+		c.probeTelRoute = "anthropic"
+		c.probeTelEffective = "baseten" // the router's fallback_route served it
+	})
+	rep := runDoctor(doctorOpts{probe: true, yes: true, timeoutSec: 5})
+	if c := findCheck(t, rep, "e2e", "probe:"+fx.doorPort); c.Status != docOK {
+		t.Fatalf("probe = %s (%s), want ok: the rejection still came back through the door", c.Status, c.Finding)
+	}
+	c := findCheck(t, rep, "e2e", "route:"+fx.doorPort)
+	if c.Status != docFail {
+		t.Fatalf("route = %s (%s), want fail: the configured native route was not exercised", c.Status, c.Finding)
+	}
+	for _, want := range []string{`"baseten"`, `"anthropic"`} {
+		if !strings.Contains(c.Finding, want) {
+			t.Errorf("finding %q missing %q", c.Finding, want)
+		}
+	}
+	if rep.ExitCode != 1 {
+		t.Errorf("exit = %d, want 1 when the configured route never served the probe", rep.ExitCode)
+	}
+}
+
+// TestDoctorProbeNativeRouteAuthRejectionDoorFallbackFails ensures a
+// provider rejection cannot prove the router path when the door's native
+// failover served the request instead.
+func TestDoctorProbeNativeRouteAuthRejectionDoorFallbackFails(t *testing.T) {
+	fx := newDoctorFixture(t, func(c *doctorFixtureCfg) {
+		c.routingOff = true
+		c.clientRoute = "anthropic"
+		c.doorProbe = "fallback"
+		c.probeStatus = http.StatusUnauthorized
+	})
+	rep := runDoctor(doctorOpts{probe: true, yes: true, timeoutSec: 5})
+	if c := findCheck(t, rep, "e2e", "probe:"+fx.doorPort); c.Status != docFail {
+		t.Fatalf("probe = %s (%s), want fail when native failover bypasses the router", c.Status, c.Finding)
+	}
+	if rep.ExitCode != 1 {
+		t.Errorf("exit = %d, want 1", rep.ExitCode)
+	}
+}
+
+// TestDoctorProbeNativeRouteAuthRejectionUnstampedFails ensures an
+// unstamped provider rejection cannot be attributed to the router path.
+func TestDoctorProbeNativeRouteAuthRejectionUnstampedFails(t *testing.T) {
+	fx := newDoctorFixture(t, func(c *doctorFixtureCfg) {
+		c.routingOff = true
+		c.clientRoute = "anthropic"
+		c.doorProbe = "none"
+		c.probeStatus = http.StatusForbidden
+	})
+	rep := runDoctor(doctorOpts{probe: true, yes: true, timeoutSec: 5})
+	if c := findCheck(t, rep, "e2e", "probe:"+fx.doorPort); c.Status != docFail {
+		t.Fatalf("probe = %s (%s), want fail without router provenance", c.Status, c.Finding)
+	}
+	if rep.ExitCode != 1 {
+		t.Errorf("exit = %d, want 1", rep.ExitCode)
+	}
+}
+
+// TestDoctorProbeBasetenRouteAuthRejectionFails guards the boundary of
+// the native allowance: on the baseten route a 401 means the Baseten
+// credential itself is broken, which must keep failing doctor.
+func TestDoctorProbeBasetenRouteAuthRejectionFails(t *testing.T) {
+	fx := newDoctorFixture(t, func(c *doctorFixtureCfg) {
+		c.doorProbe = "router"
+		c.probeStatus = http.StatusUnauthorized
+	})
+	rep := runDoctor(doctorOpts{probe: true, yes: true, timeoutSec: 5})
+	if c := findCheck(t, rep, "e2e", "probe:"+fx.doorPort); c.Status != docFail {
+		t.Fatalf("probe = %s (%s), want fail: a baseten-route 401 is a broken credential", c.Status, c.Finding)
+	}
+	if rep.ExitCode != 1 {
+		t.Errorf("exit = %d, want 1", rep.ExitCode)
+	}
+}
+
+// TestDoctorProbeNativeRouteTransportErrorFails guards the other
+// boundary: only an HTTP auth rejection from the far end counts as
+// path-proving; a connection failure on a native route still fails.
+func TestDoctorProbeNativeRouteTransportErrorFails(t *testing.T) {
+	fx := newDoctorFixture(t, func(c *doctorFixtureCfg) {
+		c.routingOff = true
+		c.clientRoute = "anthropic"
+		c.doorProbe = "router"
+		c.probeStatus = http.StatusBadGateway // not an auth rejection
+	})
+	rep := runDoctor(doctorOpts{probe: true, yes: true, timeoutSec: 5})
+	if c := findCheck(t, rep, "e2e", "probe:"+fx.doorPort); c.Status != docFail {
+		t.Fatalf("probe = %s (%s), want fail on a non-auth error", c.Status, c.Finding)
 	}
 }
 

@@ -158,6 +158,13 @@ cat > "$APP/Contents/Info.plist" <<EOF
 	<string>${EXECUTABLE_NAME}</string>
 	<key>BasetenSwitchBuildChannel</key>
 	<string>${BUILD_CHANNEL}</string>
+	<!-- Advertises the headless --unregister-login-item one-shot mode:
+	     only the app itself can unregister its SMAppService login item,
+	     so `baseten-switch uninstall` checks this marker before driving
+	     the bundled executable; bundles without it get the manual
+	     removal instructions. -->
+	<key>BasetenSwitchLoginItemCLI</key>
+	<true/>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleInfoDictionaryVersion</key>
