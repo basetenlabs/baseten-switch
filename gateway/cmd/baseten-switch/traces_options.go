@@ -14,6 +14,7 @@ type tracePackageOptions struct {
 	selection             tracepackage.Selection
 	output                string
 	includeNative         bool
+	requireNative         bool
 	dryRun                bool
 	yes                   bool
 	allowUnscannedContent bool
@@ -67,6 +68,8 @@ func parseTracePackageOptions(args []string, now time.Time) (tracePackageOptions
 			}
 		case "--include-native":
 			result.includeNative = true
+		case "--require-native":
+			result.requireNative = true
 		case "--include-codex-archived":
 			result.includeCodexArchived = true
 		case "--dry-run":
@@ -89,6 +92,9 @@ func parseTracePackageOptions(args []string, now time.Time) (tracePackageOptions
 	}
 	if result.includeCodexArchived && !result.includeNative {
 		return result, errors.New("traces package: --include-codex-archived requires --include-native")
+	}
+	if result.requireNative && !result.includeNative {
+		return result, errors.New("traces package: --require-native requires --include-native")
 	}
 	if result.nativeSessionSelector != "" && !result.includeNative {
 		return result, errors.New("traces package: --native-session-selector requires --include-native")

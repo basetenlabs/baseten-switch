@@ -355,10 +355,42 @@ func TestIncompleteAndUnknownSourcesFailClosed(t *testing.T) {
 			t.Fatal(err)
 		}
 		result, err := collector.Collect(context.Background(), plan)
-		if err != nil || result.Exclusions["native_unsupported"] != 1 {
+		if err != nil || result.Exclusions["native_unsupported"] != 1 ||
+			result.SchemaDrift.Status != "unavailable" || result.SchemaDrift.ExcludedSources != 1 {
 			t.Fatalf("unknown source was not omitted: result=%+v err=%v", result, err)
 		}
 	})
+}
+
+func TestCollectSurfacesUnsupportedTurnSchemaDrift(t *testing.T) {
+	home := t.TempDir()
+	path := writeFixture(t, home, fixtureSession, false, true)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := []byte(`{"timestamp":"2026-08-17T12:00:02Z"`)
+	drift := []byte(`{"timestamp":"2026-08-17T12:00:01.900Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"future_semantic_item","content":"synthetic"}}}` + "\n")
+	updated := bytes.Replace(raw, marker, append(drift, marker...), 1)
+	if bytes.Equal(updated, raw) {
+		t.Fatal("fixture completion marker was not found")
+	}
+	if err := os.WriteFile(path, updated, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	collector := Collector{CodexHome: home}
+	plan, err := collector.Discover(context.Background(), baseSelection())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := collector.Collect(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Turns) != 0 || result.SchemaDrift.Status != "unavailable" ||
+		result.SchemaDrift.ExcludedSemanticTurns != 1 || result.SchemaDrift.ExcludedSources != 0 {
+		t.Fatalf("unsupported turn drift was not surfaced: %+v", result)
+	}
 }
 
 func TestExplicitMissingSessionFailsDiscovery(t *testing.T) {

@@ -203,6 +203,14 @@ func Create(ctx context.Context, options Options) (result Result, returnErr erro
 		if err := validateNativeManifestMetadata(native); err != nil {
 			return result, err
 		}
+		collectionStatus, err := resolveNativeCollectionStatus(
+			native.CollectionStatus,
+			native.SchemaDrift,
+			len(native.Rows),
+		)
+		if err != nil {
+			return result, err
+		}
 		scanPlainMetadata([]byte(strings.Join(append(append([]string{
 			native.Client, native.SourceKind, native.CollectorVersion,
 		}, native.ClientVersions...), native.CorrelationMethods...), "\n")), &scanner)
@@ -220,6 +228,7 @@ func Create(ctx context.Context, options Options) (result Result, returnErr erro
 			Client: strings.TrimSpace(native.Client), SourceKind: strings.TrimSpace(native.SourceKind),
 			CollectorVersion: strings.TrimSpace(native.CollectorVersion),
 			ClientVersions:   slices.Clone(native.ClientVersions), CorrelationMethods: slices.Clone(native.CorrelationMethods),
+			CollectionStatus: collectionStatus, SchemaDrift: native.SchemaDrift,
 		}
 		if member.RecordCount == 0 {
 			nativeCollectors = append(nativeCollectors, collectorManifest)
@@ -658,7 +667,33 @@ func validateNativeManifestMetadata(native NativeMember) error {
 			return errors.New("trace package: invalid native exclusion metadata")
 		}
 	}
+	if native.SchemaDrift.IgnoredMetadataRecords < 0 ||
+		native.SchemaDrift.ExcludedSemanticTurns < 0 ||
+		native.SchemaDrift.ExcludedSources < 0 {
+		return errors.New("trace package: invalid native schema drift counts")
+	}
 	return nil
+}
+
+func resolveNativeCollectionStatus(status string, drift NativeSchemaDriftV1, normalizedTurns int) (string, error) {
+	if normalizedTurns < 0 {
+		return "", errors.New("trace package: invalid normalized native turn count")
+	}
+	hasDrift := drift.IgnoredMetadataRecords > 0 || drift.ExcludedSemanticTurns > 0 || drift.ExcludedSources > 0
+	expected := NativeCollectionComplete
+	if hasDrift && normalizedTurns > 0 {
+		expected = NativeCollectionPartial
+	} else if hasDrift {
+		expected = NativeCollectionUnavailable
+	}
+	status = strings.TrimSpace(status)
+	if status == "" {
+		return expected, nil
+	}
+	if status != expected {
+		return "", errors.New("trace package: native collection status is inconsistent with schema drift")
+	}
+	return status, nil
 }
 
 func safeClientVersion(value string) bool {

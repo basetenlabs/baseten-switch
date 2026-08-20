@@ -140,6 +140,12 @@ func collectNativePackageData(
 				ClientVersions:     collected.ClientVersions,
 				CorrelationMethods: collected.CorrelationMethods,
 				Exclusions:         collected.Exclusions,
+				CollectionStatus:   collected.SchemaDrift.Status,
+				SchemaDrift: tracepackage.NativeSchemaDriftV1{
+					IgnoredMetadataRecords: collected.SchemaDrift.IgnoredMetadataRecords,
+					ExcludedSemanticTurns:  collected.SchemaDrift.ExcludedSemanticTurns,
+					ExcludedSources:        collected.SchemaDrift.ExcludedSources,
+				},
 			})
 			mergeNativeResult(&result, collected.TraceLinks, collected.Exclusions)
 		}
@@ -186,6 +192,12 @@ func collectNativePackageData(
 				ClientVersions:     collected.ClientVersions,
 				CorrelationMethods: collected.CorrelationMethods,
 				Exclusions:         collected.Exclusions,
+				CollectionStatus:   collected.SchemaDrift.Status,
+				SchemaDrift: tracepackage.NativeSchemaDriftV1{
+					IgnoredMetadataRecords: collected.SchemaDrift.IgnoredMetadataRecords,
+					ExcludedSemanticTurns:  collected.SchemaDrift.ExcludedSemanticTurns,
+					ExcludedSources:        collected.SchemaDrift.ExcludedSources,
+				},
 			})
 			mergeNativeResult(&result, collected.TraceLinks, collected.Exclusions)
 		}
@@ -210,6 +222,48 @@ func collectNativePackageData(
 
 func traceSelectedForPackage(trace tracecapture.TraceV1, selection tracepackage.Selection, client string) bool {
 	return trace.Client == client && !trace.StartedAt.Before(selection.Since) && trace.StartedAt.Before(selection.Until)
+}
+
+func nativeSchemaDriftDetected(drift tracepackage.NativeSchemaDriftV1) bool {
+	return drift.IgnoredMetadataRecords > 0 || drift.ExcludedSemanticTurns > 0 || drift.ExcludedSources > 0
+}
+
+func validateRequiredNative(options tracePackageOptions, traces []tracecapture.TraceV1, native nativePackageData) error {
+	if !options.requireNative {
+		return nil
+	}
+	required := make(map[string]struct{})
+	for _, trace := range traces {
+		if traceSelectedForPackage(trace, options.selection, trace.Client) {
+			required[trace.Client] = struct{}{}
+		}
+	}
+	membersByClient := make(map[string]tracepackage.NativeMember, len(native.members))
+	for _, member := range native.members {
+		if _, duplicate := membersByClient[member.Client]; duplicate {
+			return fmt.Errorf("required native enrichment for %s has duplicate collectors", member.Client)
+		}
+		membersByClient[member.Client] = member
+		required[member.Client] = struct{}{}
+	}
+	clients := make([]string, 0, len(required))
+	for client := range required {
+		clients = append(clients, client)
+	}
+	slices.Sort(clients)
+	for _, client := range clients {
+		member, ok := membersByClient[client]
+		if !ok {
+			return fmt.Errorf("required native enrichment for %s is unavailable", client)
+		}
+		if member.CollectionStatus != tracepackage.NativeCollectionComplete {
+			return fmt.Errorf("required native enrichment for %s is %s", member.Client, member.CollectionStatus)
+		}
+		if len(member.Rows) == 0 {
+			return fmt.Errorf("required native enrichment for %s produced no normalized turns", member.Client)
+		}
+	}
+	return nil
 }
 
 func decodeCapturedBody(body tracecapture.BodyV1) []byte {

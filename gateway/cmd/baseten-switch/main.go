@@ -272,6 +272,7 @@ Print the spend summary calculated from local telemetry segments.
   baseten-switch traces enable --client NAME [--client NAME] [--retention-days N]
   baseten-switch traces disable
   baseten-switch traces package --since TIME --client NAME [options]
+  baseten-switch traces decode PACKAGE.zip --output DIR [--yes]
   baseten-switch traces purge --yes [--packages]
   baseten-switch traces cleanup IDENTIFIER
 
@@ -279,12 +280,17 @@ Trace capture is disabled by default. Captured bodies can contain prompts,
 responses, reasoning summaries, tool input and output, source code, credentials,
 personal data, and regulated data. Switch never uploads trace packages.
 
+Decode validates a trace package, writes exact decoded request and response
+bodies plus content-free indexes to a new private directory, and never
+overwrites the destination. It does not require a config or running gateway.
+
 Package options:
   --since TIME                 Required RFC 3339 timestamp or Go duration
   --until TIME                 Optional exclusive bound, defaults to command start
   --client NAME                Required and repeatable client selector
   --output PATH                Optional new ZIP destination; never overwritten
   --include-native             Include only high-confidence linked native turns
+  --require-native             Fail if requested native enrichment drifts or is empty
   --native-session-selector P  Private mode-0600 explicit native selector file
   --include-codex-archived     Opt in to recognized archived Codex sessions
   --dry-run                    Print content-free counts without creating a ZIP

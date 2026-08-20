@@ -14,6 +14,7 @@ func TestParseTracePackageOptionsAnchorsRelativeBoundsOnce(t *testing.T) {
 		"--client", "claude-code",
 		"--client", "codex",
 		"--include-native",
+		"--require-native",
 		"--yes",
 	}, anchor)
 	if err != nil {
@@ -25,7 +26,7 @@ func TestParseTracePackageOptionsAnchorsRelativeBoundsOnce(t *testing.T) {
 	if want := anchor.Add(-30 * time.Minute); !options.selection.Until.Equal(want) {
 		t.Fatalf("until = %s, want %s", options.selection.Until, want)
 	}
-	if len(options.selection.Clients) != 2 || !options.includeNative || !options.yes {
+	if len(options.selection.Clients) != 2 || !options.includeNative || !options.requireNative || !options.yes {
 		t.Fatalf("options = %#v", options)
 	}
 }
@@ -53,6 +54,7 @@ func TestParseTracePackageOptionsRejectsUnsafeCombinations(t *testing.T) {
 		{[]string{"--client", "codex"}, "--since is required"},
 		{[]string{"--since", "1h"}, "at least one --client"},
 		{[]string{"--since", "1h", "--client", "codex", "--include-codex-archived"}, "requires --include-native"},
+		{[]string{"--since", "1h", "--client", "codex", "--require-native"}, "requires --include-native"},
 		{[]string{"--since", "1h", "--client", "codex", "--yes", "--dry-run"}, "not valid with --dry-run"},
 		{[]string{"--since", "0s", "--client", "codex"}, "duration must not be zero"},
 		{[]string{"--since", "31d", "--client", "codex"}, "expected RFC 3339"},

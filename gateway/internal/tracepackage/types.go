@@ -207,6 +207,8 @@ type NativeMember struct {
 	ClientVersions     []string
 	CorrelationMethods []string
 	Exclusions         map[string]int
+	CollectionStatus   string
+	SchemaDrift        NativeSchemaDriftV1
 }
 
 // CleanupError reports that sensitive staging data could not be removed
@@ -267,12 +269,28 @@ type ScannerManifestV1 struct {
 }
 
 type NativeCollectorManifestV1 struct {
-	Member             string   `json:"member"`
-	Client             string   `json:"client"`
-	SourceKind         string   `json:"source_kind"`
-	CollectorVersion   string   `json:"collector_version"`
-	ClientVersions     []string `json:"client_versions"`
-	CorrelationMethods []string `json:"correlation_methods"`
+	Member             string              `json:"member"`
+	Client             string              `json:"client"`
+	SourceKind         string              `json:"source_kind"`
+	CollectorVersion   string              `json:"collector_version"`
+	ClientVersions     []string            `json:"client_versions"`
+	CorrelationMethods []string            `json:"correlation_methods"`
+	CollectionStatus   string              `json:"collection_status,omitempty"`
+	SchemaDrift        NativeSchemaDriftV1 `json:"schema_drift,omitempty"`
+}
+
+const (
+	NativeCollectionComplete    = "complete"
+	NativeCollectionPartial     = "partial"
+	NativeCollectionUnavailable = "unavailable"
+)
+
+// NativeSchemaDriftV1 reports only bounded counts. Native record types, field
+// names, values, identifiers, paths, and parser errors must never enter it.
+type NativeSchemaDriftV1 struct {
+	IgnoredMetadataRecords int `json:"ignored_metadata_records"`
+	ExcludedSemanticTurns  int `json:"excluded_semantic_turns"`
+	ExcludedSources        int `json:"excluded_sources"`
 }
 
 type SnapshotManifestV1 struct {

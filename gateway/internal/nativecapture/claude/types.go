@@ -66,6 +66,27 @@ type Result struct {
 	TraceLinks         map[string]string
 	Exclusions         map[string]int
 	CorrelationMethods []string
+	SchemaDrift        SchemaDriftSummary
+}
+
+// SchemaDriftSummary reports only counts and a derived status. It never
+// includes native record types, field names, source paths, or content.
+type SchemaDriftSummary struct {
+	Status                 string
+	IgnoredMetadataRecords int
+	ExcludedSemanticTurns  int
+	ExcludedSources        int
+}
+
+func (s *SchemaDriftSummary) finalize(collectedTurns int) {
+	switch {
+	case s.IgnoredMetadataRecords == 0 && s.ExcludedSemanticTurns == 0 && s.ExcludedSources == 0:
+		s.Status = "complete"
+	case collectedTurns > 0:
+		s.Status = "partial"
+	default:
+		s.Status = "unavailable"
+	}
 }
 
 type NativeTurnV1 struct {

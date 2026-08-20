@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/basetenlabs/baseten-switch/gateway/internal/config"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/tracecapture"
+	"github.com/basetenlabs/baseten-switch/gateway/internal/tracepackage"
 )
 
 func traceCommandFixture(t *testing.T) (string, tracecapture.RuntimePaths) {
@@ -183,6 +185,108 @@ func TestTracePackageCommandCreatesLocalZIPWithoutTelemetry(t *testing.T) {
 	}
 	if !seen["manifest.json"] || !seen["switch/traces.jsonl"] || seen["switch/telemetry.jsonl"] {
 		t.Fatalf("members = %#v", seen)
+	}
+
+	resolvedDestination, err := filepath.EvalSymlinks(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded := filepath.Join(decodedRoot, "decoded")
+	out.Reset()
+	if code := cmdTracesDecode([]string{resolvedDestination, "--output", decoded, "--yes"}, bytes.NewReader(nil), &out); code != 0 {
+		t.Fatalf("decode exit = %d, output = %s", code, out.String())
+	}
+	if _, err := os.Stat(filepath.Join(decoded, "index.jsonl")); err != nil {
+		t.Fatalf("decoded index: %v", err)
+	}
+	if strings.Contains(out.String(), "synthetic") {
+		t.Fatalf("decode printed body content: %s", out.String())
+	}
+	if !strings.Contains(out.String(), "warning: decoded files are discoverable plaintext") {
+		t.Fatalf("--yes decode omitted preflight sensitivity warning: %s", out.String())
+	}
+}
+
+func TestTracePackageSummaryWarnsOnNativeSchemaDrift(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	options := tracePackageOptions{
+		selection: tracepackage.Selection{
+			Since: now.Add(-time.Hour), Until: now, Clients: []string{"claude-code"},
+		},
+		includeNative: true,
+	}
+	native := nativePackageData{members: []tracepackage.NativeMember{{
+		Name:             "native/claude-code/turns.jsonl",
+		Client:           "claude-code",
+		Rows:             []json.RawMessage{json.RawMessage(`{}`)},
+		CollectionStatus: tracepackage.NativeCollectionPartial,
+		SchemaDrift: tracepackage.NativeSchemaDriftV1{
+			IgnoredMetadataRecords: 2,
+			ExcludedSemanticTurns:  1,
+		},
+	}}}
+	var out bytes.Buffer
+	summarizeTracePackage(options, nil, tracecapture.TraceSelectionStats{}, native, &out, true)
+	want := "WARNING: native schema drift detected: claude-code status=partial ignored_metadata=2 excluded_turns=1 excluded_sources=0; Switch traces are unaffected."
+	if strings.Count(out.String(), want) != 1 {
+		t.Fatalf("summary warning = %q", out.String())
+	}
+}
+
+func TestValidateRequiredNative(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	options := tracePackageOptions{
+		requireNative: true,
+		selection: tracepackage.Selection{
+			Since: now.Add(-time.Hour), Until: now, Clients: []string{"claude-code"},
+		},
+	}
+	traces := []tracecapture.TraceV1{{Client: "claude-code", StartedAt: now.Add(-time.Minute)}}
+	complete := tracepackage.NativeMember{
+		Client: "claude-code", CollectionStatus: tracepackage.NativeCollectionComplete,
+		Rows: []json.RawMessage{json.RawMessage(`{}`)},
+	}
+	tests := []struct {
+		name    string
+		native  nativePackageData
+		wantErr string
+	}{
+		{name: "complete", native: nativePackageData{members: []tracepackage.NativeMember{complete}}},
+		{name: "partial", native: nativePackageData{members: []tracepackage.NativeMember{{
+			Client: "claude-code", CollectionStatus: tracepackage.NativeCollectionPartial,
+			Rows: []json.RawMessage{json.RawMessage(`{}`)},
+		}}}, wantErr: "is partial"},
+		{name: "empty", native: nativePackageData{members: []tracepackage.NativeMember{{
+			Client: "claude-code", CollectionStatus: tracepackage.NativeCollectionComplete,
+		}}}, wantErr: "produced no normalized turns"},
+		{name: "missing", native: nativePackageData{}, wantErr: "is unavailable"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateRequiredNative(options, traces, test.native)
+			if test.wantErr == "" && err != nil {
+				t.Fatal(err)
+			}
+			if test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
+				t.Fatalf("error = %v, want %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestTraceDecodeRequiresOutputAndYesWhenNoninteractive(t *testing.T) {
+	if _, err := parseTraceDecodeOptions([]string{"package.zip"}); err == nil {
+		t.Fatal("missing --output accepted")
+	}
+	if options, err := parseTraceDecodeOptions([]string{"package.zip", "--output", "decoded", "--yes"}); err != nil || !options.yes {
+		t.Fatalf("parse = %#v, %v", options, err)
+	}
+	if _, err := parseTraceDecodeOptions([]string{"package.zip", "--output", "--yes"}); err == nil {
+		t.Fatal("--yes accepted as the output path")
 	}
 }
 

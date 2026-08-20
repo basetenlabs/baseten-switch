@@ -91,6 +91,182 @@ func TestCollectorExtractsStreamingMessageStartID(t *testing.T) {
 	}
 }
 
+func TestCollectorIgnoresRecognizedSessionMetadataDuringTurn(t *testing.T) {
+	root, path := installFixture(t, fixtureSession, "")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := []byte(`{"type":"assistant"`)
+	metadata := []byte("{\"type\":\"atis-latch\",\"sessionId\":\"" + fixtureSession + "\"}\n" +
+		"{\"type\":\"mode\",\"sessionId\":\"" + fixtureSession + "\",\"mode\":\"synthetic\"}\n")
+	updated := strings.Replace(string(raw), string(marker), string(metadata)+string(marker), 1)
+	if updated == string(raw) {
+		t.Fatal("fixture assistant marker was not found")
+	}
+	if err := os.WriteFile(path, []byte(updated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	collector := Collector{ConfigRoot: root}
+	plan, err := collector.Discover(context.Background(), fixtureSelection(`{"id":"msg_fixture_final"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := collector.Collect(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Turns) != 1 || result.TraceLinks[fixtureEvent] == "" || result.Exclusions["malformed"] != 0 {
+		t.Fatalf("recognized metadata invalidated the turn: %+v", result)
+	}
+}
+
+func TestCollectorCountsFutureMetadataWithoutExposingItsShape(t *testing.T) {
+	root, path := installFixture(t, fixtureSession, "")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := []byte(`{"type":"assistant"`)
+	metadata := []byte(`{"type":"future-display-state","sessionId":"` + fixtureSession + `","timestamp":"2026-08-13T15:04:05.500Z","enabled":true,"revision":3}` + "\n")
+	updated := bytesReplaceOnce(t, raw, marker, append(metadata, marker...))
+	if err := os.WriteFile(path, updated, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	collector := Collector{ConfigRoot: root}
+	plan, err := collector.Discover(context.Background(), fixtureSelection(`{"id":"msg_fixture_final"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := collector.Collect(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Turns) != 1 || result.SchemaDrift.Status != "partial" ||
+		result.SchemaDrift.IgnoredMetadataRecords != 1 ||
+		result.SchemaDrift.ExcludedSemanticTurns != 0 || result.SchemaDrift.ExcludedSources != 0 {
+		t.Fatalf("unexpected future metadata drift summary: %+v", result)
+	}
+}
+
+func TestCollectorDoesNotReportDriftOutsideSelection(t *testing.T) {
+	root, path := installFixture(t, fixtureSession, "")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := []byte(`{"type":"future-display-state","sessionId":"` + fixtureSession + `","timestamp":"2026-08-13T14:00:00Z","enabled":true}` + "\n")
+	if err := os.WriteFile(path, append(metadata, raw...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	collector := Collector{ConfigRoot: root}
+	plan, err := collector.Discover(context.Background(), fixtureSelection(`{"id":"msg_fixture_final"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := collector.Collect(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Turns) != 1 || result.SchemaDrift.Status != "complete" ||
+		result.SchemaDrift.IgnoredMetadataRecords != 0 {
+		t.Fatalf("out-of-window drift affected collection status: %+v", result)
+	}
+}
+
+func TestCollectorLocalizesUnknownSemanticRecordToActiveTurn(t *testing.T) {
+	root, path := installFixture(t, fixtureSession, "")
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	additional := strings.Join([]string{
+		`{"type":"future-semantic-event","sessionId":"` + fixtureSession + `","timestamp":"2026-08-13T15:04:09.100Z","content":{"kind":"future"}}`,
+		`{"type":"user","uuid":"11111111-bbbb-4bbb-8bbb-bbbbbbbbbbbb","parentUuid":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","sessionId":"` + fixtureSession + `","timestamp":"2026-08-13T15:04:10Z","version":"2.1.139","message":{"role":"user","content":"Start a later synthetic turn."}}`,
+		`{"type":"assistant","uuid":"22222222-bbbb-4bbb-8bbb-bbbbbbbbbbbb","parentUuid":"11111111-bbbb-4bbb-8bbb-bbbbbbbbbbbb","sessionId":"` + fixtureSession + `","timestamp":"2026-08-13T15:04:11Z","version":"2.1.139","message":{"id":"msg_later_valid","role":"assistant","content":[{"type":"text","text":"Later turn remains valid."}],"stop_reason":"end_turn"}}`,
+		`{"type":"system","subtype":"turn_duration","uuid":"33333333-bbbb-4bbb-8bbb-bbbbbbbbbbbb","parentUuid":"22222222-bbbb-4bbb-8bbb-bbbbbbbbbbbb","sessionId":"` + fixtureSession + `","timestamp":"2026-08-13T15:04:12Z","version":"2.1.139","durationMs":2000}`,
+	}, "\n") + "\n"
+	if _, err := file.WriteString(additional); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	selection := fixtureSelection(`{"id":"msg_later_valid"}`)
+	collector := Collector{ConfigRoot: root}
+	plan, err := collector.Discover(context.Background(), selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := collector.Collect(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Turns) != 1 || result.Turns[0].SwitchEventIDs[0] != fixtureEvent ||
+		result.SchemaDrift.Status != "partial" || result.SchemaDrift.ExcludedSemanticTurns != 1 ||
+		result.SchemaDrift.IgnoredMetadataRecords != 0 || result.SchemaDrift.ExcludedSources != 0 {
+		t.Fatalf("unknown semantic record was not localized: %+v", result)
+	}
+}
+
+func TestCollectorRejectsUnboundedUnknownSemanticSource(t *testing.T) {
+	root, path := installFixture(t, fixtureSession, "")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	semantic := []byte(`{"type":"future-semantic-event","sessionId":"` + fixtureSession + `","content":{"kind":"future"}}` + "\n")
+	if err := os.WriteFile(path, append(semantic, raw...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	collector := Collector{ConfigRoot: root}
+	plan, err := collector.Discover(context.Background(), fixtureSelection(`{"id":"msg_fixture_final"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := collector.Collect(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Turns) != 0 || result.SchemaDrift.Status != "unavailable" ||
+		result.SchemaDrift.ExcludedSources != 1 {
+		t.Fatalf("unbounded semantic drift did not exclude its source: %+v", result)
+	}
+}
+
+func TestCollectorTreatsUnknownSystemSubtypeAsSemanticDrift(t *testing.T) {
+	root, path := installFixture(t, fixtureSession, "")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := []byte(`{"type":"system","subtype":"turn_duration"`)
+	unknown := []byte(`{"type":"system","subtype":"future_lifecycle","sessionId":"` + fixtureSession + `","timestamp":"2026-08-13T15:04:08.500Z","version":"2.1.139"}` + "\n")
+	updated := bytesReplaceOnce(t, raw, marker, append(unknown, marker...))
+	if err := os.WriteFile(path, updated, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	collector := Collector{ConfigRoot: root}
+	plan, err := collector.Discover(context.Background(), fixtureSelection(`{"id":"msg_fixture_final"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := collector.Collect(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Turns) != 0 || result.SchemaDrift.Status != "unavailable" ||
+		result.SchemaDrift.ExcludedSemanticTurns != 1 || result.SchemaDrift.ExcludedSources != 0 {
+		t.Fatalf("unknown system subtype was not isolated as semantic drift: %+v", result)
+	}
+}
+
 func TestKeyedSessionNarrowsDuplicateResponseID(t *testing.T) {
 	root, _ := installFixture(t, fixtureSession, "")
 	installFixtureAtRoot(t, root, secondSession, "")
@@ -444,4 +620,13 @@ func installFixtureAtRoot(t *testing.T, root, sessionID, agentID string) string 
 		t.Fatal(err)
 	}
 	return path
+}
+
+func bytesReplaceOnce(t *testing.T, source, old, replacement []byte) []byte {
+	t.Helper()
+	updated := []byte(strings.Replace(string(source), string(old), string(replacement), 1))
+	if string(updated) == string(source) {
+		t.Fatalf("fixture marker %q was not found", old)
+	}
+	return updated
 }

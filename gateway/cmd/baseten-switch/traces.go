@@ -65,7 +65,7 @@ var tracePackageInputIsTerminal = func(in io.Reader) bool {
 
 func cmdTraces(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: baseten-switch traces <status|enable|disable|package|purge|cleanup>")
+		fmt.Fprintln(os.Stderr, "usage: baseten-switch traces <status|enable|disable|package|decode|purge|cleanup>")
 		return 2
 	}
 	switch args[0] {
@@ -77,6 +77,8 @@ func cmdTraces(args []string) int {
 		return cmdTracesDisable(args[1:], os.Stdout)
 	case "package":
 		return cmdTracesPackage(args[1:], os.Stdin, os.Stdout)
+	case "decode":
+		return cmdTracesDecode(args[1:], os.Stdin, os.Stdout)
 	case "purge":
 		return cmdTracesPurge(args[1:], os.Stdout)
 	case "cleanup":
@@ -334,10 +336,21 @@ func cmdTracesPackage(args []string, in io.Reader, out io.Writer) int {
 		}
 	}
 	if options.dryRun {
-		return summarizeTracePackage(options, selectedTraces, selectionStats, nativeData, out, true)
+		if code := summarizeTracePackage(options, selectedTraces, selectionStats, nativeData, out, true); code != 0 {
+			return code
+		}
+		if err := validateRequiredNative(options, selectedTraces, nativeData); err != nil {
+			fmt.Fprintf(os.Stderr, "traces package: %v\n", err)
+			return 1
+		}
+		return 0
 	}
 	if code := summarizeTracePackage(options, selectedTraces, selectionStats, nativeData, out, false); code != 0 {
 		return code
+	}
+	if err := validateRequiredNative(options, selectedTraces, nativeData); err != nil {
+		fmt.Fprintf(os.Stderr, "traces package: %v\n", err)
+		return 1
 	}
 	if !options.yes {
 		if !tracePackageInputIsTerminal(in) {
@@ -473,6 +486,19 @@ func summarizeTracePackage(options tracePackageOptions, traces []tracecapture.Tr
 			}
 		}
 		fmt.Fprintf(out, "native candidates: %d file(s), %d bytes; normalized turns: %d\n", native.candidateFiles, native.candidateBytes, nativeTurns)
+		for _, member := range native.members {
+			if !nativeSchemaDriftDetected(member.SchemaDrift) {
+				continue
+			}
+			fmt.Fprintf(out,
+				"WARNING: native schema drift detected: %s status=%s ignored_metadata=%d excluded_turns=%d excluded_sources=%d; Switch traces are unaffected.\n",
+				member.Client,
+				member.CollectionStatus,
+				member.SchemaDrift.IgnoredMetadataRecords,
+				member.SchemaDrift.ExcludedSemanticTurns,
+				member.SchemaDrift.ExcludedSources,
+			)
+		}
 		if len(native.exclusions) > 0 {
 			reasons := make([]string, 0, len(native.exclusions))
 			for reason := range native.exclusions {

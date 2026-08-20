@@ -53,17 +53,18 @@ type rawContent struct {
 }
 
 type candidateTurn struct {
-	sessionID    string
-	agentID      string
-	parentToolID string
-	startedAt    time.Time
-	endedAt      time.Time
-	complete     bool
-	invalid      bool
-	approxBytes  int
-	events       []candidateEvent
-	matches      map[string]struct{}
-	explicit     bool
+	sessionID     string
+	agentID       string
+	parentToolID  string
+	startedAt     time.Time
+	endedAt       time.Time
+	complete      bool
+	invalid       bool
+	driftExcluded bool
+	approxBytes   int
+	events        []candidateEvent
+	matches       map[string]struct{}
+	explicit      bool
 }
 
 type candidateEvent struct {
@@ -88,10 +89,17 @@ type candidateContent struct {
 }
 
 type parsedSource struct {
-	turns         []*candidateTurn
-	versions      map[string]struct{}
-	digest        [sha256.Size]byte
-	retainedBytes int
+	turns                 []*candidateTurn
+	versions              map[string]struct{}
+	digest                [sha256.Size]byte
+	retainedBytes         int
+	ignoredMetadataDrifts []ignoredMetadataDrift
+	excludedDriftTurns    []*candidateTurn
+}
+
+type ignoredMetadataDrift struct {
+	at   time.Time
+	turn *candidateTurn
 }
 
 func (c Collector) Collect(ctx context.Context, plan Plan) (Result, error) {
@@ -132,7 +140,11 @@ func (c Collector) Collect(ctx context.Context, plan Plan) (Result, error) {
 			if source.explicit {
 				return Result{}, fmt.Errorf("%w: selected Claude Code session could not be read", ErrExplicitSource)
 			}
-			result.Exclusions[reasonForSourceError(err)]++
+			reason := reasonForSourceError(err)
+			result.Exclusions[reason]++
+			if reason == "unsupported" {
+				result.SchemaDrift.ExcludedSources++
+			}
 			continue
 		}
 		if c.afterRead != nil {
@@ -148,8 +160,18 @@ func (c Collector) Collect(ctx context.Context, plan Plan) (Result, error) {
 		for version := range parsed.versions {
 			versions[version] = struct{}{}
 		}
+		for _, drift := range parsed.ignoredMetadataDrifts {
+			if ignoredMetadataDriftInSelection(drift, plan.selection) {
+				result.SchemaDrift.IgnoredMetadataRecords++
+			}
+		}
 		retainedBytes += parsed.retainedBytes
 		retainedTurns += len(parsed.turns)
+		for _, turn := range parsed.excludedDriftTurns {
+			if candidateTurnInSelection(turn, plan.selection) {
+				result.SchemaDrift.ExcludedSemanticTurns++
+			}
+		}
 		for _, turn := range parsed.turns {
 			if turn.invalid {
 				if turn.explicit {
@@ -241,6 +263,7 @@ func (c Collector) Collect(ctx context.Context, plan Plan) (Result, error) {
 	if len(result.TraceLinks) > 0 {
 		result.CorrelationMethods = []string{"response_id"}
 	}
+	result.SchemaDrift.finalize(len(result.Turns))
 	return result, nil
 }
 
@@ -293,8 +316,12 @@ func (c Collector) readSource(
 		if err := json.Unmarshal(line, &record); err != nil {
 			return parsedSource{}, fmt.Errorf("malformed: invalid JSONL record")
 		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(line, &fields); err != nil || fields == nil {
+			return parsedSource{}, fmt.Errorf("malformed: invalid JSONL record")
+		}
 		if err := c.processRecord(
-			&parsed, &active, &pending, source, selection, record,
+			&parsed, &active, &pending, source, selection, record, fields,
 			traceByResponseID, turnBudget, byteBudget,
 		); err != nil {
 			return parsedSource{}, err
@@ -316,6 +343,7 @@ func (c Collector) processRecord(
 	source sourceFile,
 	selection Selection,
 	record rawRecord,
+	fields map[string]json.RawMessage,
 	traceByResponseID map[string][]TraceReference,
 	turnBudget int,
 	byteBudget int,
@@ -336,14 +364,25 @@ func (c Collector) processRecord(
 		}
 		parsed.versions[record.Version] = struct{}{}
 	case "system", "progress", "file-history-snapshot", "queue-operation",
-		"custom-title", "ai-title", "summary", "attachment", "last-prompt", "pr-link":
+		"custom-title", "ai-title", "summary", "attachment", "last-prompt", "pr-link",
+		"atis-latch", "mode":
 		// These recognized records are either normalized below or deliberately
 		// excluded. They do not broaden the event allowlist.
 	default:
-		if *active != nil {
-			(*active).invalid = true
+		metadataOnly, err := classifyUnknownMetadata(fields, source)
+		if err != nil {
+			return err
 		}
-		return nil
+		if metadataOnly {
+			at, _ := parseTimestamp(record.Timestamp)
+			parsed.ignoredMetadataDrifts = append(parsed.ignoredMetadataDrifts, ignoredMetadataDrift{at: at, turn: *active})
+			return nil
+		}
+		if *active != nil {
+			invalidateTurnForSchemaDrift(parsed, *active)
+			return nil
+		}
+		return fmt.Errorf("unsupported: unbounded Claude Code semantic record")
 	}
 
 	at, timestampOK := parseTimestamp(record.Timestamp)
@@ -353,7 +392,7 @@ func (c Collector) processRecord(
 		_ = message
 		if !valid || !timestampOK {
 			if *active != nil {
-				(*active).invalid = true
+				invalidateTurnForSchemaDrift(parsed, *active)
 			}
 			return nil
 		}
@@ -403,7 +442,7 @@ func (c Collector) processRecord(
 		}
 		message, contents, valid := decodeAssistantRecord(record)
 		if !valid {
-			(*active).invalid = true
+			invalidateTurnForSchemaDrift(parsed, *active)
 			return nil
 		}
 		(*active).endedAt = at
@@ -456,9 +495,108 @@ func (c Collector) processRecord(
 			}); err != nil {
 				return err
 			}
+		default:
+			if *active != nil {
+				invalidateTurnForSchemaDrift(parsed, *active)
+				return nil
+			}
+			return fmt.Errorf("unsupported: unbounded Claude Code system record")
 		}
 	}
 	return nil
+}
+
+func invalidateTurnForSchemaDrift(parsed *parsedSource, turn *candidateTurn) {
+	turn.invalid = true
+	if turn.driftExcluded {
+		return
+	}
+	turn.driftExcluded = true
+	parsed.excludedDriftTurns = append(parsed.excludedDriftTurns, turn)
+}
+
+func ignoredMetadataDriftInSelection(drift ignoredMetadataDrift, selection Selection) bool {
+	if drift.turn != nil {
+		return candidateTurnInSelection(drift.turn, selection)
+	}
+	return !drift.at.IsZero() && !drift.at.Before(selection.Since) && drift.at.Before(selection.Until)
+}
+
+func candidateTurnInSelection(turn *candidateTurn, selection Selection) bool {
+	if turn.startedAt.IsZero() || !turn.startedAt.Before(selection.Until) {
+		return false
+	}
+	if turn.endedAt.IsZero() {
+		return !turn.startedAt.Before(selection.Since)
+	}
+	return !turn.endedAt.Before(selection.Since)
+}
+
+func classifyUnknownMetadata(fields map[string]json.RawMessage, source sourceFile) (bool, error) {
+	if len(fields) == 0 || len(fields) > 64 {
+		return false, nil
+	}
+	var recordType string
+	if raw, exists := fields["type"]; !exists || json.Unmarshal(raw, &recordType) != nil || recordType == "" {
+		return false, nil
+	}
+	if raw, exists := fields["sessionId"]; exists {
+		var sessionID string
+		if json.Unmarshal(raw, &sessionID) != nil || sessionID == "" || sessionID != source.sessionID {
+			return false, fmt.Errorf("unsupported: unknown metadata session identifier")
+		}
+	}
+	if raw, exists := fields["agentId"]; exists {
+		var agentID string
+		if json.Unmarshal(raw, &agentID) != nil || agentID == "" || agentID != source.agentID {
+			return false, fmt.Errorf("unsupported: unknown metadata agent identifier")
+		}
+	}
+	for key, raw := range fields {
+		lower := strings.NewReplacer("_", "", "-", "").Replace(strings.ToLower(key))
+		for _, semantic := range []string{
+			"message", "content", "tool", "input", "output", "result",
+			"thinking", "reason", "summary", "compact", "prompt", "response",
+			"attachment", "completion", "lifecycle", "parent", "turn", "uuid",
+			"lineage", "error",
+		} {
+			if strings.Contains(lower, semantic) {
+				return false, nil
+			}
+		}
+		trimmed := bytes.TrimSpace(raw)
+		if len(trimmed) == 0 || len(trimmed) > 4<<10 || trimmed[0] == '{' || trimmed[0] == '[' {
+			return false, nil
+		}
+		var primitive any
+		if json.Unmarshal(trimmed, &primitive) != nil {
+			return false, nil
+		}
+		switch value := primitive.(type) {
+		case nil, bool, float64:
+		case string:
+			if !safeUnknownMetadataString(value) {
+				return false, nil
+			}
+		default:
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func safeUnknownMetadataString(value string) bool {
+	if value == "" || len(value) > 256 {
+		return false
+	}
+	for _, char := range value {
+		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' ||
+			char >= '0' && char <= '9' || strings.ContainsRune("._-+:/@", char) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func decodeUserRecord(record rawRecord) (rawMessage, []candidateContent, bool, bool) {

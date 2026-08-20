@@ -190,6 +190,39 @@ func TestCreateAddsValidatedNormalizedNativeMemberAndBidirectionalLink(t *testin
 	}
 }
 
+func TestCreateRecordsAndValidatesNativeSchemaDrift(t *testing.T) {
+	base := time.Date(2026, time.August, 19, 12, 0, 0, 0, time.UTC)
+	options := basicOptions(filepath.Join(t.TempDir(), "native-drift.zip"), base, jsonl(
+		traceJSON(t, selectedEventID, "claude-code", base.Add(time.Hour)),
+	))
+	row := json.RawMessage(`{"bundle_turn_id":"operator-turn","switch_event_ids":[],"match_mode":"explicit_session"}`)
+	options.NativeMembers = []NativeMember{{
+		Name: "native/claude-code/turns.jsonl", Client: "claude-code",
+		SourceKind: "claude-code-session-jsonl", CollectorVersion: "test-v1",
+		Rows: []json.RawMessage{row}, CollectionStatus: NativeCollectionPartial,
+		SchemaDrift: NativeSchemaDriftV1{IgnoredMetadataRecords: 2, ExcludedSemanticTurns: 1},
+	}}
+	options.OperatorSelectedNativeTurns = []string{"operator-turn"}
+	if _, err := Create(context.Background(), options); err != nil {
+		t.Fatal(err)
+	}
+	var manifest ManifestV1
+	if err := json.Unmarshal(readZIP(t, options.Destination)[ManifestMemberName], &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.NativeCollectors) != 1 || manifest.NativeCollectors[0].CollectionStatus != NativeCollectionPartial ||
+		manifest.NativeCollectors[0].SchemaDrift.IgnoredMetadataRecords != 2 ||
+		manifest.NativeCollectors[0].SchemaDrift.ExcludedSemanticTurns != 1 {
+		t.Fatalf("native drift manifest = %#v", manifest.NativeCollectors)
+	}
+
+	options.Destination = filepath.Join(t.TempDir(), "inconsistent.zip")
+	options.NativeMembers[0].CollectionStatus = NativeCollectionComplete
+	if _, err := Create(context.Background(), options); err == nil || !strings.Contains(err.Error(), "inconsistent") {
+		t.Fatalf("Create() error = %v", err)
+	}
+}
+
 func TestCreateRejectsOneSidedNativeLinkage(t *testing.T) {
 	base := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
 	options := basicOptions(filepath.Join(t.TempDir(), "native.zip"), base, jsonl(

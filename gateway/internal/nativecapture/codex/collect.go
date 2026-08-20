@@ -102,10 +102,18 @@ func (c Collector) Collect(ctx context.Context, plan Plan) (Result, error) {
 				return Result{}, fmt.Errorf("%w: selected Codex session could not be collected", ErrExplicitSource)
 			}
 			result.Exclusions[reason]++
+			if reason == "native_unsupported" {
+				result.SchemaDrift.ExcludedSources++
+			}
 			continue
 		}
 		if parsed.clientVersion != "" {
 			versions[parsed.clientVersion] = struct{}{}
+		}
+		for _, turn := range parsed.turns {
+			if turn.unsupported && codexTurnInSelection(turn, plan.selection) {
+				result.SchemaDrift.ExcludedSemanticTurns++
+			}
 		}
 		if source.explicit {
 			explicitSourceCounts[parsed.sessionID]++
@@ -204,6 +212,7 @@ func (c Collector) Collect(ctx context.Context, plan Plan) (Result, error) {
 		result.CorrelationMethods = append(result.CorrelationMethods, method)
 	}
 	slices.Sort(result.CorrelationMethods)
+	result.SchemaDrift.finalize(len(result.Turns))
 	return result, nil
 }
 
@@ -340,7 +349,7 @@ func parseRollout(ctx context.Context, reader io.Reader, source sourceFile, budg
 			if active != nil {
 				event, ok := normalizeResponseItem(line.Timestamp, itemType, payload)
 				if !ok {
-					active.unsupported = true
+					markUnsupportedTurn(&parsed, active)
 				} else if event.kind != "" {
 					if err := budget.appendEvent(active, event); err != nil {
 						return parsedSource{}, false, err
@@ -414,7 +423,7 @@ func parseRollout(ctx context.Context, reader io.Reader, source sourceFile, budg
 				if active != nil {
 					event, ok := normalizeEventMessage(line.Timestamp, eventType, payload)
 					if !ok {
-						active.unsupported = true
+						markUnsupportedTurn(&parsed, active)
 					} else if event.kind != "" {
 						if err := budget.appendEvent(active, event); err != nil {
 							return parsedSource{}, false, err
@@ -481,6 +490,23 @@ func parseRollout(ctx context.Context, reader io.Reader, source sourceFile, budg
 	}
 	complete := source.size == 0 || (tracked.readAny && tracked.last == '\n')
 	return parsed, complete, nil
+}
+
+func markUnsupportedTurn(_ *parsedSource, turn *parsedTurn) {
+	if turn.unsupported {
+		return
+	}
+	turn.unsupported = true
+}
+
+func codexTurnInSelection(turn *parsedTurn, selection Selection) bool {
+	if turn.startedAt.IsZero() || !turn.startedAt.Before(selection.Until) {
+		return false
+	}
+	if turn.completedAt.IsZero() {
+		return !turn.startedAt.Before(selection.Since)
+	}
+	return turn.completedAt.After(selection.Since)
 }
 
 func supportedCodexVersion(value string) bool {
