@@ -22,6 +22,13 @@ enum MenubarIconState: Equatable {
     case degraded
 }
 
+/// In-flight model traffic temporarily takes over the status color. Once the
+/// request completes, the persistent routing/degraded projection returns.
+func menubarIconState(_ persistent: MenubarIconState,
+                      hasActivity: Bool) -> MenubarIconState {
+    hasActivity ? .active : persistent
+}
+
 /// auth defaults to nil (unknown), so an unavailable admin auth block does not
 /// claim that reauthentication is required.
 func menubarIconState(gatewayUp: Bool, clients: [ClientStatus],

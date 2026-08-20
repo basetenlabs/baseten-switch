@@ -10,6 +10,10 @@ enum AppColors {
         alpha: 1.0)
 }
 
+enum MenubarIconMetrics {
+    static let size = NSSize(width: 20, height: 20)
+}
+
 /// Native menu-bar shell: AppKit owns the NSStatusItem and NSMenu via
 /// StatusItemController. The SwiftUI App struct only hosts the delegate
 /// adaptor and the single-instance guard.
@@ -47,21 +51,17 @@ struct BasetenSwitchApp: App {
         Settings { EmptyView() }
     }
 
-    /// The Baseten logo as a native template image. AppKit derives the
-    /// glyph from the SVG's alpha so it adapts to light/dark and menu
-    /// highlight states. The packaged app loads it from Resources; the
-    /// source-tree candidate keeps bare Swift builds useful in development.
+    /// The Baseten logo as a 20pt native template image. The SVG's own
+    /// view-box padding leaves a roughly 16pt visible glyph, matching the
+    /// optical height of neighboring standalone menu-bar symbols.
     static let menubarIcon: NSImage = {
         guard let url = menubarIconResourceURL(),
               let img = NSImage(contentsOf: url) else {
             return NSImage(systemSymbolName: "circle.lefthalf.filled",
                            accessibilityDescription: "Baseten Switch") ?? NSImage()
         }
+        img.size = MenubarIconMetrics.size
         img.isTemplate = true
-        // Match the previous 22pt PNG canvas, whose logo occupied 27 of
-        // its 36 pixels. The SVG has no equivalent outer padding, so its
-        // image size is the old logo's effective 16.5pt footprint.
-        img.size = NSSize(width: 16.5, height: 16.5)
         return img
     }()
 
@@ -113,7 +113,7 @@ struct BasetenSwitchApp: App {
             blue: 0x23 / 255.0,
             alpha: 1.0))
 
-    /// Production Preview keeps the same 16.5pt optical footprint as Stable,
+    /// Production Preview keeps the same 20pt optical footprint as Stable,
     /// but adds a small lower-right dot so both status items remain
     /// distinguishable when they run side by side.
     static func menubarIcon(for variant: AppVariant,
@@ -138,8 +138,8 @@ struct BasetenSwitchApp: App {
         let rect = NSRect(origin: .zero, size: base.size)
         base.draw(in: rect)
         NSColor.black.setFill()
-        NSBezierPath(ovalIn: NSRect(x: 12.0, y: 0.5,
-                                    width: 4.0, height: 4.0)).fill()
+        NSBezierPath(ovalIn: NSRect(x: 15.75, y: 0.25,
+                                    width: 3.75, height: 3.75)).fill()
         image.unlockFocus()
         image.isTemplate = true
         return image
@@ -242,8 +242,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let variant = AppVariant.current()
         let state = BasetenSwitchState(preview: fixture, variant: variant)
+        let forceActivity =
+            ProcessInfo.processInfo.environment["BASETEN_SWITCH_MENUBAR_ACTIVITY"] == "1"
         let controller = StatusItemController(
-            state: state, variant: variant, isPreview: true)
+            state: state,
+            variant: variant,
+            isPreview: true,
+            forceActivity: forceActivity)
         self.state = state
         previewController = controller
         let hasHostWindow =
@@ -263,9 +268,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             host.makeKeyAndOrderFront(nil)
             previewHostWindow = host
         }
-        let menuDelay = hasHostWindow ? 2.0 : 0.35
-        DispatchQueue.main.asyncAfter(deadline: .now() + menuDelay) {
-            controller.openForPreview()
+        if ProcessInfo.processInfo.environment["BASETEN_SWITCH_POPUP_AUTO_OPEN"] != "0" {
+            let menuDelay = hasHostWindow ? 2.0 : 0.35
+            DispatchQueue.main.asyncAfter(deadline: .now() + menuDelay) {
+                controller.openForPreview()
+            }
         }
     }
 

@@ -607,6 +607,7 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 			"error": reloadErr,
 		},
 		"global_routing_enabled": globalEnabled,
+		"active_requests":        g.activeRequests.Load(),
 		"uptime_seconds":         g.uptimeSeconds(),
 		"version":                version.Version,
 		// Mutation clients must target the exact file this process has

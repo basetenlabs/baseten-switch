@@ -201,7 +201,8 @@ final class DisplayTests: XCTestCase {
         XCTAssertEqual(resourceURL?.lastPathComponent, "baseten-logo-white.svg")
         XCTAssertTrue(BasetenSwitchApp.menubarIcon.isTemplate)
         XCTAssertEqual(BasetenSwitchApp.menubarIcon.size,
-                       NSSize(width: 16.5, height: 16.5))
+                       NSSize(width: 20, height: 20))
+        XCTAssertNotNil(BasetenSwitchApp.menubarIcon.tiffRepresentation)
     }
 
     func testClientBrandMarksUseOfficialMonochromeIdentities() throws {
@@ -674,7 +675,9 @@ final class DisplayTests: XCTestCase {
     }
 
     func testPresentationEqualityIgnoresMonotonicUptimePolls() {
-        func snapshot(uptime: Int64, observedAt: TimeInterval)
+        func snapshot(uptime: Int64,
+                      observedAt: TimeInterval,
+                      activeRequests: Int = 0)
             -> RoutingSnapshot {
             RoutingSnapshot(
                 status: AdminStatusSnapshot(dict: [
@@ -685,6 +688,7 @@ final class DisplayTests: XCTestCase {
                     "health": "ready",
                     "version": "v1",
                     "uptime_seconds": NSNumber(value: uptime),
+                    "active_requests": NSNumber(value: activeRequests),
                                         "capabilities": ["global_routing"],
                     "global_routing_enabled": true,
                     "clients": [],
@@ -695,6 +699,9 @@ final class DisplayTests: XCTestCase {
         XCTAssertTrue(routingPresentationEqual(
             snapshot(uptime: 100, observedAt: 1_000),
             snapshot(uptime: 105, observedAt: 1_005)))
+        XCTAssertFalse(routingPresentationEqual(
+            snapshot(uptime: 100, observedAt: 1_000),
+            snapshot(uptime: 101, observedAt: 1_001, activeRequests: 1)))
         XCTAssertEqual(
             projectedUptimeSeconds(
                 snapshot: snapshot(uptime: 100, observedAt: 1_000),
@@ -995,7 +1002,7 @@ final class DisplayTests: XCTestCase {
             environment: [:])
         let image = BasetenSwitchApp.menubarIcon(for: preview)
 
-        XCTAssertEqual(image.size, NSSize(width: 16.5, height: 16.5))
+        XCTAssertEqual(image.size, NSSize(width: 20, height: 20))
         XCTAssertTrue(image.isTemplate)
     }
 
@@ -1080,6 +1087,12 @@ final class DisplayTests: XCTestCase {
                                         clients: [client("claude-code", route: "anthropic")]),
                        .off)
         XCTAssertEqual(menubarIconState(gatewayUp: true, clients: []), .off)
+    }
+
+    func testMenubarActivityTemporarilyUsesActiveColor() {
+        XCTAssertEqual(menubarIconState(.off, hasActivity: true), .active)
+        XCTAssertEqual(menubarIconState(.degraded, hasActivity: true), .active)
+        XCTAssertEqual(menubarIconState(.degraded, hasActivity: false), .degraded)
     }
 
     private func authWithHealth(_ health: String) -> AuthStatus {

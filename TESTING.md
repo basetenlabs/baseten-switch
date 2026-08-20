@@ -53,6 +53,20 @@ request coalescing, and navigation. Nothing drives live AppKit behavior
 Release validation also covers the packaged app, accessibility, and
 performance.
 
+To inspect the status-item icon without a gateway or model request, run one of
+the debug fixtures below and stop it with Ctrl-C:
+
+```sh
+scripts/preview-menubar-icon.sh idle
+scripts/preview-menubar-icon.sh active
+scripts/preview-menubar-icon.sh degraded
+scripts/preview-menubar-icon.sh activity
+```
+
+`activity` forces the same pulsing green presentation used while an inference
+request is in flight. These fixtures use the side-effect-free Swift preview
+state: they do not poll localhost, read credentials, or send network traffic.
+
 ## Layer 2: the `check.sh` gate
 
 ```sh

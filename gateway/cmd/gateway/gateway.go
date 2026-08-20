@@ -619,6 +619,9 @@ type Gateway struct {
 	activeConfigHash string
 	activeConfigFile *config.File
 	reloadError      string
+	// activeRequests is intentionally aggregate-only: the menubar needs a
+	// transient activity signal, not request contents or client identity.
+	activeRequests atomic.Int64
 
 	wg  sync.WaitGroup
 	ctx context.Context
@@ -1366,6 +1369,10 @@ func (lg *listenerGroup) resolveClient(r *http.Request) *clientListener {
 func (g *Gateway) handleClient(cl *clientListener, w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	shape := cl.cfg.ProtocolShape
+	if isInferenceRequest(shape, r.Method, path) {
+		g.activeRequests.Add(1)
+		defer g.activeRequests.Add(-1)
+	}
 	switch r.Method {
 	case http.MethodGet:
 		switch path {
@@ -1432,6 +1439,23 @@ func (g *Gateway) handleClient(cl *clientListener, w http.ResponseWriter, r *htt
 		proxy.DrainBody(r)
 		g.reject(w, 405, "method not allowed: "+r.Method)
 		return
+	}
+}
+
+// isInferenceRequest excludes health and model-discovery traffic so the
+// menubar pulse represents a harness exchanging model data, not background
+// probes. The counter spans the full handler lifetime, including streaming.
+func isInferenceRequest(shape, method, path string) bool {
+	if method != http.MethodPost {
+		return false
+	}
+	switch shape {
+	case "anthropic":
+		return path == "/v1/messages" || path == "/v1/messages/count_tokens"
+	case "openai":
+		return path == "/v1/chat/completions" || path == "/v1/responses"
+	default:
+		return false
 	}
 }
 

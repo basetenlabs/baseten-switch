@@ -137,6 +137,7 @@ final class BasetenSwitchState: ObservableObject {
     var uptimeSeconds: Int64 {
         projectedUptimeSeconds(snapshot: routingSnapshot, now: Date())
     }
+    var activeRequests: Int { routingSnapshot?.activeRequests ?? 0 }
     var routerVersion: String { routingSnapshot?.version ?? "" }
     var auth: AuthStatus? { routingSnapshot?.auth }
     var activeConfigPath: String { routingSnapshot?.configPath ?? "" }
@@ -191,7 +192,10 @@ final class BasetenSwitchState: ObservableObject {
         let poll = PollCoordinator(
             reader: self.reader,
             clock: clock,
-            interval: 5)
+            // Model calls are usually long-lived streams. A one-second local
+            // status read makes their activity visible without a new event
+            // channel or high-frequency polling.
+            interval: 1)
         pollCoordinator = poll
         mutationCoordinator = MutationCoordinator(runner: cliRunner)
 
@@ -1950,6 +1954,7 @@ func routingPresentationEqual(_ lhs: RoutingSnapshot,
         && lhs.gateway == rhs.gateway
         && lhs.health == rhs.health
         && lhs.version == rhs.version
+        && lhs.activeRequests == rhs.activeRequests
         && lhs.configPath == rhs.configPath
         && lhs.capabilities == rhs.capabilities
         && lhs.globalRoutingEnabled == rhs.globalRoutingEnabled

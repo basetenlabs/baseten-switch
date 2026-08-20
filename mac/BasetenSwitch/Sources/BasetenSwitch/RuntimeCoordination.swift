@@ -99,7 +99,7 @@ actor PollCoordinator {
          interval: TimeInterval = 5) {
         self.reader = reader
         self.clock = clock
-        self.interval = max(interval, 5)
+        self.interval = max(interval, 0.5)
     }
 
     func start(handler: @escaping Handler) {
