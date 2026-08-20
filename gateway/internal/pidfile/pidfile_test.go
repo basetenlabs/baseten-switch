@@ -2,6 +2,7 @@ package pidfile
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -163,6 +164,28 @@ func TestDoorPidfileWriteRead(t *testing.T) {
 	UnlinkAt(DoorPath())
 	if _, err := os.Stat(p); !os.IsNotExist(err) {
 		t.Fatal("door pidfile still exists after unlink")
+	}
+}
+
+// TestZombieNotAlive pins the containerized-stop regression: an exited
+// but unreaped child still accepts signal 0, and IsAlive must not read
+// it as running or stop reports "still alive after SIGKILL" forever.
+func TestZombieNotAlive(t *testing.T) {
+	if _, err := os.Stat("/proc/self/stat"); err != nil {
+		t.Skip("no procfs; zombie detection is Linux-only")
+	}
+	cmd := exec.Command("/bin/true")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := cmd.Process.Pid
+	defer cmd.Wait()
+	deadline := time.Now().Add(2 * time.Second)
+	for IsAlive(pid) {
+		if time.Now().After(deadline) {
+			t.Fatalf("pid %d (exited, unreaped) still reported alive", pid)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

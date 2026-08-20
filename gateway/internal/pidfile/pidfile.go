@@ -98,12 +98,35 @@ func ReadConfigState(pidPath string) (string, error) {
 	return strings.TrimSpace(string(b)), nil
 }
 
+// IsAlive reports whether pid is a live process. Signal 0 alone is not
+// enough: a zombie (exited but unreaped, e.g. under a container PID 1
+// that never waits) still accepts signals and would read as alive
+// forever, turning a clean stop into "still alive after SIGKILL".
 func IsAlive(pid int) bool {
 	proc, err := os.FindProcess(pid)
 	if err != nil {
 		return false
 	}
-	return proc.Signal(syscall.Signal(0)) == nil
+	if proc.Signal(syscall.Signal(0)) != nil {
+		return false
+	}
+	return !isZombie(pid)
+}
+
+// isZombie reports state Z in /proc/<pid>/stat. The state field follows
+// the parenthesized comm, which may itself contain spaces or ')', so
+// parse after the last ')'. No procfs (darwin) means never a zombie here.
+func isZombie(pid int) bool {
+	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return false
+	}
+	s := string(b)
+	i := strings.LastIndexByte(s, ')')
+	if i < 0 || i+2 >= len(s) {
+		return false
+	}
+	return s[i+2] == 'Z'
 }
 
 func Unlink() {

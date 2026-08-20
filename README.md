@@ -294,6 +294,45 @@ baseten-switch up
 
 Homebrew is the supported path for the complete macOS product.
 
+## Linux
+
+The gateway, front door, and CLI build and run on Linux. The menu bar app is
+macOS-only, so the CLI is the entire interface. Install with the Nix flake
+above, or build from source and put the binary on your `PATH`:
+
+```sh
+scripts/build.sh gateway
+install -m 0755 gateway/bin/baseten-switch ~/.local/bin/
+```
+
+`config init`, `up`, `down`, `status`, `on`, `off`, `claude`, `codex`, `spend`,
+and `doctor` behave as documented, including the live SIGHUP config reload.
+Three differences from the macOS product:
+
+**No launchd supervision.** `up --install` and `up --uninstall` manage user
+LaunchAgents and are unavailable; plain `up` and `down` run and stop the
+components directly and need no extra flags. Set `BASETEN_SWITCH_LAUNCHD=off`
+to turn every launchd interaction into an explicit refusal rather than a
+`launchctl` lookup failure. `doctor` reports the supervision check as skipped.
+Use systemd or another service manager to keep the components running across
+logout and reboot.
+
+**Run under an init that reaps its children.** `up` daemonizes the router and
+door, so they are orphaned onto PID 1. Liveness is probed with signal 0, which
+succeeds for a zombie as well as for a live process. If PID 1 never reaps the
+children it adopts, an exited component stays in the process table as a zombie
+and `down` reports `still alive after SIGKILL` for a process that has already
+terminated. A normal login session or a systemd unit reaps correctly. In a
+container, start it with an init that reaps — `docker run --init`, `tini`, or
+`podman --init` — rather than making the application PID 1.
+
+**Authentication.** The Baseten CLI that `setup` and `auth login` drive is
+distributed through Homebrew, so OAuth sign-in may be unavailable. Without it,
+use the API-key fallback: put `BASETEN_API_KEY` and
+`BASETEN_SWITCH_API_KEY_FALLBACK=1` in `~/.config/baseten-switch/env` at mode
+0600. `status` then reports `API-key fallback in use`, and `doctor` reports the
+sign-in checks as skipped.
+
 ## License
 
 Baseten Switch is available under the [MIT License](LICENSE).
