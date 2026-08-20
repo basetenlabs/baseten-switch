@@ -8,6 +8,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/basetenlabs/baseten-switch/gateway/internal/tracecapture"
 )
 
 func TestUninstallDryRunIsReadOnlyAndEnumeratesActions(t *testing.T) {
@@ -33,6 +35,40 @@ func TestUninstallDryRunIsReadOnlyAndEnumeratesActions(t *testing.T) {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("dry-run output missing %q:\n%s", want, out.String())
 		}
+	}
+}
+
+func TestUninstallDoesNotBypassFailedValidatedTracePurge(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("BASETEN_SWITCH_CONFIG_PATH", "")
+	configPath := filepath.Join(home, ".config", "baseten-switch", "gateway.yaml")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte("global: {}\nclients: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	paths, err := tracecapture.ResolveRuntimePaths(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(paths.TraceDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(paths.TraceDir, ".trace-store-owner"), []byte("wrong owner\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(filepath.Dir(configPath), "must-remain")
+	if err := os.WriteFile(sentinel, []byte("retained"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if code := runUninstall(uninstallOptions{purge: true, yes: true}, nil, &out); code != 1 {
+		t.Fatalf("runUninstall = %d, output = %s", code, out.String())
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("broad data purge bypassed trace validation: %v", err)
 	}
 }
 

@@ -24,6 +24,7 @@ var expectedAdvertisedCommands = []string{
 	"config",
 	"setup",
 	"spend",
+	"traces",
 	"whoami",
 	"auth",
 	"doctor",

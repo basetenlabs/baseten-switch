@@ -44,6 +44,7 @@ import (
 	"github.com/basetenlabs/baseten-switch/gateway/internal/pidfile"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/route"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/telemetry"
+	"github.com/basetenlabs/baseten-switch/gateway/internal/tracecapture"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/version"
 )
 
@@ -204,6 +205,7 @@ func runDoctor(o doctorOpts) doctorReport {
 	mutationStatus, mutationStatusErr := doctorInspectRoutingMutationStatus(cfgPath)
 	allowStartupFix := mutationStatusErr == nil && mutationStatus.Classification == mutationStatusNone
 	st := doctorRouterChecks(add, adminAddr, routerState, allowStartupFix)
+	doctorTraceRuntimeCheck(add, cfgPath, cfgErr, f, st)
 	doctorMutationRecoveryCheckForStatus(add, mutationStatus, mutationStatusErr)
 	doctorRouterClientChecks(add, st)
 	boundAddrs := map[string]bool{}
@@ -244,6 +246,48 @@ func runDoctor(o doctorOpts) doctorReport {
 		rep.ExitCode = 1
 	}
 	return rep
+}
+
+func doctorTraceRuntimeCheck(add addCheck, cfgPath string, cfgErr error, file *config.File, status *doctorAdminStatus) {
+	if cfgErr != nil || file == nil {
+		add("router", "trace_capture", docSkip, "config did not load", "")
+		return
+	}
+	policy, err := config.ResolveTraceCapture(file)
+	if err != nil {
+		add("router", "trace_capture", docSkip, "trace capture policy is invalid", "")
+		return
+	}
+	if status == nil {
+		add("router", "trace_capture", docSkip, "router status unavailable", "")
+		return
+	}
+	if status.ConfigPath == "" {
+		add("router", "trace_capture", docSkip, "router does not expose active config identity", "")
+		return
+	}
+	if canonicalPath(status.ConfigPath) != canonicalPath(cfgPath) {
+		add("router", "trace_capture", docFail, "running router uses a different config", "restart the router with the selected config")
+		return
+	}
+	runtime := status.TraceCapture
+	if policy.Enabled && (!runtime.Enabled || runtime.State != "enabled") {
+		finding := fmt.Sprintf("trace capture is configured but runtime state is %s", displayTraceStatusValue(runtime.State))
+		if runtime.LastError != nil && *runtime.LastError != "" {
+			finding += " (" + *runtime.LastError + ")"
+		}
+		add("router", "trace_capture", docFail, finding, "baseten-switch traces status")
+		return
+	}
+	if !policy.Enabled && runtime.Enabled {
+		add("router", "trace_capture", docFail, "trace capture is active although the selected config disables it", "reload or restart the router")
+		return
+	}
+	if policy.Enabled {
+		add("router", "trace_capture", docWarn, "high-sensitivity trace capture is active", "baseten-switch traces disable")
+		return
+	}
+	add("router", "trace_capture", docOK, "trace capture is disabled", "")
 }
 
 // doctorConfigPath resolves the config path exactly like
@@ -372,6 +416,24 @@ func doctorConfigChecks(add addCheck, cfgPath string, cfgErr error, f *config.Fi
 		return nil
 	}
 	add("config", "load", docOK, "loaded "+cfgPath, "")
+	if tracePolicy, traceErr := config.ResolveTraceCapture(f); traceErr != nil {
+		add("config", "trace_capture", docFail, traceErr.Error(), "fix global.trace_capture in "+cfgPath)
+	} else if tracePolicy.Enabled {
+		add("config", "trace_capture", docWarn,
+			"high-sensitivity local trace capture is enabled; "+traceSensitiveWarning,
+			"baseten-switch traces disable")
+	}
+	if paths, err := tracecapture.ResolveRuntimePaths(config.ExpandPath(cfgPath)); err == nil {
+		if exports, inspectErr := tracecapture.InspectRuntimeExports(paths); inspectErr != nil {
+			add("config", "trace_exports", docWarn, "retained trace packages could not be inspected", "baseten-switch traces status")
+		} else if exports.PackageCount > 0 || exports.QuarantineCount > 0 {
+			add("config", "trace_exports", docWarn,
+				fmt.Sprintf("retained trace data: %d package(s), %d package bytes, %d quarantine item(s), %d quarantine bytes", exports.PackageCount, exports.PackageBytes, exports.QuarantineCount, exports.QuarantineBytes),
+				"baseten-switch traces purge --packages --yes")
+		} else {
+			add("config", "trace_exports", docOK, "no retained trace packages or quarantine items", "")
+		}
+	}
 
 	enabled := 0
 	for _, c := range f.Clients {

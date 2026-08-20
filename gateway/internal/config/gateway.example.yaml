@@ -18,6 +18,15 @@ global:
   telemetry_enabled: true
   telemetry_retention_days: 90
 
+  # High-sensitivity request/response capture is disabled by default. When
+  # enabled, exact bodies can contain prompts, reasoning, tool data, source
+  # code, credentials, personal data, and regulated data. See schema.md.
+  # trace_capture:
+  #   enabled: true
+  #   clients:
+  #     - claude-code
+  #   retention_days: 7
+
   # Retry and timeout knobs shared by all harnesses.
   retry_max: 3
   request_timeout: 600s

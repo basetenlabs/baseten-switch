@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -219,16 +220,144 @@ type Global struct {
 	TelemetryDir   string            `yaml:"telemetry_dir" json:"telemetry_dir"`
 	// TelemetryEnabled is a pointer so an omitted value retains the
 	// documented default of true while an explicit false pauses collection.
-	TelemetryEnabled       *bool  `yaml:"telemetry_enabled,omitempty" json:"telemetry_enabled,omitempty"`
-	TelemetryRetentionDays int    `yaml:"telemetry_retention_days,omitempty" json:"telemetry_retention_days,omitempty"`
-	RetryMax               int    `yaml:"retry_max" json:"retry_max"`
-	RequestTimeout         string `yaml:"request_timeout" json:"request_timeout"`
+	TelemetryEnabled       *bool `yaml:"telemetry_enabled,omitempty" json:"telemetry_enabled,omitempty"`
+	TelemetryRetentionDays int   `yaml:"telemetry_retention_days,omitempty" json:"telemetry_retention_days,omitempty"`
+	// TraceCapture is a separate, high-sensitivity request and response body
+	// store. It is disabled when omitted and never inherits telemetry settings.
+	TraceCapture   *TraceCapture `yaml:"trace_capture,omitempty" json:"trace_capture,omitempty"`
+	RetryMax       int           `yaml:"retry_max" json:"retry_max"`
+	RequestTimeout string        `yaml:"request_timeout" json:"request_timeout"`
 	// TTFTTimeout is the per-attempt time-to-first-byte deadline (Go
 	// duration syntax). If the upstream sends no first response byte
 	// within it, the gateway abandons the attempt and falls through to
 	// the client's fallback_route. Empty or 0 disables it (the shipped
 	// default). Per-client ttft_timeout overrides this value.
 	TTFTTimeout string `yaml:"ttft_timeout,omitempty" json:"ttft_timeout,omitempty"`
+}
+
+// TraceCapture is the explicit local content-capture policy. Clients is an
+// allowlist of enabled harness listeners, not a route or provider selector.
+type TraceCapture struct {
+	Enabled       bool     `yaml:"enabled" json:"enabled"`
+	Clients       []string `yaml:"clients,omitempty" json:"clients,omitempty"`
+	RetentionDays int      `yaml:"retention_days,omitempty" json:"retention_days,omitempty"`
+}
+
+// ResolvedTraceCapture is the normalized policy used by the gateway runtime.
+type ResolvedTraceCapture struct {
+	Enabled       bool
+	Clients       []string
+	RetentionDays int
+}
+
+const (
+	DefaultTraceRetentionDays = 7
+	MaxTraceRetentionDays     = 365
+)
+
+// ResolveTraceCapture validates the content-capture trust boundary and applies
+// defaults. Disabled policies retain their allowlist so a later typed local
+// activation can be explicit, but they capture no traffic.
+func ResolveTraceCapture(f *File) (ResolvedTraceCapture, error) {
+	resolved := ResolvedTraceCapture{RetentionDays: DefaultTraceRetentionDays}
+	if f == nil || f.Global.TraceCapture == nil {
+		return resolved, nil
+	}
+	raw := f.Global.TraceCapture
+	resolved.Enabled = raw.Enabled
+	resolved.RetentionDays = raw.RetentionDays
+	if resolved.RetentionDays == 0 {
+		resolved.RetentionDays = DefaultTraceRetentionDays
+	}
+	if resolved.RetentionDays < 1 || resolved.RetentionDays > MaxTraceRetentionDays {
+		return ResolvedTraceCapture{}, fmt.Errorf(
+			"routing policy: global.trace_capture.retention_days must be between 1 and %d",
+			MaxTraceRetentionDays,
+		)
+	}
+
+	clientByName := make(map[string]Client, len(f.Clients))
+	for _, client := range f.Clients {
+		clientByName[client.Name] = client
+	}
+	seen := make(map[string]struct{}, len(raw.Clients))
+	for _, name := range raw.Clients {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return ResolvedTraceCapture{}, fmt.Errorf("routing policy: global.trace_capture.clients contains an empty name")
+		}
+		if _, ok := seen[name]; ok {
+			return ResolvedTraceCapture{}, fmt.Errorf("routing policy: global.trace_capture.clients contains duplicate %q", name)
+		}
+		seen[name] = struct{}{}
+		resolved.Clients = append(resolved.Clients, name)
+	}
+	if !resolved.Enabled {
+		return resolved, nil
+	}
+	if len(resolved.Clients) == 0 {
+		return ResolvedTraceCapture{}, fmt.Errorf("routing policy: enabled global.trace_capture requires at least one client")
+	}
+
+	selectedListeners := make(map[string]struct{}, len(resolved.Clients))
+	for _, name := range resolved.Clients {
+		client, ok := clientByName[name]
+		if !ok || !client.Enabled {
+			return ResolvedTraceCapture{}, fmt.Errorf("routing policy: trace capture client %q must name an enabled client", name)
+		}
+		if !isLoopbackBindAddr(client.BindAddr) {
+			return ResolvedTraceCapture{}, fmt.Errorf(
+				"routing policy: trace capture client %q bind_addr %q must be loopback",
+				name,
+				client.BindAddr,
+			)
+		}
+		selectedListeners[normalizedLoopbackEndpoint(client.BindAddr)] = struct{}{}
+	}
+	if f.Door != nil {
+		for _, port := range f.Door.Ports {
+			if _, selected := selectedListeners[normalizedLoopbackEndpoint(port.RouterAddr)]; !selected {
+				continue
+			}
+			if !isLoopbackBindAddr(port.BindAddr) {
+				return ResolvedTraceCapture{}, fmt.Errorf(
+					"routing policy: door bind_addr %q targeting trace-captured listener %q must be loopback",
+					port.BindAddr,
+					port.RouterAddr,
+				)
+			}
+		}
+	}
+	return resolved, nil
+}
+
+func normalizedLoopbackEndpoint(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	host = strings.TrimSpace(strings.Trim(host, "[]"))
+	if strings.EqualFold(host, "localhost") {
+		return "loopback:" + port
+	}
+	ip := net.ParseIP(host)
+	if ip != nil && ip.IsLoopback() {
+		return "loopback:" + port
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func isLoopbackBindAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	host = strings.TrimSpace(strings.Trim(host, "[]"))
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // IsTelemetryEnabled returns the effective telemetry collection setting.
@@ -293,6 +422,9 @@ func ValidateRoutingPolicy(f *File) error {
 	}
 	if f.Global.TelemetryRetentionDays < 0 {
 		return fmt.Errorf("routing policy: global.telemetry_retention_days must be positive when set")
+	}
+	if _, err := ResolveTraceCapture(f); err != nil {
+		return err
 	}
 	for _, c := range f.Clients {
 		if c.ProtocolShape != "anthropic" && c.ProtocolShape != "openai" {

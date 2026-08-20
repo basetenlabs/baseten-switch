@@ -24,9 +24,39 @@ SIGHUP. The native Mac app edits the same file through `baseten-switch`.
 | `telemetry_dir` | string | `~/.config/baseten-switch/telemetry` | Private directory containing versioned, monthly JSONL request segments. |
 | `telemetry_enabled` | bool | `true` | Toggle per-request telemetry collection. Disabling collection preserves existing history. |
 | `telemetry_retention_days` | int | `90` | Retention window for closed telemetry segments. The active segment is never deleted. |
+| `trace_capture` | object | (absent, disabled) | Separate high-sensitivity local request/response body capture. It never inherits telemetry settings. See below. |
 | `retry_max` | int | `3` | Gateway-level retry count against upstream failures. |
 | `request_timeout` | duration | `600s` | Hard per-request timeout (Go duration syntax). |
 | `ttft_timeout` | duration | (disabled) | Time-to-first-byte deadline per upstream attempt (Go duration syntax; absent or `0` disables). Expiry before a response begins permits the configured fallback; a final attempt or explicit model choice returns 504. The deadline never interrupts an active stream. Telemetry records `fallback_trigger: "ttft_timeout"`. Malformed or negative values refuse the config at load. Start with `30s` and tune for your workload. Per-client `ttft_timeout` overrides this value. |
+
+### `global.trace_capture`
+
+This feature is disabled when the block is absent or `enabled` is false. When
+enabled, Switch stores exact client request bodies and gateway-emitted response
+bytes in a separate private JSONL store. Captured data can contain prompts,
+responses, visible reasoning, tool definitions, tool arguments and results,
+source code, files, terminal and MCP output, images, documents, pasted
+credentials, personal data, and regulated data. File permissions are not
+encryption. Enable capture only under an approved local data-handling policy.
+
+```yaml
+global:
+  trace_capture:
+    enabled: true
+    clients:
+      - claude-code
+    retention_days: 7
+```
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `false` | Enables future capture for the exact allowlisted clients. Existing files are preserved when disabled. |
+| `clients` | list[string] | `[]` | Required and nonempty when enabled. Every name must resolve to an enabled client whose listener, and any front door targeting it, is bound to loopback. |
+| `retention_days` | int | `7` | Retention for closed daily trace segments. Accepted range is 1 through 365 days. |
+
+Trace capture is independent of metadata telemetry. It stores no generic
+request or response headers. It is never enabled by an environment variable or
+remote provider setting.
 
 ### `clients[].model_options`
 

@@ -106,6 +106,15 @@ func (g *Gateway) adminConfig(w http.ResponseWriter, r *http.Request) {
 			g.reject(w, 400, "invalid config: "+err.Error())
 			return
 		}
+		active, err := config.Load(g.activeConfigPath())
+		if err != nil {
+			g.reject(w, 500, "load active config: "+err.Error())
+			return
+		}
+		if err := validateAdminTraceCaptureMutation(active, &f); err != nil {
+			g.reject(w, 403, err.Error())
+			return
+		}
 		if err := config.Save(g.activeConfigPath(), &f); err != nil {
 			g.reject(w, 500, "save config: "+err.Error())
 			return
@@ -119,6 +128,36 @@ func (g *Gateway) adminConfig(w http.ResponseWriter, r *http.Request) {
 	default:
 		g.reject(w, 405, "method not allowed")
 	}
+}
+
+// validateAdminTraceCaptureMutation keeps the unauthenticated loopback admin
+// surface from increasing content-capture scope. Activation and allowlist
+// expansion require a typed local CLI action or an exact local file edit.
+func validateAdminTraceCaptureMutation(active, proposed *config.File) error {
+	current, err := config.ResolveTraceCapture(active)
+	if err != nil {
+		return fmt.Errorf("active trace capture policy is invalid")
+	}
+	next, err := config.ResolveTraceCapture(proposed)
+	if err != nil {
+		return fmt.Errorf("invalid trace capture policy: %w", err)
+	}
+	if !current.Enabled && next.Enabled {
+		return fmt.Errorf("trace capture cannot be enabled through the administration API; use a local CLI command or edit gateway.yaml")
+	}
+	if !next.Enabled {
+		return nil
+	}
+	allowed := make(map[string]struct{}, len(current.Clients))
+	for _, client := range current.Clients {
+		allowed[client] = struct{}{}
+	}
+	for _, client := range next.Clients {
+		if _, ok := allowed[client]; !ok {
+			return fmt.Errorf("trace capture client allowlist cannot be expanded through the administration API; use a local CLI command or edit gateway.yaml")
+		}
+	}
+	return nil
 }
 
 // activeConfigPath returns the path the gateway is currently reading
@@ -573,8 +612,9 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 		// Mutation clients must target the exact file this process has
 		// loaded. Ambient CLI sticky state can point at an older scratch
 		// config even while this router is healthy.
-		"config_path": g.activeConfigPath(),
-		"telemetry":   g.telemetryAdminHealth(runtimeCfg),
+		"config_path":   g.activeConfigPath(),
+		"telemetry":     g.telemetryAdminHealth(runtimeCfg),
+		"trace_capture": g.traceAdminHealth(),
 		"baseten_catalog": sanitizedBasetenCatalogHealthJSON(
 			g.catalogHealth(),
 		),
