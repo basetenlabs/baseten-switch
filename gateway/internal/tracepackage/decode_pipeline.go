@@ -19,31 +19,26 @@ func InspectDecode(ctx context.Context, packagePath string) (plan DecodePlan, re
 	if err := file.Close(); err != nil {
 		return plan, err
 	}
-	inspectionRoot, err := os.MkdirTemp("", ".baseten-switch-decode-inspect-*")
-	if err != nil {
-		return plan, fmt.Errorf("trace package decode: create inspection staging: %w", err)
-	}
-	if err := os.Chmod(inspectionRoot, 0o700); err != nil {
-		_ = os.RemoveAll(inspectionRoot)
-		return plan, err
-	}
-	inspectionRoot, err = filepath.EvalSymlinks(inspectionRoot)
-	if err != nil {
-		return plan, fmt.Errorf("trace package decode: resolve inspection staging: %w", err)
-	}
-	inspectionInfo, err := os.Lstat(inspectionRoot)
+	inspectionName, err := randomDecodeStageName()
 	if err != nil {
 		return plan, err
 	}
-	inspectionIdentity, err := identityFromFileInfo(inspectionInfo)
+	tempRoot, err := filepath.EvalSymlinks(os.TempDir())
+	if err != nil {
+		return plan, fmt.Errorf("trace package decode: resolve temporary directory: %w", err)
+	}
+	inspectionWorkspace, err := createDecodeWorkspace(filepath.Join(tempRoot, inspectionName+"-output"))
 	if err != nil {
 		return plan, err
 	}
 	defer func() {
-		returnErr = errors.Join(returnErr, removeIdentityVerifiedDirectory(inspectionRoot, inspectionIdentity))
+		returnErr = errors.Join(returnErr, inspectionWorkspace.cleanup())
 	}()
-	inspectionOutput := filepath.Join(inspectionRoot, "not-published")
-	executed, err := decodeLegacy(ctx, DecodeOptions{PackagePath: resolved, OutputDir: inspectionOutput, inspectOnly: true})
+	inspectionOutput := filepath.Join(inspectionWorkspace.stagePath, "not-published")
+	executed, err := decodeLegacy(ctx, DecodeOptions{
+		PackagePath: resolved, OutputDir: inspectionOutput, inspectOnly: true,
+		expectedPackageIdentity: &identity,
+	})
 	if err != nil {
 		return plan, err
 	}
@@ -81,46 +76,19 @@ func MaterializeDecode(ctx context.Context, plan DecodePlan, outputDir string) (
 	}
 	plan.state.used = true
 	plan.state.mu.Unlock()
-	file, identity, resolved, err := openSecurePackage(plan.state.packagePath)
+	executed, err := decodeLegacy(ctx, DecodeOptions{
+		PackagePath: plan.state.packagePath, OutputDir: outputDir,
+		expectedPackageIdentity: &plan.state.packageInfo,
+		expectedPreflight:       &plan.Preflight,
+	})
 	if err != nil {
 		return result, err
-	}
-	closeErr := file.Close()
-	if closeErr != nil || resolved != plan.state.packagePath || identity != plan.state.packageInfo {
-		return result, errors.New("trace package decode: source package changed after inspection")
-	}
-	executed, err := decodeLegacy(ctx, DecodeOptions{PackagePath: resolved, OutputDir: outputDir})
-	if err != nil {
-		return result, err
-	}
-	if executed.PackageSHA256 != plan.Preflight.PackageSHA256 || executed.ArchiveID != plan.Preflight.ArchiveID ||
-		executed.TraceCount != plan.Preflight.TraceCount || executed.BodyCount != plan.Preflight.CapturedBodyCount || executed.DecodedBytes != plan.Preflight.DecodedBytes {
-		if outputInfo, statErr := os.Lstat(executed.OutputDir); statErr == nil {
-			if outputIdentity, identityErr := identityFromFileInfo(outputInfo); identityErr == nil {
-				_ = removeIdentityVerifiedDirectory(executed.OutputDir, outputIdentity)
-			}
-		}
-		return result, errors.New("trace package decode: repeated validation differs from inspected plan")
 	}
 	return DecodeResult{
 		OutputDir: executed.OutputDir, ArchiveID: executed.ArchiveID,
 		PackageSHA256: executed.PackageSHA256, TraceCount: executed.TraceCount,
 		MaterializedBodies: executed.BodyCount, DecodedBytes: executed.DecodedBytes,
 	}, nil
-}
-
-func removeIdentityVerifiedDirectory(path string, identity fileIdentity) error {
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if !sameObjectIdentity(info, identity) {
-		return errors.New("trace package decode: refused cleanup after directory identity changed")
-	}
-	return os.RemoveAll(path)
 }
 
 // Decode is a convenience API for callers that do not need an interactive

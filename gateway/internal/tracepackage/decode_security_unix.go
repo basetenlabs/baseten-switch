@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 type fileIdentity struct {
@@ -79,24 +81,27 @@ func openSecurePackage(value string) (*os.File, fileIdentity, string, error) {
 	if err != nil {
 		return nil, fileIdentity{}, "", err
 	}
-	if err := rejectSymlinkComponents(abs, true); err != nil {
+	parent, err := openSecureDecodeDirectory(filepath.Dir(abs))
+	if err != nil {
 		return nil, fileIdentity{}, "", err
 	}
-	before, err := os.Lstat(abs)
-	if err != nil || !before.Mode().IsRegular() || before.Mode()&fs.ModeSymlink != 0 {
-		return nil, fileIdentity{}, "", errors.New("trace package decode: package must be a regular non-symlink file")
-	}
-	if before.Mode().Perm()&0o077 != 0 {
-		return nil, fileIdentity{}, "", errors.New("trace package decode: package must have owner-only permissions")
-	}
-	file, err := openNoFollow(abs)
+	defer parent.close()
+	fd, err := unix.Openat(int(parent.file.Fd()), filepath.Base(abs), unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, fileIdentity{}, "", fmt.Errorf("trace package decode: open package without following links: %w", err)
 	}
+	file := os.NewFile(uintptr(fd), abs)
 	after, err := file.Stat()
-	if err != nil || !after.Mode().IsRegular() || !os.SameFile(before, after) {
+	visible, pathErr := os.Lstat(abs)
+	componentErr := rejectSymlinkComponents(abs, true)
+	if err != nil || pathErr != nil || componentErr != nil || !after.Mode().IsRegular() ||
+		visible.Mode()&fs.ModeSymlink != 0 || !os.SameFile(after, visible) {
 		_ = file.Close()
 		return nil, fileIdentity{}, "", errors.New("trace package decode: package changed while opening")
+	}
+	if after.Mode().Perm()&0o077 != 0 {
+		_ = file.Close()
+		return nil, fileIdentity{}, "", errors.New("trace package decode: package must have owner-only permissions")
 	}
 	identity, err := identityFromFileInfo(after)
 	if err != nil || identity.owner != currentOwnerID() || identity.size > MaxZIPBytes {

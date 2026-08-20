@@ -16,11 +16,14 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"mime"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	claudenative "github.com/basetenlabs/baseten-switch/gateway/internal/nativecapture/claude"
@@ -35,9 +38,11 @@ const maxManifestBytes = 4 << 20
 var ErrDecodeDestinationExists = errors.New("trace package decode: destination already exists")
 
 type DecodeOptions struct {
-	PackagePath string
-	OutputDir   string
-	inspectOnly bool
+	PackagePath             string
+	OutputDir               string
+	inspectOnly             bool
+	expectedPackageIdentity *fileIdentity
+	expectedPreflight       *DecodePreflight
 }
 
 type decodedBodyIndexV1 struct {
@@ -60,6 +65,7 @@ type packagedTraceEnvelope struct {
 
 type extractedMember struct {
 	manifest MemberManifestV1
+	root     *os.Root
 	path     string
 }
 
@@ -112,12 +118,14 @@ func decodeLegacy(ctx context.Context, options DecodeOptions) (result decodeExec
 		return result, err
 	}
 	result.OutputDir = outputDir
-	packageFile, packageIdentity, openedPath, err := openSecurePackage(packagePath)
+	packageFile, packageIdentity, _, err := openSecurePackage(packagePath)
 	if err != nil {
 		return result, err
 	}
 	defer packageFile.Close()
-	packagePath = openedPath
+	if options.expectedPackageIdentity != nil && packageIdentity != *options.expectedPackageIdentity {
+		return result, errors.New("trace package decode: source package changed after inspection")
+	}
 	sourceHashBefore, err := hashOpenFile(packageFile, packageIdentity.size)
 	if err != nil {
 		return result, fmt.Errorf("trace package decode: hash source package: %w", err)
@@ -144,22 +152,16 @@ func decodeLegacy(ctx context.Context, options DecodeOptions) (result decodeExec
 		return result, err
 	}
 
-	stageDir, err := os.MkdirTemp(filepath.Dir(outputDir), ".baseten-switch-decode-*")
+	workspace, err := createDecodeWorkspace(outputDir)
 	if err != nil {
-		return result, fmt.Errorf("trace package decode: create staging directory: %w", err)
-	}
-	if err := os.Chmod(stageDir, 0o700); err != nil {
-		_ = os.RemoveAll(stageDir)
-		return result, fmt.Errorf("trace package decode: protect staging directory: %w", err)
+		return result, err
 	}
 	defer func() {
-		if stageDir != "" {
-			returnErr = errors.Join(returnErr, os.RemoveAll(stageDir))
-		}
+		returnErr = errors.Join(returnErr, workspace.cleanup())
 	}()
 
-	rawDir := filepath.Join(stageDir, ".validated-input")
-	if err := os.Mkdir(rawDir, 0o700); err != nil {
+	rawDir := ".validated-input"
+	if err := workspace.root.Mkdir(rawDir, 0o700); err != nil {
 		return result, fmt.Errorf("trace package decode: create input staging: %w", err)
 	}
 	extracted := make(map[string]extractedMember, len(memberManifest))
@@ -174,11 +176,11 @@ func decodeLegacy(ctx context.Context, options DecodeOptions) (result decodeExec
 		}
 		totalBytes += expected.Bytes
 		nameHash := sha256.Sum256([]byte(file.Name))
-		path := filepath.Join(rawDir, hex.EncodeToString(nameHash[:]))
-		if err := extractAndVerify(ctx, file, expected, path); err != nil {
+		memberPath := path.Join(rawDir, hex.EncodeToString(nameHash[:]))
+		if err := extractAndVerify(ctx, file, expected, workspace.root, memberPath); err != nil {
 			return result, err
 		}
-		extracted[file.Name] = extractedMember{manifest: expected, path: path}
+		extracted[file.Name] = extractedMember{manifest: expected, root: workspace.root, path: memberPath}
 	}
 
 	traceEvents, err := validateTraceRows(extracted[TraceMemberName])
@@ -227,35 +229,28 @@ func decodeLegacy(ctx context.Context, options DecodeOptions) (result decodeExec
 	}
 	if options.inspectOnly {
 		bodyBudget := MaxUncompressedBytes - decodedFixedBytes
-		bodyTotals, err := decodeTraceRows(ctx, extracted[TraceMemberName].path, "", manifest.ArchiveID, bodyBudget, io.Discard, false)
+		bodyTotals, err := decodeTraceRows(ctx, extracted[TraceMemberName], nil, manifest.ArchiveID, bodyBudget, io.Discard, false)
 		if err != nil {
 			return result, err
 		}
 		result.BodyCount = bodyTotals.Count
 		result.DecodedBytes = bodyTotals.Bytes
-		result.MemberNames = append([]string{"decode-manifest.json", "index.jsonl", "source-manifest.json"}, bodyTotals.Names...)
-		for name := range extracted {
-			if name == TelemetryMemberName || strings.HasPrefix(name, "native/") {
-				result.MemberNames = append(result.MemberNames, name)
-			}
-		}
-		slices.Sort(result.MemberNames)
-		if err := verifyOpenPackageUnchanged(packageFile, packageIdentity, packagePath, sourceHashBefore); err != nil {
+		result.MemberNames = decodedOutputMemberNames(bodyTotals.Names, extracted)
+		if err := verifyOpenPackageUnchanged(packageFile, packageIdentity, sourceHashBefore); err != nil {
 			return result, err
 		}
 		return result, nil
 	}
 
-	if err := decodeWritePrivateFile(filepath.Join(stageDir, "source-manifest.json"), manifestBytes); err != nil {
+	if err := decodeWritePrivateFile(workspace.root, "source-manifest.json", manifestBytes); err != nil {
 		return result, err
 	}
-	indexPath := filepath.Join(stageDir, "index.jsonl")
-	indexFile, err := openPrivateNew(indexPath)
+	indexFile, err := openPrivateNew(workspace.root, "index.jsonl")
 	if err != nil {
 		return result, err
 	}
 	bodyBudget := MaxUncompressedBytes - decodedFixedBytes
-	bodyTotals, decodeErr := decodeTraceRows(ctx, extracted[TraceMemberName].path, stageDir, manifest.ArchiveID, bodyBudget, indexFile, true)
+	bodyTotals, decodeErr := decodeTraceRows(ctx, extracted[TraceMemberName], workspace.root, manifest.ArchiveID, bodyBudget, indexFile, true)
 	syncErr := indexFile.Sync()
 	closeErr := indexFile.Close()
 	if decodeErr != nil || syncErr != nil || closeErr != nil {
@@ -265,13 +260,14 @@ func decodeLegacy(ctx context.Context, options DecodeOptions) (result decodeExec
 		if name != TelemetryMemberName && !strings.HasPrefix(name, "native/") {
 			continue
 		}
-		if err := copyPrivateFile(ctx, member.path, filepath.Join(stageDir, filepath.FromSlash(name))); err != nil {
+		if err := copyPrivateFile(ctx, member, workspace.root, name); err != nil {
 			return result, err
 		}
 	}
 	result.BodyCount = bodyTotals.Count
 	result.DecodedBytes = bodyTotals.Bytes
-	decodedMembers, outputBytes, err := buildDecodedMemberManifest(stageDir, extracted, result.TraceCount)
+	result.MemberNames = decodedOutputMemberNames(bodyTotals.Names, extracted)
+	decodedMembers, outputBytes, err := buildDecodedMemberManifest(workspace.root, extracted, result.TraceCount)
 	if err != nil {
 		return result, err
 	}
@@ -295,28 +291,59 @@ func decodeLegacy(ctx context.Context, options DecodeOptions) (result decodeExec
 	if int64(len(decodeManifestBytes)) > MaxUncompressedBytes-outputBytes {
 		return result, fmt.Errorf("%w: total decoded output", ErrLimitExceeded)
 	}
-	if err := decodeWritePrivateFile(filepath.Join(stageDir, "decode-manifest.json"), decodeManifestBytes); err != nil {
+	if err := decodeWritePrivateFile(workspace.root, "decode-manifest.json", decodeManifestBytes); err != nil {
 		return result, err
 	}
-	if err := os.RemoveAll(rawDir); err != nil {
+	if err := workspace.root.RemoveAll(rawDir); err != nil {
 		return result, fmt.Errorf("trace package decode: remove validated input staging: %w", err)
 	}
-	if err := verifyOpenPackageUnchanged(packageFile, packageIdentity, packagePath, sourceHashBefore); err != nil {
+	if options.expectedPreflight != nil && !sameDecodePreflight(result, *options.expectedPreflight) {
+		return result, errors.New("trace package decode: repeated validation differs from inspected plan")
+	}
+	if err := verifyOpenPackageUnchanged(packageFile, packageIdentity, sourceHashBefore); err != nil {
 		return result, err
 	}
-	if err := publishDecodedDirectory(stageDir, outputDir); err != nil {
+	if err := workspace.publish(); err != nil {
 		return result, err
 	}
-	stageDir = ""
 	return result, nil
 }
 
-func verifyOpenPackageUnchanged(file *os.File, identity fileIdentity, path, expectedHash string) error {
+func decodedOutputMemberNames(bodyNames []string, extracted map[string]extractedMember) []string {
+	names := append([]string{"decode-manifest.json", "index.jsonl", "source-manifest.json"}, bodyNames...)
+	for name := range extracted {
+		if name == TelemetryMemberName || strings.HasPrefix(name, "native/") {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	return names
+}
+
+func sameDecodePreflight(result decodeExecutionResult, expected DecodePreflight) bool {
+	return result.ArchiveID == expected.ArchiveID &&
+		result.PackageSHA256 == expected.PackageSHA256 &&
+		result.TraceCount == expected.TraceCount &&
+		result.BodyCount == expected.CapturedBodyCount &&
+		result.TraceCount*2-result.BodyCount == expected.OmittedBodyCount &&
+		result.DecodedBytes == expected.DecodedBytes &&
+		slices.Equal(result.MemberNames, expected.MemberNames) &&
+		result.TelemetryCount == expected.TelemetryRows &&
+		result.NativeTurnCount == expected.NativeRows &&
+		result.Scanner.Version == expected.Scanner.Version &&
+		result.Scanner.ScannedBodyCount == expected.Scanner.ScannedBodyCount &&
+		result.Scanner.UnscannedBodyCount == expected.Scanner.UnscannedBodyCount &&
+		maps.Equal(result.Scanner.DetectedCategoryCounts, expected.Scanner.DetectedCategoryCounts) &&
+		result.Scanner.ScannedNativeRecordCount == expected.Scanner.ScannedNativeRecordCount &&
+		result.Scanner.UnscannedNativeRecordCount == expected.Scanner.UnscannedNativeRecordCount &&
+		result.Scanner.AllowUnscannedContentUsed == expected.Scanner.AllowUnscannedContentUsed &&
+		result.Scanner.AllowDetectedSecretsUsed == expected.Scanner.AllowDetectedSecretsUsed
+}
+
+func verifyOpenPackageUnchanged(file *os.File, identity fileIdentity, expectedHash string) error {
 	actualHash, err := hashOpenFile(file, identity.size)
 	currentInfo, statErr := file.Stat()
-	pathInfo, pathErr := os.Lstat(path)
-	if err != nil || statErr != nil || pathErr != nil || actualHash != expectedHash ||
-		!sameIdentity(currentInfo, identity) || !os.SameFile(currentInfo, pathInfo) {
+	if err != nil || statErr != nil || actualHash != expectedHash || !sameIdentity(currentInfo, identity) {
 		return errors.New("trace package decode: source package changed during decoding")
 	}
 	return nil
@@ -619,13 +646,13 @@ func validateDecodeManifest(manifest ManifestV1, files map[string]*zip.File) (ma
 	return wanted, nil
 }
 
-func extractAndVerify(ctx context.Context, file *zip.File, expected MemberManifestV1, destination string) error {
+func extractAndVerify(ctx context.Context, file *zip.File, expected MemberManifestV1, root *os.Root, destination string) error {
 	reader, err := file.Open()
 	if err != nil {
 		return fmt.Errorf("trace package decode: open %s: %w", file.Name, err)
 	}
 	defer reader.Close()
-	out, err := openPrivateNew(destination)
+	out, err := openPrivateNew(root, destination)
 	if err != nil {
 		return err
 	}
@@ -646,7 +673,7 @@ func extractAndVerify(ctx context.Context, file *zip.File, expected MemberManife
 }
 
 func forEachJSONLine(member extractedMember, maxLine int, fn func([]byte) error) (int, error) {
-	file, err := os.Open(member.path)
+	file, err := member.root.Open(member.path)
 	if err != nil {
 		return 0, err
 	}
@@ -932,9 +959,8 @@ func validNativeMatchMode(client, value string) bool {
 	}
 }
 
-func decodeTraceRows(ctx context.Context, source, stageDir, archiveID string, bodyBudget int64, index io.Writer, materialize bool) (decodedBodyTotals, error) {
+func decodeTraceRows(ctx context.Context, member extractedMember, outputRoot *os.Root, archiveID string, bodyBudget int64, index io.Writer, materialize bool) (decodedBodyTotals, error) {
 	var totals decodedBodyTotals
-	member := extractedMember{manifest: MemberManifestV1{Name: TraceMemberName}, path: source}
 	_, err := forEachJSONLineUnchecked(member, MaxTraceLineBytes, func(line []byte) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -943,11 +969,11 @@ func decodeTraceRows(ctx context.Context, source, stageDir, archiveID string, bo
 		if err != nil {
 			return err
 		}
-		request, err := decodeOneBody(ctx, stageDir, trace.EventID, "request", trace.Request, materialize)
+		request, err := decodeOneBody(ctx, outputRoot, trace.EventID, "request", trace.Request, materialize)
 		if err != nil {
 			return err
 		}
-		responseBody, err := decodeOneBody(ctx, stageDir, trace.EventID, "response", trace.Response.BodyV1, materialize)
+		responseBody, err := decodeOneBody(ctx, outputRoot, trace.EventID, "response", trace.Response.BodyV1, materialize)
 		if err != nil {
 			return err
 		}
@@ -1050,7 +1076,7 @@ func mustJSONRaw(value any) json.RawMessage {
 
 func forEachJSONLineUnchecked(member extractedMember, maxLine int, fn func([]byte) error) (int, error) {
 	member.manifest.RecordCount = -1
-	file, err := os.Open(member.path)
+	file, err := member.root.Open(member.path)
 	if err != nil {
 		return 0, err
 	}
@@ -1080,7 +1106,7 @@ func forEachJSONLineUnchecked(member extractedMember, maxLine int, fn func([]byt
 	}
 }
 
-func decodeOneBody(ctx context.Context, stageDir, eventID, boundary string, body tracecapture.BodyV1, materialize bool) (decodedBodyIndexV1, error) {
+func decodeOneBody(ctx context.Context, outputRoot *os.Root, eventID, boundary string, body tracecapture.BodyV1, materialize bool) (decodedBodyIndexV1, error) {
 	entry := decodedBodyIndexV1{
 		Boundary: body.Boundary, ContentType: body.ContentType, ContentEncoding: body.ContentEncoding,
 		BodyEncoding: body.BodyEncoding, ObservedBytes: body.ObservedBytes, CaptureState: body.CaptureState,
@@ -1102,9 +1128,12 @@ func decodeOneBody(ctx context.Context, stageDir, eventID, boundary string, body
 	if err != nil {
 		return entry, err
 	}
-	relative := filepath.ToSlash(filepath.Join("traces", eventID, boundary+extensionForContentType(body.ContentType)))
+	relative := path.Join("traces", eventID, boundary+extensionForContentType(body.ContentType))
 	if materialize {
-		if err := decodeWritePrivateFile(filepath.Join(stageDir, filepath.FromSlash(relative)), decoded); err != nil {
+		if outputRoot == nil {
+			return entry, errors.New("trace package decode: decoded output root is unavailable")
+		}
+		if err := decodeWritePrivateFile(outputRoot, relative, decoded); err != nil {
 			return entry, err
 		}
 	}
@@ -1186,19 +1215,22 @@ func extensionForContentType(value string) string {
 	}
 }
 
-func openPrivateNew(path string) (*os.File, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+func openPrivateNew(root *os.Root, name string) (*os.File, error) {
+	if root == nil || !fs.ValidPath(name) || name == "." {
+		return nil, errors.New("trace package decode: invalid private file path")
+	}
+	if err := root.MkdirAll(path.Dir(name), 0o700); err != nil {
 		return nil, fmt.Errorf("trace package decode: create private directory: %w", err)
 	}
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	file, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("trace package decode: create private file: %w", err)
 	}
 	return file, nil
 }
 
-func decodeWritePrivateFile(path string, data []byte) error {
-	file, err := openPrivateNew(path)
+func decodeWritePrivateFile(root *os.Root, name string, data []byte) error {
+	file, err := openPrivateNew(root, name)
 	if err != nil {
 		return err
 	}
@@ -1211,13 +1243,13 @@ func decodeWritePrivateFile(path string, data []byte) error {
 	return nil
 }
 
-func copyPrivateFile(ctx context.Context, source, destination string) error {
-	in, err := os.Open(source)
+func copyPrivateFile(ctx context.Context, source extractedMember, destinationRoot *os.Root, destination string) error {
+	in, err := source.root.Open(source.path)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := openPrivateNew(destination)
+	out, err := openPrivateNew(destinationRoot, destination)
 	if err != nil {
 		return err
 	}
@@ -1239,21 +1271,17 @@ func (r contextBoundReader) Read(buffer []byte) (int, error) {
 	return r.reader.Read(buffer)
 }
 
-func buildDecodedMemberManifest(stageDir string, extracted map[string]extractedMember, traceCount int) ([]DecodedMemberManifestV1, int64, error) {
+func buildDecodedMemberManifest(root *os.Root, extracted map[string]extractedMember, traceCount int) ([]DecodedMemberManifestV1, int64, error) {
 	var members []DecodedMemberManifestV1
 	var total int64
-	err := filepath.WalkDir(stageDir, func(filePath string, entry fs.DirEntry, walkErr error) error {
+	err := fs.WalkDir(root.FS(), ".", func(filePath string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if filePath == stageDir {
+		if filePath == "." {
 			return nil
 		}
-		relative, err := filepath.Rel(stageDir, filePath)
-		if err != nil {
-			return err
-		}
-		name := filepath.ToSlash(relative)
+		name := filePath
 		if name == ".validated-input" || strings.HasPrefix(name, ".validated-input/") {
 			if entry.IsDir() {
 				return filepath.SkipDir
@@ -1270,7 +1298,7 @@ func buildDecodedMemberManifest(stageDir string, extracted map[string]extractedM
 		if err != nil {
 			return err
 		}
-		hashValue, err := hashFile(filePath)
+		hashValue, err := hashRootFile(root, filePath)
 		if err != nil {
 			return err
 		}
@@ -1300,7 +1328,7 @@ func buildDecodedMemberManifest(stageDir string, extracted map[string]extractedM
 					return errors.New("trace package decode: invalid decoded body path")
 				}
 				member.EventID = parts[1]
-				boundary := strings.TrimSuffix(parts[2], filepath.Ext(parts[2]))
+				boundary := strings.TrimSuffix(parts[2], path.Ext(parts[2]))
 				switch boundary {
 				case "request":
 					member.Kind = DecodedMemberRequestBody
@@ -1334,78 +1362,33 @@ func buildDecodedMemberManifest(stageDir string, extracted map[string]extractedM
 	return members, total, nil
 }
 
-func publishDecodedDirectory(stageDir, outputDir string) error {
-	// Portable Go does not expose a no-replace directory rename. Reserve the
-	// destination atomically, mark it incomplete, move same-filesystem entries,
-	// then remove the marker as the publication boundary.
-	if err := os.Mkdir(outputDir, 0o700); err != nil {
-		if errors.Is(err, fs.ErrExist) {
-			return ErrDecodeDestinationExists
-		}
-		return fmt.Errorf("trace package decode: reserve output directory: %w", err)
-	}
-	reservedInfo, err := os.Lstat(outputDir)
+func hashRootFile(root *os.Root, name string) (string, error) {
+	file, err := root.Open(name)
 	if err != nil {
-		return err
+		return "", err
 	}
-	reservedIdentity, err := identityFromFileInfo(reservedInfo)
-	if err != nil {
-		return err
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return "", errors.New("trace package decode: staged member is not a regular file")
 	}
-	cleanup := true
-	defer func() {
-		if cleanup {
-			if current, err := os.Lstat(outputDir); err == nil && sameObjectIdentity(current, reservedIdentity) {
-				_ = os.RemoveAll(outputDir)
-			}
-		}
-	}()
-	if err := syncDirectory(filepath.Dir(outputDir)); err != nil {
-		return fmt.Errorf("trace package decode: sync output parent after reservation: %w", err)
-	}
-	marker := filepath.Join(outputDir, ".incomplete")
-	if err := decodeWritePrivateFile(marker, []byte("incomplete\n")); err != nil {
-		return err
-	}
-	entries, err := os.ReadDir(stageDir)
-	if err != nil {
-		return fmt.Errorf("trace package decode: list staged output: %w", err)
-	}
-	for _, entry := range entries {
-		if err := os.Rename(filepath.Join(stageDir, entry.Name()), filepath.Join(outputDir, entry.Name())); err != nil {
-			return fmt.Errorf("trace package decode: publish %s: %w", entry.Name(), err)
-		}
-	}
-	if err := syncDecodedTree(outputDir); err != nil {
-		return err
-	}
-	if err := os.Remove(marker); err != nil {
-		return fmt.Errorf("trace package decode: complete publication: %w", err)
-	}
-	if err := syncDirectory(outputDir); err != nil {
-		return fmt.Errorf("trace package decode: sync completed output: %w", err)
-	}
-	if err := syncDirectory(filepath.Dir(outputDir)); err != nil {
-		return fmt.Errorf("trace package decode: sync output parent: %w", err)
-	}
-	if err := os.Remove(stageDir); err != nil {
-		return fmt.Errorf("trace package decode: remove empty staging directory: %w", err)
-	}
-	cleanup = false
-	return nil
+	return hashOpenFile(file, info.Size())
 }
 
-func syncDecodedTree(root string) error {
+func syncDecodedRoot(root *os.Root) error {
 	var directories []string
-	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+	err := fs.WalkDir(root.FS(), ".", func(name string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
 		if entry.IsDir() {
-			directories = append(directories, path)
+			directories = append(directories, name)
 			return nil
 		}
-		file, err := os.Open(path)
+		if entry.Type()&fs.ModeSymlink != 0 || !entry.Type().IsRegular() {
+			return errors.New("trace package decode: non-regular staged output")
+		}
+		file, err := root.Open(name)
 		if err != nil {
 			return err
 		}
@@ -1418,8 +1401,14 @@ func syncDecodedTree(root string) error {
 	}
 	slices.Reverse(directories)
 	for _, directory := range directories {
-		if err := syncDirectory(directory); err != nil {
-			return fmt.Errorf("trace package decode: sync output directory: %w", err)
+		file, err := root.Open(directory)
+		if err != nil {
+			return fmt.Errorf("trace package decode: open output directory for sync: %w", err)
+		}
+		syncErr := file.Sync()
+		closeErr := file.Close()
+		if syncErr != nil || closeErr != nil {
+			return fmt.Errorf("trace package decode: sync output directory: %w", errors.Join(syncErr, closeErr))
 		}
 	}
 	return nil

@@ -111,6 +111,27 @@ func TestInspectDecodeIsAuthoritativeAndPlanIsSingleUse(t *testing.T) {
 	}
 }
 
+func TestMaterializeDecodeRejectsChangedPreflightBeforePublication(t *testing.T) {
+	source := createDecodeFixture(t)
+	plan, err := InspectDecode(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.Preflight.TraceCount++
+	root, _ := filepath.EvalSymlinks(t.TempDir())
+	output := filepath.Join(root, "decoded")
+	if _, err := MaterializeDecode(context.Background(), plan, output); err == nil || !strings.Contains(err.Error(), "differs from inspected plan") {
+		t.Fatalf("materialize error = %v", err)
+	}
+	if _, err := os.Lstat(output); !os.IsNotExist(err) {
+		t.Fatalf("output was published: %v", err)
+	}
+	staging, err := filepath.Glob(filepath.Join(root, ".baseten-switch-decode-*"))
+	if err != nil || len(staging) != 0 {
+		t.Fatalf("staging directories remained: %v, %v", staging, err)
+	}
+}
+
 func TestInspectDecodeRejectsInsecureSourceMode(t *testing.T) {
 	source := createDecodeFixture(t)
 	if err := os.Chmod(source, 0o644); err != nil {
@@ -179,7 +200,12 @@ func TestBoundedJSONLReaderRejectsOversizedLine(t *testing.T) {
 	if err := os.WriteFile(path, bytes.Repeat([]byte("x"), 1025), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	member := extractedMember{manifest: MemberManifestV1{Name: "test", RecordCount: 1}, path: path}
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	member := extractedMember{manifest: MemberManifestV1{Name: "test", RecordCount: 1}, root: root, path: filepath.Base(path)}
 	if _, err := forEachJSONLine(member, 1024, func([]byte) error { return nil }); err == nil {
 		t.Fatal("oversized line accepted")
 	}
@@ -314,6 +340,10 @@ func TestDecodeRejectsManifestHashMismatchWithoutOutput(t *testing.T) {
 	}
 	if _, err := os.Stat(output); !os.IsNotExist(err) {
 		t.Fatalf("output was published: %v", err)
+	}
+	staging, err := filepath.Glob(filepath.Join(outputRoot, ".baseten-switch-decode-*"))
+	if err != nil || len(staging) != 0 {
+		t.Fatalf("staging directories remained: %v, %v", staging, err)
 	}
 }
 
