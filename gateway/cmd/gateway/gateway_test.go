@@ -21,6 +21,7 @@ import (
 	"github.com/basetenlabs/baseten-switch/gateway/internal/config"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/pricing"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/telemetry"
+	"github.com/basetenlabs/baseten-switch/gateway/internal/version"
 )
 
 func testConfig(t *testing.T, upstreamBaseten, upstreamAnthropic string) Config {
@@ -431,6 +432,12 @@ func TestPostMessagesBasetenForwardsRewrittenModel(t *testing.T) {
 		if r.URL.Path != "/v1/messages" {
 			t.Errorf("unexpected upstream path %q", r.URL.Path)
 		}
+		if got, want := r.Header.Get("User-Agent"), "baseten-switch/"+version.Version+" test-harness/1.0"; got != want {
+			t.Errorf("User-Agent = %q, want %q", got, want)
+		}
+		if got := r.Header.Get(switchVersionHeader); got != version.Version {
+			t.Errorf("%s = %q, want %q", switchVersionHeader, got, version.Version)
+		}
 		if r.Header.Get("Authorization") != "Api-Key bas-key" {
 			t.Errorf("bad upstream auth: %q", r.Header.Get("Authorization"))
 		}
@@ -453,6 +460,8 @@ func TestPostMessagesBasetenForwardsRewrittenModel(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer tok")
 	req.Header.Set("Anthropic-Version", "2023-06-01")
+	req.Header.Set("User-Agent", "test-harness/1.0")
+	req.Header.Set(switchVersionHeader, "forged")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -1025,6 +1034,12 @@ func TestOpenAIShapeBasetenForwardsChatCompletions(t *testing.T) {
 	gotModel := make(chan string, 1)
 	gotPath := make(chan string, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.Header.Get("User-Agent"), "baseten-switch/"+version.Version+" test-harness/1.0"; got != want {
+			t.Errorf("User-Agent = %q, want %q", got, want)
+		}
+		if got := r.Header.Get(switchVersionHeader); got != version.Version {
+			t.Errorf("%s = %q, want %q", switchVersionHeader, got, version.Version)
+		}
 		gotPath <- r.URL.Path
 		b, _ := io.ReadAll(r.Body)
 		var m map[string]interface{}
@@ -1046,6 +1061,8 @@ func TestOpenAIShapeBasetenForwardsChatCompletions(t *testing.T) {
 	req, _ := http.NewRequest("POST", clientURL(g, "opencode", "/v1/chat/completions"), bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer tok")
+	req.Header.Set("User-Agent", "test-harness/1.0")
+	req.Header.Set(switchVersionHeader, "forged")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -1546,6 +1563,12 @@ func TestOpenAIShapeResponsesPassthroughForwardsVerbatim(t *testing.T) {
 	gotModel := make(chan string, 1)
 	gotPath := make(chan string, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("User-Agent"); got != "native-harness/1.0" {
+			t.Errorf("native User-Agent = %q, want unchanged", got)
+		}
+		if got := r.Header.Get(switchVersionHeader); got != "native-inbound" {
+			t.Errorf("native %s = %q, want unchanged", switchVersionHeader, got)
+		}
 		gotPath <- r.URL.Path
 		b, _ := io.ReadAll(r.Body)
 		var m map[string]interface{}
@@ -1573,6 +1596,8 @@ func TestOpenAIShapeResponsesPassthroughForwardsVerbatim(t *testing.T) {
 	req, _ := http.NewRequest("POST", clientURL(g, "opencode", "/v1/responses"), bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer tok")
+	req.Header.Set("User-Agent", "native-harness/1.0")
+	req.Header.Set(switchVersionHeader, "native-inbound")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -1678,6 +1703,12 @@ func TestOpenAIShapeResponsesBasetenRewritesModel(t *testing.T) {
 	gotModel := make(chan string, 1)
 	gotPath := make(chan string, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.Header.Get("User-Agent"), "baseten-switch/"+version.Version+" test-harness/1.0"; got != want {
+			t.Errorf("User-Agent = %q, want %q", got, want)
+		}
+		if got := r.Header.Get(switchVersionHeader); got != version.Version {
+			t.Errorf("%s = %q, want %q", switchVersionHeader, got, version.Version)
+		}
 		gotPath <- r.URL.Path
 		b, _ := io.ReadAll(r.Body)
 		var m map[string]interface{}
@@ -1699,6 +1730,8 @@ func TestOpenAIShapeResponsesBasetenRewritesModel(t *testing.T) {
 	req, _ := http.NewRequest("POST", clientURL(g, "codex", "/v1/responses"), bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer tok")
+	req.Header.Set("User-Agent", "test-harness/1.0")
+	req.Header.Set(switchVersionHeader, "forged")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)

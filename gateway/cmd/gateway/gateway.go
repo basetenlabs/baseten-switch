@@ -2497,6 +2497,7 @@ func (g *Gateway) buildAttemptTargetWithSnapshot(
 	if projectFastProfile {
 		_, headers, _ = requestprofile.RemoveUnsupportedFastProfile(nil, headers)
 	}
+	applyBasetenUsageHeaders(headers, rt)
 	telemetryAttempt := captureTelemetryAttemptV1(
 		snapshot,
 		time.Now(),
