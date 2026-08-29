@@ -234,6 +234,9 @@ final class RouterWindowController: NSObject, NSWindowDelegate, NSToolbarDelegat
             selection: navigation.selection
         ) {
             state.requestClientPageRefresh()
+            if navigation.selection == .client("claude-code") {
+                state.requestClaudeModelPickerDiagnosticsRefresh()
+            }
         } else {
             state.requestInteractiveRefresh(includeStats: false)
             if navigation.selection == .overview {
@@ -272,6 +275,9 @@ final class RouterWindowController: NSObject, NSWindowDelegate, NSToolbarDelegat
             return
         }
         state.ensureModelCatalogLoaded()
+        if selection == .client("claude-code") {
+            state.ensureClaudeModelPickerDiagnosticsLoaded()
+        }
     }
 }
 
@@ -679,6 +685,9 @@ private struct RouterConfigurationView: View {
             return
         }
         state.ensureModelCatalogLoaded()
+        if selection == .client("claude-code") {
+            state.ensureClaudeModelPickerDiagnosticsLoaded()
+        }
     }
 }
 
@@ -998,6 +1007,12 @@ private struct ClientRoutingView: View {
                     warnings
                     if presentation.showsModelRouting {
                         modelRoutingSection
+                    }
+                    if client.name == "claude-code" {
+                        ClaudeModelPickerSectionView(
+                            state: state,
+                            client: client,
+                            isPreview: isPreview)
                     }
                     if presentation.showsReasoning {
                         reasoningSection

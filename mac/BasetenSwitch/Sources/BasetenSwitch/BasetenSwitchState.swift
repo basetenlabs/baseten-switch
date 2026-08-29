@@ -101,6 +101,14 @@ final class BasetenSwitchState: ObservableObject {
     @Published private(set) var pendingCodexRoute: PendingControlMutation?
     @Published private(set) var pendingSubagents: [String: PendingControlMutation] = [:]
     @Published private(set) var pendingReasoning: PendingReasoningMutation?
+    @Published private(set) var pendingClaudeModelPicker:
+        PendingClaudeModelPickerMutation?
+    @Published private(set) var claudeModelPickerNotice: String?
+    @Published private(set) var claudeModelPickerWarnings: [String] = []
+    @Published private(set) var claudeModelPickerDiagnostics:
+        ClaudeModelPickerDiagnostics?
+    @Published private(set) var claudeModelPickerDiagnosticsLoading = false
+    @Published private(set) var claudeModelPickerDiagnosticsError: String?
     @Published private(set) var reasoningWarnings: [String: String] = [:]
     @Published private(set) var mutationRecoveryState: MutationRecoveryState
 
@@ -121,6 +129,7 @@ final class BasetenSwitchState: ObservableObject {
     private var clientPageRefreshTask: Task<Void, Never>?
     private var clientPageRefreshPending = false
     private var modelCatalogTask: Task<Void, Never>?
+    private var claudeModelPickerDiagnosticsTask: Task<Void, Never>?
     private var modelCatalogGeneration: UInt64 = 0
     private var refreshingModelCatalog: [LiveModelCatalogEntry]?
     private var automaticCatalogRecoveryGeneration: UInt64?
@@ -272,6 +281,8 @@ final class BasetenSwitchState: ObservableObject {
         clientPageRefreshTask = nil
         clientPageRefreshPending = false
         invalidateModelCatalog()
+        claudeModelPickerDiagnosticsTask?.cancel()
+        claudeModelPickerDiagnosticsTask = nil
         mutationRecoveryTask?.cancel()
         mutationRecoveryTask = nil
         Task { await pollCoordinator?.stop() }
@@ -626,6 +637,45 @@ final class BasetenSwitchState: ObservableObject {
     func ensureModelCatalogLoaded() {
         guard case .idle = liveModelCatalogState else { return }
         requestModelCatalogRefresh()
+    }
+
+    func ensureClaudeModelPickerDiagnosticsLoaded() {
+        guard claudeModelPickerDiagnostics == nil,
+              !claudeModelPickerDiagnosticsLoading else { return }
+        requestClaudeModelPickerDiagnosticsRefresh()
+    }
+
+    func requestClaudeModelPickerDiagnosticsRefresh() {
+        guard claudeModelPickerDiagnosticsTask == nil else { return }
+        claudeModelPickerDiagnosticsLoading = true
+        claudeModelPickerDiagnosticsError = nil
+        claudeModelPickerDiagnosticsTask = Task { [weak self] in
+            await self?.refreshClaudeModelPickerDiagnostics()
+            self?.claudeModelPickerDiagnosticsTask = nil
+        }
+    }
+
+    func waitForClaudeModelPickerDiagnosticsRefresh() async {
+        await claudeModelPickerDiagnosticsTask?.value
+    }
+
+    private func refreshClaudeModelPickerDiagnostics() async {
+        let result = await executeCLI(
+            ["claude", "picker", "status", "--json"],
+            timeout: 10)
+        guard !result.timedOut,
+              result.status == 0 || result.status == 3,
+              let diagnostics = ClaudeModelPickerDiagnostics(
+                json: result.standardOutput) else {
+            claudeModelPickerDiagnosticsLoading = false
+            claudeModelPickerDiagnosticsError = result.timedOut
+                ? "Checking the Claude picker status timed out."
+                : "Switch could not read the Claude picker status."
+            return
+        }
+        claudeModelPickerDiagnostics = diagnostics
+        claudeModelPickerDiagnosticsLoading = false
+        claudeModelPickerDiagnosticsError = nil
     }
 
     func routerWindowDidClose() {
@@ -1224,6 +1274,292 @@ final class BasetenSwitchState: ObservableObject {
         await setSubagents(client, choice: choice)
     }
 
+    // MARK: - Claude model picker
+
+    func claudeModelPickerProjection(
+        for client: ClientStatus
+    ) -> ClaudeModelPickerProjection {
+        projectClaudeModelPicker(
+            status: client.modelPicker,
+            liveState: liveModelCatalogState)
+    }
+
+    var canMutateClaudeModelPicker: Bool {
+        guard gatewayUp,
+              canMutate,
+              mutationRecoveryAllowsRouting,
+              let snapshot = routingSnapshot else { return false }
+        return snapshot.token.isAuthoritative
+            && snapshot.token.activeGeneration > 0
+            && snapshot.desiredMatchesActive
+    }
+
+    var claudeModelPickerMutationDisabledReason: String? {
+        if let pendingClaudeModelPicker {
+            return "\(pendingClaudeModelPicker.kind.progressLabel) is still in progress."
+        }
+        guard gatewayUp else { return "The local gateway is unavailable." }
+        guard canMutate else { return runtimeTrustError }
+        if let recoveryReason = mutationRecoveryDisabledReason {
+            return recoveryReason
+        }
+        guard let snapshot = routingSnapshot,
+              snapshot.token.isAuthoritative,
+              snapshot.token.activeGeneration > 0 else {
+            return "Update the local gateway before changing the model picker."
+        }
+        guard snapshot.desiredMatchesActive else {
+            return "The saved and active configurations differ. Resolve the reload error first."
+        }
+        return nil
+    }
+
+    func previewClaudeModelPickerAdd(
+        slug: String,
+        alias: String? = nil
+    ) async -> ClaudeModelPickerAddPreviewOutcome? {
+        guard canMutateClaudeModelPicker,
+              modelCatalogAllowsMutation,
+              pendingClaudeModelPicker == nil else {
+            return nil
+        }
+        var arguments = [
+            "claude", "picker", "add", slug,
+            "--dry-run", "--json",
+        ]
+        if let alias {
+            arguments += ["--alias", alias]
+        }
+        let result = await executeCLI(arguments, timeout: 10)
+        guard let outcome = ClaudeModelPickerAddPreviewOutcome(
+            json: result.standardOutput,
+            status: result.status,
+            explicitAlias: alias) else {
+            lastError = result.timedOut
+                ? "The model picker preview timed out."
+                : "Switch could not generate a safe model picker preview."
+            return nil
+        }
+        if case .preview(let preview, _) = outcome,
+           preview.slug != slug {
+            lastError = "Switch returned a model picker preview for a different model."
+            return nil
+        }
+        lastError = nil
+        return outcome
+    }
+
+    func previewClaudeModelPickerEnable()
+        async -> ClaudeModelPickerEnablePreview? {
+        guard canMutateClaudeModelPicker,
+              pendingClaudeModelPicker == nil else {
+            return nil
+        }
+        let result = await executeCLI(
+            [
+                "claude", "picker", "enable",
+                "--dry-run", "--json",
+            ],
+            timeout: 10)
+        guard result.succeeded,
+              let preview = ClaudeModelPickerEnablePreview(
+                json: result.standardOutput) else {
+            lastError = result.timedOut
+                ? "The model picker setup preview timed out."
+                : "Switch could not generate a safe model picker setup preview."
+            return nil
+        }
+        lastError = nil
+        return preview
+    }
+
+    func requestClaudeModelPicker(
+        _ kind: ClaudeModelPickerMutationKind
+    ) {
+        guard beginClaudeModelPickerMutation(kind) else { return }
+        Task { await finishClaudeModelPickerMutation(kind) }
+    }
+
+    func setClaudeModelPicker(
+        _ kind: ClaudeModelPickerMutationKind
+    ) async {
+        guard beginClaudeModelPickerMutation(kind) else { return }
+        await finishClaudeModelPickerMutation(kind)
+    }
+
+    private func beginClaudeModelPickerMutation(
+        _ kind: ClaudeModelPickerMutationKind
+    ) -> Bool {
+        guard canMutateClaudeModelPicker,
+              pendingClaudeModelPicker == nil else { return false }
+        if case .add = kind, !modelCatalogAllowsMutation {
+            lastError = "Refresh the Baseten model catalog before adding a model."
+            return false
+        }
+        let operationID = UUID().uuidString.lowercased()
+        pendingClaudeModelPicker = PendingClaudeModelPickerMutation(
+            operationID: operationID,
+            kind: kind,
+            phase: .applying)
+        claudeModelPickerNotice = nil
+        claudeModelPickerWarnings = []
+        scheduleReconciling(
+            key: "claude-model-picker",
+            operationID: operationID)
+        return true
+    }
+
+    private func finishClaudeModelPickerMutation(
+        _ kind: ClaudeModelPickerMutationKind
+    ) async {
+        guard let pending = pendingClaudeModelPicker,
+              pending.kind == kind,
+              let snapshot = routingSnapshot else { return }
+        let arguments = mutationArguments(
+            operationID: pending.operationID,
+            snapshot: snapshot,
+            command: kind.command)
+        let primaryResult = await executeCLI(arguments, timeout: 30)
+        let primaryReceipt = GlobalMutationReceipt(
+            json: primaryResult.standardOutput)
+        let primaryIdentityMatches = claudeModelPickerReceiptMatches(
+            primaryReceipt,
+            operationID: pending.operationID,
+            kind: kind)
+
+        var finalResult = primaryResult
+        var finalReceipt = primaryReceipt
+        var finalReceiptIdentityMatches = primaryIdentityMatches
+        var settingsSyncRecovered = false
+        let reconciliationAction = primaryReceipt?.reconciliationAction ?? ""
+        let manualResolutionRequired = primaryIdentityMatches
+            && primaryReceipt?.reconciliationRequired == true
+            && (
+                reconciliationAction == "manual_claude_settings_resolution"
+                    || reconciliationAction
+                        == "mutation_reconcile_then_manual_claude_settings_resolution"
+            )
+        var routerReconciledBeforeManualResolution = false
+        if manualResolutionRequired,
+           reconciliationAction
+            == "mutation_reconcile_then_manual_claude_settings_resolution" {
+            markReconciling(operationID: pending.operationID)
+            let reconciled = await executeCLI(
+                [
+                    "--json", "mutation", "reconcile",
+                    pending.operationID,
+                ],
+                timeout: 10)
+            let reconciledReceipt = GlobalMutationReceipt(
+                json: reconciled.standardOutput)
+            routerReconciledBeforeManualResolution = reconciled.succeeded
+                && primaryReceipt?.identityStrength == "exact"
+                && reconciledReceipt?.identityStrength == "exact"
+                && isValidMutationRequestFingerprint(
+                    primaryReceipt?.requestFingerprint ?? "")
+                && primaryReceipt?.requestFingerprint
+                    == reconciledReceipt?.requestFingerprint
+                && claudeModelPickerReceiptMatches(
+                    reconciledReceipt,
+                    operationID: pending.operationID,
+                    kind: kind)
+                && reconciledReceipt?.ok == true
+                && reconciledReceipt?.reconciliationRequired == false
+                && reconciledReceipt?.cleanupPending == false
+            if routerReconciledBeforeManualResolution {
+                await refreshAfterMutation()
+            } else {
+                retainMutationRecoveryGate(
+                    reconciledReceipt ?? primaryReceipt)
+            }
+        } else if primaryIdentityMatches,
+           primaryReceipt?.applied == true,
+           primaryReceipt?.reconciliationRequired == true,
+           reconciliationAction == "claude_picker_sync",
+           primaryReceipt?.errorCode == "settings_sync_failed" {
+            markReconciling(operationID: pending.operationID)
+            await refreshAfterMutation()
+            if let updatedSnapshot = routingSnapshot,
+               !snapshotIsStale,
+               claudeModelPickerMutationConfirmed(
+                    kind,
+                    status: clients.first(where: {
+                        $0.name == "claude-code"
+                    })?.modelPicker) {
+                let syncOperationID = UUID().uuidString.lowercased()
+                let syncArguments = mutationArguments(
+                    operationID: syncOperationID,
+                    snapshot: updatedSnapshot,
+                    command: ClaudeModelPickerMutationKind.sync(
+                        convertReplacementMode:
+                            kind.convertsReplacementMode).command)
+                finalResult = await executeCLI(
+                    syncArguments,
+                    timeout: 30)
+                finalReceipt = GlobalMutationReceipt(
+                    json: finalResult.standardOutput)
+                finalReceiptIdentityMatches = claudeModelPickerReceiptMatches(
+                    finalReceipt,
+                    operationID: syncOperationID,
+                    kind: .sync(
+                        convertReplacementMode:
+                            kind.convertsReplacementMode))
+                settingsSyncRecovered = finalReceiptIdentityMatches
+                    && finalReceipt?.ok == true
+                    && finalReceipt?.applied == true
+                    && finalReceipt?.reconciliationRequired == false
+            }
+        }
+        await refreshAfterMutation()
+        await refreshClaudeModelPickerDiagnostics()
+
+        let receipt = finalReceipt
+        let updatedPicker = clients.first(where: {
+            $0.name == "claude-code"
+        })?.modelPicker
+        let primarySucceeded = primaryResult.succeeded
+            && primaryReceipt?.ok == true
+            && primaryReceipt?.applied == true
+            && primaryReceipt?.reconciliationRequired == false
+            && primaryIdentityMatches
+        let operationSucceeded = primarySucceeded || settingsSyncRecovered
+        let hashesMatch = kind.isSync || hashesConfirm(receipt)
+        let confirmed = !snapshotIsStale
+            && finalResult.succeeded
+            && operationSucceeded
+            && hashesMatch
+            && claudeModelPickerMutationConfirmed(
+                kind,
+                status: updatedPicker)
+        claudeModelPickerWarnings = finalReceiptIdentityMatches
+            ? receipt?.warnings ?? []
+            : []
+        if manualResolutionRequired {
+            claudeModelPickerNotice = nil
+            if reconciliationAction
+                == "mutation_reconcile_then_manual_claude_settings_resolution",
+               !routerReconciledBeforeManualResolution {
+                lastError = "Router configuration reconciliation is still pending. Resolve it before manually repairing Claude Code's model picker settings."
+            } else {
+                lastError = "The routing configuration is current, but Claude Code's model picker settings need manual resolution. Resolve the settings conflict, then refresh."
+            }
+        } else if confirmed {
+            lastError = nil
+            claudeModelPickerNotice = claudeModelPickerSuccessMessage(kind)
+        } else {
+            claudeModelPickerNotice = nil
+            lastError = primaryResult.timedOut
+                ? "The Claude Code model picker change timed out and could not be confirmed."
+                : mutationFailureMessage(
+                    receipt,
+                    fallback: "The Claude Code model picker change was not confirmed in the active configuration.")
+        }
+        clearPending(
+            key: "claude-model-picker",
+            operationID: pending.operationID)
+        pendingClaudeModelPicker = nil
+    }
+
     // MARK: - Client reasoning configuration
 
     var canMutateReasoning: Bool {
@@ -1669,6 +2005,9 @@ final class BasetenSwitchState: ObservableObject {
         if pendingReasoning?.operationID == operationID {
             pendingReasoning?.phase = .reconciling
         }
+        if pendingClaudeModelPicker?.operationID == operationID {
+            pendingClaudeModelPicker?.phase = .reconciling
+        }
     }
 
     private func mutationFailureMessage(
@@ -1840,6 +2179,9 @@ final class BasetenSwitchState: ObservableObject {
             } else if key == "reasoning",
                       self.pendingReasoning?.operationID == operationID {
                 self.pendingReasoning?.phase = .reconciling
+            } else if key == "claude-model-picker",
+                      self.pendingClaudeModelPicker?.operationID == operationID {
+                self.pendingClaudeModelPicker?.phase = .reconciling
             }
         }
     }

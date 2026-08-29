@@ -49,7 +49,7 @@ API-key profiles and reports the active type through
 up, down, restart, status
 on, off
 config init, config reset
-claude on|off|status|subagents|route|reasoning
+claude on|off|status|subagents|route|reasoning|picker
 codex on|off|status|route|reasoning
 whoami, auth login, doctor, spend
 gateway start|stop|restart|status
@@ -58,6 +58,17 @@ door
 
 Run `baseten-switch <command> --help` for the current flags and environment
 overrides.
+
+`claude picker` manages the ordered `model_picker` projection stored beside
+the Claude client's `model_aliases`. The gateway config owns desired alias
+membership and order. The Claude adapter generates presentation, safely
+projects rows into user settings, and reports policy or runtime visibility
+without weakening managed Claude configuration.
+Use `claude picker enable --dry-run --json` to preview every configured alias,
+including aliases that share a slug. If `add <slug> --dry-run --json` reports
+multiple alias choices, repeat it with `--alias <alias>`. Converting an
+existing Claude picker from replacement mode requires the explicit
+`--convert-replacement-mode` flag on `enable` or `sync`.
 
 ## Module layout
 

@@ -237,7 +237,9 @@ func validTerminalOperationShape(record mutationTerminalRecord) bool {
 	switch record.Operation {
 	case "set_global_routing":
 		return validMutationSurface(record.Operation, record.Surface) && record.Client == "" && record.KeyHash == "" && record.RequestedTargetHash == ""
-	case "set_claude_route", "set_claude_subagents":
+	case "set_claude_route", "set_claude_subagents",
+		"enable_claude_picker", "disable_claude_picker",
+		"add_claude_picker_model", "remove_claude_picker_model", "move_claude_picker_model":
 		return validMutationSurface(record.Operation, record.Surface) && !record.Requested && record.Client != "" && validConfigHash(record.KeyHash) && validConfigHash(record.RequestedTargetHash)
 	case "set_codex_route":
 		return validMutationSurface(record.Operation, record.Surface) && !record.Requested && record.Client != "" && validConfigHash(record.KeyHash) && validConfigHash(record.RequestedTargetHash)
@@ -253,7 +255,9 @@ func validMutationSurface(operation, surface string) bool {
 	switch operation {
 	case "set_global_routing":
 		return surface == mutationSurfaceSwitch
-	case "set_claude_route", "set_claude_subagents":
+	case "set_claude_route", "set_claude_subagents",
+		"enable_claude_picker", "disable_claude_picker",
+		"add_claude_picker_model", "remove_claude_picker_model", "move_claude_picker_model":
 		return surface == mutationSurfaceClaude
 	case "set_codex_route":
 		return surface == mutationSurfaceCodex

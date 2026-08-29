@@ -120,7 +120,8 @@ Each client entry maps one harness to one local bind address.
 | `protocol_shape` | enum: `anthropic`,`openai` | `anthropic` | Wire shape the harness sends to the gateway. It selects the listener handler and native provider: `/v1/messages` and Anthropic for `anthropic`, `/v1/chat/completions` and OpenAI for `openai`. An anthropic listener with `upstream_shape: openai` uses cross-shape translation for Baseten traffic. The reverse translation is unsupported. |
 | `auth_token` | object | (empty) | Incoming-auth: what the harness sends to the gateway. |
 | `default_model` | baseten slug | (required for enabled clients) | Baseten target for requests that do not match an explicit `model_routes` family mapping. Must contain `/`. Disabled clients may omit it while parked. |
-| `model_aliases` | map[alias id] -> baseten slug | (empty) | Anthropic-shape clients only. Publishes picker-visible Baseten models to Claude Code's gateway model discovery: the gateway synthesizes them into `GET /v1/models` (Anthropic list shape, `?limit` respected), and Claude Code launched with `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` shows them in the `/model` picker. Alias ids must begin with `claude` or `anthropic` (the picker drops everything else before caching) and must not shadow real Anthropic model names (`claude-opus-*`, `claude-sonnet-*`, `claude-haiku-*`, `claude-instant-*`, `claude-<digit>*`); violations refuse the config at load. While global routing is On, a request naming an alias or raw Baseten slug is an explicit Baseten choice with no fallback. While Off, it fails locally with guidance to select a native model or turn routing On; no Baseten credential or endpoint is accessed. Unknown gateway aliases remain a loud error. |
+| `model_aliases` | map[alias id] -> baseten slug | (empty) | Anthropic-shape clients only. Defines stable picker and request model IDs. The gateway also synthesizes aliases into `GET /v1/models` for compatibility with older Claude Code gateway-discovery clients. Alias ids must begin with `claude` or `anthropic` and must not shadow real Anthropic model names (`claude-opus-*`, `claude-sonnet-*`, `claude-haiku-*`, `claude-instant-*`, `claude-<digit>*`); violations refuse the config at load. While global routing is On, a request naming an alias or raw Baseten slug is an explicit Baseten choice with no fallback. While Off, it fails locally with guidance to select a native model or turn routing On; no Baseten credential or endpoint is accessed. Unknown gateway aliases remain a loud error. |
+| `model_picker` | object | (absent) | Anthropic-shape clients only. Ordered desired projection into Claude Code's user-level `modelPicker`. An absent block means the integration has not been configured; a present disabled or empty block remains explicit saved intent. See `model_picker` below. |
 | `subagent_model` | string | (empty) | Anthropic-shape clients only. Rewrite target for Claude Code subagent requests. When global routing is On, the rewrite runs before the normal explicit-choice, family-mapping, and default-mapping ladder. When Off, saved subagent configuration is inactive and the original native model passes through. |
 | `subagent_routing` | enum: `on`,`off` | (absent) | Anthropic-shape clients only. Live toggle for the `subagent_model` rewrite, so the menubar can flip it without losing the configured model. `on` enables the rewrite; `off` disables it (sidechain traffic passes untouched, exact factory behavior). Absent means `on` when `subagent_model` is set, so the field exists purely as the off switch. Enabled = `subagent_model` non-empty and `subagent_routing` is not `off`. Validation at load: a value other than empty/`on`/`off`, or `subagent_routing` set while `subagent_model` is empty, is a config-load error. The `baseten-switch claude subagents on|off` verb flips this field then SIGHUPs the gateway; live sessions pick it up on their next sidechain request. |
 | `model_routes` | map[family]string | GLM-5.2 for fable, opus, sonnet, and haiku in new configs | Anthropic-shape per-family mappings. Keys are exactly `fable`, `opus`, `sonnet`, or `haiku`. `native` selects Anthropic; a configured alias or raw Baseten slug selects Baseten. A missing family uses the client's `default_model`. While global routing is Off, every mapping is dormant but remains editable. Baseten mappings retain the protocol-native fallback; native mappings do not activate fallback. |
@@ -131,6 +132,37 @@ Each client entry maps one harness to one local bind address.
 | `responses_strip_tool_types` | list[string] | (empty) | OpenAI-shape clients only; the field on an Anthropic-shape client refuses the config at load. Tool types listed here are stripped from `tools[]` before a Baseten `/v1/responses` attempt. An object-form `tool_choice` referencing a stripped type is rewritten; string forms like `auto` are untouched. A native fallback keeps the original body byte-for-byte. Telemetry and stderr logs report stripping. Empty entries are invalid, list order is preserved, and a list change respawns the listener on SIGHUP. |
 | `ttft_timeout` | duration | inherit `global.ttft_timeout` | Per-harness override of the first-byte deadline (see `global.ttft_timeout` for semantics). `0` disables it for this harness even when the global value is set. |
 | `fallback_route` | enum: `anthropic`,`openai` | protocol-native in new configs | Accepts only `NativeRoute(protocol_shape)` or an absent value. It is eligible after default or mapped Baseten policy fails, but is inactive for global Off, native mappings, and explicit alias or raw-slug choices. Anthropic-shape 429 responses relay to the harness without fallback or cooldown; OpenAI-shape 429 responses remain fallback-eligible. |
+
+### `model_picker`
+
+`model_picker` curates the Baseten rows that Switch appends to Claude Code's
+native `/model` lineup. It does not replace `model_aliases`, enforce routing,
+or change Claude-owned native rows. Organization-managed Claude settings and
+Claude's `availableModels` policy remain authoritative and may prevent a
+configured row from appearing.
+
+```yaml
+model_picker:
+  enabled: true
+  models:
+    - alias: claude-baseten-glm-5-2
+```
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `false` | When true, the Claude adapter synchronizes these rows. When false, routing aliases remain configured but Switch-owned picker rows are removed. |
+| `models` | ordered list[object] | `[]` | Saved row order. An empty list is valid. Aliases must be unique. |
+| `models[].alias` | string | (required) | Stable routing identity. It must exist in the same client's `model_aliases`. |
+
+Labels and descriptions are not configurable in v1. Switch resolves the exact
+alias slug through local model metadata, appends ` via Baseten` to the display
+name, and uses the fixed description `Served by Baseten.` when projecting the
+row into Claude settings.
+
+The checked-in new-install template enables the picker and includes every
+default alias. Existing configs without `model_picker` are not changed merely
+by loading them. Typed picker edits preserve bytes outside this subtree and
+validate the complete resulting config before replacement.
 
 ### `responses_compatibility`
 

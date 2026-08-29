@@ -106,8 +106,9 @@ type Client struct {
 	ProtocolShape string     `yaml:"protocol_shape,omitempty" json:"protocol_shape,omitempty"`
 	AuthToken     *AuthToken `yaml:"auth_token,omitempty" json:"auth_token,omitempty"`
 	DefaultModel  string     `yaml:"default_model,omitempty" json:"default_model,omitempty"`
-	// ModelAliases maps picker-visible model ids to Baseten slugs for
-	// Claude Code's gateway model discovery (the model-discovery contract).
+	// ModelAliases maps stable picker and request model ids to Baseten slugs.
+	// The gateway also publishes them through Claude Code gateway discovery for
+	// compatibility with older clients (the model-discovery contract).
 	// Anthropic-shape clients only. Alias ids must begin with "claude"
 	// or "anthropic" (the picker drops everything else before caching)
 	// and must not shadow real Anthropic model names;
@@ -115,6 +116,12 @@ type Client struct {
 	// request naming an alias is an explicit Baseten choice. While Off,
 	// the request fails locally without consulting Baseten.
 	ModelAliases map[string]string `yaml:"model_aliases,omitempty" json:"model_aliases,omitempty"`
+	// ModelPicker is the ordered set of configured aliases that Switch projects
+	// into Claude Code's user-level modelPicker setting. It is presentation
+	// state only: model_aliases remains the routing contract. A nil pointer means
+	// the integration has not been configured; a present disabled or empty block
+	// remains explicit saved intent.
+	ModelPicker *ModelPicker `yaml:"model_picker,omitempty" json:"model_picker,omitempty"`
 	// SubagentModel is the rewrite target for Claude Code sidechain
 	// (subagent) requests on an anthropic-shape client: a gateway alias
 	// (must exist in this client's model_aliases), a raw Baseten slug
@@ -166,6 +173,18 @@ type Client struct {
 	// Empty inherits the global value; "0" disables the deadline even
 	// when a global one is set.
 	TTFTTimeout string `yaml:"ttft_timeout,omitempty" json:"ttft_timeout,omitempty"`
+}
+
+// ModelPicker is the Switch-owned desired projection for Claude Code's
+// modelPicker setting.
+type ModelPicker struct {
+	Enabled bool               `yaml:"enabled" json:"enabled"`
+	Models  []ModelPickerModel `yaml:"models" json:"models"`
+}
+
+// ModelPickerModel identifies one picker row by its stable model_aliases key.
+type ModelPickerModel struct {
+	Alias string `yaml:"alias" json:"alias"`
 }
 
 // DoorPort is one harness-facing front-door port. The door forwards to
@@ -439,6 +458,9 @@ func ValidateRoutingPolicy(f *File) error {
 		); err != nil {
 			return err
 		}
+		if err := validateModelPicker(c); err != nil {
+			return err
+		}
 		if c.ResponsesCompatibility != nil && c.ProtocolShape != "openai" {
 			return fmt.Errorf("client %q: responses_compatibility requires protocol_shape openai (got %q)", c.Name, c.ProtocolShape)
 		}
@@ -460,6 +482,54 @@ func ValidateRoutingPolicy(f *File) error {
 		if target == "" || !strings.Contains(target, "/") {
 			return fmt.Errorf("routing policy: enabled client %q requires a Baseten default_model target", c.Name)
 		}
+	}
+	return nil
+}
+
+func validateModelPicker(c Client) error {
+	if c.ModelPicker == nil {
+		return nil
+	}
+	if c.ProtocolShape != "anthropic" {
+		return fmt.Errorf(
+			"client %q: model_picker requires protocol_shape anthropic (got %q)",
+			c.Name,
+			c.ProtocolShape,
+		)
+	}
+	seen := make(map[string]struct{}, len(c.ModelPicker.Models))
+	for i, model := range c.ModelPicker.Models {
+		alias := strings.TrimSpace(model.Alias)
+		if alias == "" {
+			return fmt.Errorf(
+				"client %q: model_picker.models[%d].alias must not be empty",
+				c.Name,
+				i,
+			)
+		}
+		if alias != model.Alias {
+			return fmt.Errorf(
+				"client %q: model_picker.models[%d].alias %q must not contain surrounding whitespace",
+				c.Name,
+				i,
+				model.Alias,
+			)
+		}
+		if _, ok := c.ModelAliases[alias]; !ok {
+			return fmt.Errorf(
+				"client %q: model_picker alias %q is missing from model_aliases",
+				c.Name,
+				alias,
+			)
+		}
+		if _, duplicate := seen[alias]; duplicate {
+			return fmt.Errorf(
+				"client %q: model_picker alias %q is duplicated",
+				c.Name,
+				alias,
+			)
+		}
+		seen[alias] = struct{}{}
 	}
 	return nil
 }
@@ -584,6 +654,11 @@ func Load(path string) (*File, error) {
 // UnmarshalStrict decodes one YAML document and rejects unknown struct
 // fields. This keeps removed schema fields from becoming silent no-ops.
 func UnmarshalStrict(data []byte, out any) error {
+	if _, ok := out.(*File); ok {
+		if err := validateRawModelPickerNodes(data); err != nil {
+			return err
+		}
+	}
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(out); err != nil {
@@ -595,6 +670,34 @@ func UnmarshalStrict(data []byte, out any) error {
 			return fmt.Errorf("multiple YAML documents are not supported")
 		}
 		return err
+	}
+	return nil
+}
+
+// validateRawModelPickerNodes preserves the distinction between an absent
+// model_picker and an explicitly null value. yaml.v3 otherwise decodes both
+// into a nil *ModelPicker, which would turn malformed saved intent into a
+// silent no-op.
+func validateRawModelPickerNodes(data []byte) error {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return err
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) != 1 {
+		return nil
+	}
+	_, clients := mappingEntry(doc.Content[0], "clients")
+	if clients == nil || clients.Kind != yaml.SequenceNode {
+		return nil
+	}
+	for i, client := range clients.Content {
+		_, picker := mappingEntry(client, "model_picker")
+		if picker == nil {
+			continue
+		}
+		if picker.Kind == yaml.ScalarNode && picker.Tag == "!!null" {
+			return fmt.Errorf("clients[%d].model_picker must be an object, not null", i)
+		}
 	}
 	return nil
 }

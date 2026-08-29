@@ -124,6 +124,7 @@ struct ClientStatus: Identifiable, Equatable, Sendable {
     var unmatchedNativeModel: ModelResolution?
     var families: [FamilyEntry]
     var modelCatalog: [ModelCatalogEntry]
+    var modelPicker: ClaudeModelPickerStatus?
     var modelOptions: ClientModelOptions
 
     var id: String { name }
@@ -158,6 +159,8 @@ struct ClientStatus: Identifiable, Equatable, Sendable {
         families = familyArray.compactMap(FamilyEntry.init)
         let catalogArray = dict["model_catalog"] as? [[String: Any]] ?? []
         modelCatalog = catalogArray.compactMap(ModelCatalogEntry.init)
+        modelPicker = (dict["model_picker"] as? [String: Any])
+            .flatMap(ClaudeModelPickerStatus.init)
         modelOptions = decodeClientModelOptions(dict["model_options"])
     }
 }

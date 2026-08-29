@@ -57,6 +57,13 @@ clients:
       claude-baseten-glm-5-2:   zai-org/GLM-5.2
       claude-baseten-kimi-k2-7: moonshotai/Kimi-K2.7-Code
       claude-baseten-nemotron:  nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B
+    # Ordered Baseten rows appended to Claude Code's native /model choices.
+    model_picker:
+      enabled: true
+      models:
+        - alias: claude-baseten-glm-5-2
+        - alias: claude-baseten-kimi-k2-7
+        - alias: claude-baseten-nemotron
     # Route Claude Code subagent (sidechain) traffic to a model; toggle with 'baseten-switch claude subagents'. See the subagent-routing contract.
     # subagent_model: claude-baseten-glm-5-2
     # subagent_routing: on

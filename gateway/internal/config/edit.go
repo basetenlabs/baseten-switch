@@ -181,6 +181,381 @@ func validateReasoningEditTarget(provider, modelID string) error {
 	return nil
 }
 
+// SetClientModelPicker replaces or removes one client's ordered model_picker
+// subtree while preserving every byte outside that subtree. Existing row
+// nodes are reused by alias so row-attached comments move with reordered rows.
+// A nil picker removes the subtree. The complete edited file is strictly
+// parsed and routing-validated before the original is atomically replaced.
+func SetClientModelPicker(path, clientName string, picker *ModelPicker) error {
+	if strings.TrimSpace(clientName) == "" {
+		return fmt.Errorf("model picker client name cannot be empty")
+	}
+	if picker != nil {
+		for i, model := range picker.Models {
+			if !scalarValueRe.MatchString(model.Alias) {
+				return fmt.Errorf(
+					"invalid model picker alias %q at index %d on client %q",
+					model.Alias,
+					i,
+					clientName,
+				)
+			}
+		}
+	}
+
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	var parsed File
+	if err := UnmarshalStrict(b, &parsed); err != nil {
+		return fmt.Errorf("parse %s: %w", path, err)
+	}
+	if err := ValidateRoutingPolicy(&parsed); err != nil {
+		return fmt.Errorf("parse %s: %w", path, err)
+	}
+	client, ok := configClientByName(&parsed, clientName)
+	if !ok {
+		return fmt.Errorf("%s: no client named %q", path, clientName)
+	}
+	currentPicker := cloneModelPicker(client.ModelPicker)
+	client.ModelPicker = cloneModelPicker(picker)
+	if err := ValidateRoutingPolicy(&parsed); err != nil {
+		return fmt.Errorf("client %q model_picker: %w", clientName, err)
+	}
+
+	var doc yaml.Node
+	if err := yaml.Unmarshal(b, &doc); err != nil {
+		return fmt.Errorf("parse %s: %w", path, err)
+	}
+	item, nameKey, nameVal, err := clientMappingNode(&doc, clientName)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	if item.Style == yaml.FlowStyle {
+		return fmt.Errorf(
+			"%s: client %q uses a flow-style mapping; edit model_picker by hand",
+			path,
+			clientName,
+		)
+	}
+	pickerKey, pickerValue := mappingEntry(item, "model_picker")
+	if pickerValue == nil && picker == nil {
+		return nil
+	}
+	if pickerValue != nil {
+		if pickerValue.Kind != yaml.MappingNode || pickerValue.Tag == "!!null" {
+			return fmt.Errorf(
+				"%s: client %q model_picker is not a block mapping",
+				path,
+				clientName,
+			)
+		}
+		if pickerValue.Style == yaml.FlowStyle {
+			return fmt.Errorf(
+				"%s: client %q model_picker is flow-style; edit it by hand",
+				path,
+				clientName,
+			)
+		}
+	}
+
+	var replacement []byte
+	if picker != nil {
+		replacement, err = renderClientModelPicker(pickerKey, pickerValue, picker)
+		if err != nil {
+			return fmt.Errorf("%s: client %q model_picker: %w", path, clientName, err)
+		}
+		if modelPickersEqual(currentPicker, picker) {
+			return nil
+		}
+	}
+	lines := bytes.SplitAfter(b, []byte("\n"))
+	var out []byte
+	if pickerValue == nil {
+		anchorKey, anchorLine := mapBlockAnchor(item, nameKey, nameVal)
+		indent := anchorKey.Column - 1
+		replacement = indentYAMLBlock(replacement, indent, lineEndingFor(lines[anchorLine-1]))
+		out, err = replaceYAMLLines(lines, anchorLine+1, anchorLine, replacement)
+	} else {
+		endLine := yamlNodeLastLine(pickerValue)
+		if endLine < pickerKey.Line {
+			endLine = pickerKey.Line
+		}
+		if picker != nil {
+			replacement = indentYAMLBlock(
+				replacement,
+				pickerKey.Column-1,
+				lineEndingFor(lines[pickerKey.Line-1]),
+			)
+		}
+		out, err = replaceYAMLLines(lines, pickerKey.Line, endLine, replacement)
+	}
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+
+	var check File
+	if err := UnmarshalStrict(out, &check); err != nil {
+		return fmt.Errorf(
+			"%s: edited config does not parse (edit aborted): %w",
+			path,
+			err,
+		)
+	}
+	if err := ValidateRoutingPolicy(&check); err != nil {
+		return fmt.Errorf(
+			"%s: edited config is invalid (edit aborted): %w",
+			path,
+			err,
+		)
+	}
+	checkClient, ok := configClientByName(&check, clientName)
+	if !ok || !modelPickersEqual(checkClient.ModelPicker, picker) {
+		return fmt.Errorf(
+			"%s: edited client %q model_picker does not match requested state (edit aborted)",
+			path,
+			clientName,
+		)
+	}
+	if bytes.Equal(out, b) {
+		return nil
+	}
+	return writeFileAtomic(path, out, st.Mode().Perm())
+}
+
+func cloneModelPicker(picker *ModelPicker) *ModelPicker {
+	if picker == nil {
+		return nil
+	}
+	clone := &ModelPicker{Enabled: picker.Enabled}
+	clone.Models = append([]ModelPickerModel(nil), picker.Models...)
+	return clone
+}
+
+func modelPickersEqual(a, b *ModelPicker) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	if a.Enabled != b.Enabled || len(a.Models) != len(b.Models) {
+		return false
+	}
+	for i := range a.Models {
+		if a.Models[i] != b.Models[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func clientMappingNode(doc *yaml.Node, clientName string) (*yaml.Node, *yaml.Node, *yaml.Node, error) {
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) != 1 {
+		return nil, nil, nil, fmt.Errorf("not a single-document YAML file")
+	}
+	_, clients := mappingEntry(doc.Content[0], "clients")
+	if clients == nil || clients.Kind != yaml.SequenceNode {
+		return nil, nil, nil, fmt.Errorf("no clients sequence")
+	}
+	for _, item := range clients.Content {
+		nameKey, nameVal := mappingEntry(item, "name")
+		if nameVal != nil && nameVal.Kind == yaml.ScalarNode && nameVal.Value == clientName {
+			return item, nameKey, nameVal, nil
+		}
+	}
+	return nil, nil, nil, fmt.Errorf("no client named %q", clientName)
+}
+
+func renderClientModelPicker(
+	pickerKey *yaml.Node,
+	pickerValue *yaml.Node,
+	picker *ModelPicker,
+) ([]byte, error) {
+	var key, value *yaml.Node
+	if pickerValue == nil {
+		key = yamlScalar("model_picker", "!!str")
+		value = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+	} else {
+		key = cloneYAMLNode(pickerKey)
+		// A comment immediately before model_picker belongs to the surrounding
+		// client block and lies outside the replaced line range.
+		key.HeadComment = ""
+		value = cloneYAMLNode(pickerValue)
+	}
+
+	enabledKey, enabledValue := mappingEntry(value, "enabled")
+	if enabledValue == nil {
+		enabledKey = yamlScalar("enabled", "!!str")
+		enabledValue = yamlScalar(strconv.FormatBool(picker.Enabled), "!!bool")
+	} else {
+		enabledValue.Kind = yaml.ScalarNode
+		enabledValue.Tag = "!!bool"
+		enabledValue.Style = 0
+		enabledValue.Value = strconv.FormatBool(picker.Enabled)
+	}
+
+	modelsKey, modelsValue := mappingEntry(value, "models")
+	if modelsValue == nil {
+		modelsKey = yamlScalar("models", "!!str")
+		modelsValue = &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+	} else if modelsValue.Kind != yaml.SequenceNode {
+		return nil, fmt.Errorf("models is not a sequence")
+	} else if modelsValue.Style == yaml.FlowStyle && len(modelsValue.Content) > 0 {
+		return nil, fmt.Errorf("models is a non-empty flow-style sequence")
+	}
+
+	existing := make(map[string]*yaml.Node, len(modelsValue.Content))
+	for i, row := range modelsValue.Content {
+		if row.Kind != yaml.MappingNode || row.Style == yaml.FlowStyle {
+			return nil, fmt.Errorf("models[%d] is not a block mapping", i)
+		}
+		_, aliasValue := mappingEntry(row, "alias")
+		if aliasValue == nil || aliasValue.Kind != yaml.ScalarNode {
+			return nil, fmt.Errorf("models[%d].alias is not a scalar", i)
+		}
+		if _, duplicate := existing[aliasValue.Value]; duplicate {
+			return nil, fmt.Errorf("alias %q is duplicated", aliasValue.Value)
+		}
+		existing[aliasValue.Value] = row
+	}
+
+	modelsValue.Content = nil
+	for _, model := range picker.Models {
+		row := cloneYAMLNode(existing[model.Alias])
+		if row == nil {
+			row = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		}
+		setYAMLMappingString(row, "alias", model.Alias, false)
+		modelsValue.Content = append(modelsValue.Content, row)
+	}
+	if len(modelsValue.Content) == 0 {
+		modelsValue.Style = yaml.FlowStyle
+	} else {
+		modelsValue.Style = 0
+	}
+
+	// The model_picker schema is intentionally narrow. Rebuild the pair order
+	// deterministically while retaining comments carried by existing nodes.
+	value.Content = []*yaml.Node{enabledKey, enabledValue, modelsKey, modelsValue}
+	root := &yaml.Node{
+		Kind: yaml.DocumentNode,
+		Content: []*yaml.Node{{
+			Kind:    yaml.MappingNode,
+			Tag:     "!!map",
+			Content: []*yaml.Node{key, value},
+		}},
+	}
+	var rendered bytes.Buffer
+	enc := yaml.NewEncoder(&rendered)
+	enc.SetIndent(2)
+	if err := enc.Encode(root); err != nil {
+		return nil, fmt.Errorf("render: %w", err)
+	}
+	if err := enc.Close(); err != nil {
+		return nil, fmt.Errorf("render: %w", err)
+	}
+	return rendered.Bytes(), nil
+}
+
+func yamlScalar(value, tag string) *yaml.Node {
+	return &yaml.Node{Kind: yaml.ScalarNode, Tag: tag, Value: value}
+}
+
+func cloneYAMLNode(node *yaml.Node) *yaml.Node {
+	if node == nil {
+		return nil
+	}
+	clone := *node
+	clone.Content = make([]*yaml.Node, len(node.Content))
+	for i, child := range node.Content {
+		clone.Content[i] = cloneYAMLNode(child)
+	}
+	return &clone
+}
+
+func setYAMLMappingString(mapping *yaml.Node, key, value string, omitEmpty bool) {
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value != key {
+			continue
+		}
+		if omitEmpty && value == "" {
+			mapping.Content = append(mapping.Content[:i], mapping.Content[i+2:]...)
+			return
+		}
+		node := mapping.Content[i+1]
+		node.Kind = yaml.ScalarNode
+		node.Tag = "!!str"
+		node.Style = 0
+		node.Value = value
+		return
+	}
+	if omitEmpty && value == "" {
+		return
+	}
+	mapping.Content = append(
+		mapping.Content,
+		yamlScalar(key, "!!str"),
+		yamlScalar(value, "!!str"),
+	)
+}
+
+func yamlNodeLastLine(node *yaml.Node) int {
+	if node == nil {
+		return 0
+	}
+	last := node.Line
+	for _, child := range node.Content {
+		if childLast := yamlNodeLastLine(child); childLast > last {
+			last = childLast
+		}
+	}
+	return last
+}
+
+func lineEndingFor(line []byte) []byte {
+	if bytes.HasSuffix(line, []byte("\r\n")) {
+		return []byte("\r\n")
+	}
+	return []byte("\n")
+}
+
+func indentYAMLBlock(block []byte, spaces int, lineEnding []byte) []byte {
+	if len(block) == 0 {
+		return nil
+	}
+	block = bytes.ReplaceAll(block, []byte("\r\n"), []byte("\n"))
+	block = bytes.TrimSuffix(block, []byte("\n"))
+	indent := bytes.Repeat([]byte(" "), spaces)
+	rows := bytes.Split(block, []byte("\n"))
+	var out bytes.Buffer
+	for _, row := range rows {
+		out.Write(indent)
+		out.Write(row)
+		out.Write(lineEnding)
+	}
+	return out.Bytes()
+}
+
+// replaceYAMLLines replaces the inclusive 1-based range start..end. When end
+// is start-1 the replacement is inserted immediately before start.
+func replaceYAMLLines(lines [][]byte, start, end int, replacement []byte) ([]byte, error) {
+	if start < 1 || start > len(lines)+1 || end < start-1 || end > len(lines) {
+		return nil, fmt.Errorf("line range %d..%d is out of bounds", start, end)
+	}
+	var out bytes.Buffer
+	for _, line := range lines[:start-1] {
+		out.Write(line)
+	}
+	out.Write(replacement)
+	for _, line := range lines[end:] {
+		out.Write(line)
+	}
+	return out.Bytes(), nil
+}
+
 func editClientModelReasoningPolicy(
 	path string,
 	clientName string,
@@ -732,6 +1107,29 @@ func SetClientMapEntries(path, clientName, mapKey string, entries map[string]str
 			return fmt.Errorf("invalid value %q for key %q in map %q on client %q", v, k, mapKey, clientName)
 		}
 	}
+	return setClientMapEntries(path, clientName, mapKey, entries)
+}
+
+// SetClientModelAliases adds or replaces alias-to-slug entries in one
+// client's model_aliases mapping. Existing entries not named in entries are
+// preserved. Alias keys and slugs must be safe plain YAML scalars; the edit is
+// comment-preserving, post-validated, and atomically installed.
+func SetClientModelAliases(path, clientName string, entries map[string]string) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	for alias, slug := range entries {
+		if !scalarValueRe.MatchString(alias) {
+			return fmt.Errorf("invalid model alias %q on client %q", alias, clientName)
+		}
+		if !scalarValueRe.MatchString(slug) || !strings.Contains(slug, "/") {
+			return fmt.Errorf("invalid Baseten slug %q for alias %q on client %q", slug, alias, clientName)
+		}
+	}
+	return setClientMapEntries(path, clientName, "model_aliases", entries)
+}
+
+func setClientMapEntries(path, clientName, mapKey string, entries map[string]string) error {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", path, err)
@@ -870,6 +1268,8 @@ func mapEntriesVerify(c *Client, mapKey string, set map[string]string, remove ma
 // post-edit verify can read it back.
 func mapFieldValue(c *Client, key string) map[string]string {
 	switch key {
+	case "model_aliases":
+		return c.ModelAliases
 	case "model_routes":
 		return c.ModelRoutes
 	default:

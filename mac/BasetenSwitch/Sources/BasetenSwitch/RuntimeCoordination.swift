@@ -452,11 +452,13 @@ struct GlobalMutationReceipt: Equatable, Sendable {
     var activeConfigHash: String
     var applied: Bool
     var reconciliationRequired: Bool
+    var reconciliationAction: String
     var blockingOperationID: String
     var outcome: String
     var cleanupPending: Bool
     var requestFingerprint: String
     var identityStrength: String
+    var warnings: [String]
     var errorCode: String
     var errorMessage: String
     var errorRetryable: Bool
@@ -480,11 +482,15 @@ struct GlobalMutationReceipt: Equatable, Sendable {
         applied = dict["applied"] as? Bool ?? false
         reconciliationRequired =
             dict["reconciliation_required"] as? Bool ?? false
+        reconciliationAction =
+            dict["reconciliation_action"] as? String ?? ""
         blockingOperationID = dict["blocking_operation_id"] as? String ?? ""
         outcome = dict["outcome"] as? String ?? ""
         cleanupPending = dict["cleanup_pending"] as? Bool ?? false
         requestFingerprint = dict["request_fingerprint"] as? String ?? ""
         identityStrength = dict["identity_strength"] as? String ?? ""
+        warnings = (dict["warnings"] as? [String] ?? [])
+            .filter { !$0.isEmpty }
         let error = dict["error"] as? [String: Any]
         errorCode = error?["code"] as? String ?? ""
         errorMessage = error?["message"] as? String ?? ""
@@ -531,13 +537,26 @@ func allowlistedCLIEnvironment(
     ambient: [String: String] = ProcessInfo.processInfo.environment,
     overrides: [String: String]
 ) -> [String: String] {
-    let fixedPath =
-        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    var executableSearchPaths = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ]
+    if let localBin = currentUserLocalBin(home: ambient["HOME"]) {
+        // Keep system locations first while supporting Claude Code's standard
+        // user-local installer location without inheriting an ambient PATH.
+        executableSearchPaths.append(localBin)
+    }
     let inherited = [
         "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR",
         "LANG", "LC_ALL",
     ]
-    var result: [String: String] = ["PATH": fixedPath]
+    var result: [String: String] = [
+        "PATH": executableSearchPaths.joined(separator: ":"),
+    ]
     for key in inherited {
         if let value = ambient[key], !value.isEmpty {
             result[key] = value
@@ -547,6 +566,17 @@ func allowlistedCLIEnvironment(
         result[key] = value
     }
     return result
+}
+
+private func currentUserLocalBin(home: String?) -> String? {
+    guard let home,
+          !home.isEmpty,
+          home.hasPrefix("/"),
+          !home.contains(":"),
+          !home.contains("\0") else { return nil }
+    return URL(fileURLWithPath: home, isDirectory: true)
+        .appendingPathComponent(".local/bin", isDirectory: true)
+        .standardizedFileURL.path
 }
 
 /// Returns a user-facing refusal when any Preview runtime entry can escape the

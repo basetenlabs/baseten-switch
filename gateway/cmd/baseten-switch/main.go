@@ -331,6 +331,7 @@ Plain doctor is read-only. --fix cannot be combined with --json.
 `},
 	{"claude", "Manage Claude Code gateway wiring and model routing", `Usage:
   baseten-switch claude on|off|status
+  baseten-switch claude picker status|enable [--dry-run --json] [--convert-replacement-mode]|list|add <slug> [--alias <alias>] [--dry-run --json]|remove <alias>|move <alias> --before <alias>|sync [--convert-replacement-mode]|disable
   baseten-switch claude subagents [<model>|on|inherit]
   baseten-switch claude route [<family> <target|default>]
   baseten-switch claude reasoning baseten <model> off|follow-harness|effort <value>|default
@@ -339,6 +340,10 @@ on sets ANTHROPIC_BASE_URL, CLAUDE_CODE_ATTRIBUTION_HEADER, and
 ENABLE_TOOL_SEARCH in ~/.claude/settings.json, and backs up prior values. off
 restores them exactly when possible, or strips only values proven to have been
 written by Switch after drift. start and stop alias on and off.
+
+picker manages the ordered Baseten rows appended to Claude Code's /model
+picker. Claude Code 2.1.243 or later is required. Built-in rows remain owned
+by Claude Code; remove leaves the routing alias intact.
 
 subagents selects a configured alias, raw Baseten slug, or native model for
 Task and sidechain requests. "on" re-enables the kept model. "inherit" leaves

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/basetenlabs/baseten-switch/gateway/internal/config"
+	"github.com/basetenlabs/baseten-switch/gateway/internal/modelmeta"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/pidfile"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/pricing"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/telemetry"
@@ -273,6 +274,41 @@ type modelCatalogEntry struct {
 	Available     bool   `json:"available"`
 }
 
+type modelPickerStatus struct {
+	Enabled bool                     `json:"enabled"`
+	Models  []modelPickerStatusModel `json:"models"`
+}
+
+type modelPickerStatusModel struct {
+	Alias       string `json:"alias"`
+	Slug        string `json:"slug"`
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+}
+
+// computeModelPickerStatus projects the desired config in its saved order.
+// It intentionally does not read Claude settings or infer whether policy has
+// filtered a row; the Claude adapter owns those file and runtime status axes.
+func computeModelPickerStatus(c config.Client) *modelPickerStatus {
+	if c.ModelPicker == nil {
+		return nil
+	}
+	status := &modelPickerStatus{
+		Enabled: c.ModelPicker.Enabled,
+		Models:  make([]modelPickerStatusModel, 0, len(c.ModelPicker.Models)),
+	}
+	for _, model := range c.ModelPicker.Models {
+		slug := c.ModelAliases[model.Alias]
+		status.Models = append(status.Models, modelPickerStatusModel{
+			Alias:       model.Alias,
+			Slug:        slug,
+			Label:       modelmeta.ResolveBaseten(slug).DisplayName + " via Baseten",
+			Description: "Served by Baseten.",
+		})
+	}
+	return status
+}
+
 // computeModelCatalog builds display metadata for one client's configured
 // Baseten targets: one entry per model_aliases entry, the default model when
 // not covered by an alias, and raw slugs saved in model_routes or
@@ -522,6 +558,7 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 				"model_routes":       rcEff.ModelRoutes,
 				"families":           families,
 				"model_catalog":      computeModelCatalog(rcEff, catalogSnapshot),
+				"model_picker":       computeModelPickerStatus(c),
 				"model_options":      computeClientModelOptions(rcEff, catalogSnapshot),
 				"unmatched_native_model": map[string]any{
 					"configured_target": configuredTargetJSON,
@@ -563,6 +600,7 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 				"model_routes":       cl.cfg.ModelRoutes,
 				"families":           families,
 				"model_catalog":      computeModelCatalog(cl.cfg, catalogSnapshot),
+				"model_picker":       nil,
 				"model_options":      computeClientModelOptions(cl.cfg, catalogSnapshot),
 				"unmatched_native_model": map[string]any{
 					"configured_target": configuredTargetJSON,

@@ -69,13 +69,16 @@ func (e *exactConfigCommitIndeterminateError) Unwrap() error {
 }
 
 type mutationOptions struct {
-	JSON           bool
-	OperationID    string
-	IfActiveToken  string
-	IfConfigHash   string
-	hasOperationID bool
-	hasActiveToken bool
-	hasConfigHash  bool
+	JSON                     bool
+	DryRun                   bool
+	PickerAlias              string
+	ConvertPickerReplacement bool
+	OperationID              string
+	IfActiveToken            string
+	IfConfigHash             string
+	hasOperationID           bool
+	hasActiveToken           bool
+	hasConfigHash            bool
 }
 
 type mutationError struct {
@@ -100,11 +103,13 @@ type mutationResult struct {
 	ActiveConfigHash          string         `json:"active_config_hash"`
 	Applied                   bool           `json:"applied"`
 	ReconciliationRequired    bool           `json:"reconciliation_required,omitempty"`
+	ReconciliationAction      string         `json:"reconciliation_action,omitempty"`
 	BlockingOperationID       string         `json:"blocking_operation_id,omitempty"`
 	Outcome                   string         `json:"outcome,omitempty"`
 	RequestFingerprint        string         `json:"request_fingerprint,omitempty"`
 	IdentityStrength          string         `json:"identity_strength,omitempty"`
 	CleanupPending            bool           `json:"cleanup_pending,omitempty"`
+	Warnings                  []string       `json:"warnings,omitempty"`
 	Error                     *mutationError `json:"error"`
 }
 

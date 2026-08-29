@@ -107,8 +107,8 @@ func TestInitTemplateLoads(t *testing.T) {
 			t.Errorf("CollectPlaceholders includes CODEX_AUTH_TOKEN from the parked codex client; disabled clients must be exempt from the scan")
 		}
 	}
-	// The canonical configuration keeps the supported gateway-discovery
-	// aliases live.
+	// The canonical configuration keeps stable routing aliases live for the
+	// picker and compatibility discovery paths.
 	wantAliases := map[string]string{
 		"claude-baseten-glm-5-2":   "zai-org/GLM-5.2",
 		"claude-baseten-kimi-k2-7": "moonshotai/Kimi-K2.7-Code",
@@ -120,6 +120,25 @@ func TestInitTemplateLoads(t *testing.T) {
 	for alias, slug := range wantAliases {
 		if cc.ModelAliases[alias] != slug {
 			t.Errorf("model_aliases[%s] = %q, want %q", alias, cc.ModelAliases[alias], slug)
+		}
+	}
+	if cc.ModelPicker == nil || !cc.ModelPicker.Enabled {
+		t.Fatalf("claude-code model_picker = %#v, want explicit enabled picker", cc.ModelPicker)
+	}
+	wantPicker := []ModelPickerModel{
+		{Alias: "claude-baseten-glm-5-2"},
+		{Alias: "claude-baseten-kimi-k2-7"},
+		{Alias: "claude-baseten-nemotron"},
+	}
+	if len(cc.ModelPicker.Models) != len(wantPicker) {
+		t.Fatalf("model_picker.models = %#v, want %#v", cc.ModelPicker.Models, wantPicker)
+	}
+	for i := range wantPicker {
+		if cc.ModelPicker.Models[i] != wantPicker[i] {
+			t.Errorf("model_picker.models[%d] = %#v, want %#v", i, cc.ModelPicker.Models[i], wantPicker[i])
+		}
+		if _, ok := cc.ModelAliases[cc.ModelPicker.Models[i].Alias]; !ok {
+			t.Errorf("model_picker.models[%d].alias %q is absent from model_aliases", i, cc.ModelPicker.Models[i].Alias)
 		}
 	}
 	// subagent_model/subagent_routing ship commented out next to
