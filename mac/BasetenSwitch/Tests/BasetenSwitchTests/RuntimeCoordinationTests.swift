@@ -39,12 +39,15 @@ private actor CountingAdminReader: AdminStatusReading {
 private actor SequencedAdminReader: AdminStatusReading {
     private var statuses: [AdminStatusSnapshot]
     private var index = 0
+    private(set) var statusCalls = 0
+    private(set) var statsCalls = 0
 
     init(statuses: [AdminStatusSnapshot]) {
         self.statuses = statuses
     }
 
     func fetchStatus() async throws -> AdminStatusSnapshot {
+        statusCalls += 1
         guard !statuses.isEmpty else {
             throw GatewayClientError.invalidPayload
         }
@@ -55,7 +58,55 @@ private actor SequencedAdminReader: AdminStatusReading {
 
     func fetchStats(windowSeconds: Int,
                     bucketSeconds: Int) async throws -> StatsSnapshot {
+        statsCalls += 1
+        return StatsSnapshot(dict: [:])
+    }
+}
+
+private actor SuspendingMutationAdminReader: AdminStatusReading {
+    private let initial: AdminStatusSnapshot
+    private let stale: AdminStatusSnapshot
+    private let confirmed: AdminStatusSnapshot
+    private var continuation: CheckedContinuation<Void, Never>?
+    private(set) var statusCalls = 0
+
+    init(initial: AdminStatusSnapshot,
+         stale: AdminStatusSnapshot,
+         confirmed: AdminStatusSnapshot) {
+        self.initial = initial
+        self.stale = stale
+        self.confirmed = confirmed
+    }
+
+    func fetchStatus() async throws -> AdminStatusSnapshot {
+        statusCalls += 1
+        switch statusCalls {
+        case 1:
+            return initial
+        case 2:
+            await withCheckedContinuation { continuation in
+                self.continuation = continuation
+            }
+            return stale
+        default:
+            return confirmed
+        }
+    }
+
+    func fetchStats(windowSeconds: Int,
+                    bucketSeconds: Int) async throws -> StatsSnapshot {
         StatsSnapshot(dict: [:])
+    }
+
+    func waitForStaleRequest() async {
+        while statusCalls < 2 {
+            await Task.yield()
+        }
+    }
+
+    func releaseStaleRequest() {
+        continuation?.resume()
+        continuation = nil
     }
 }
 
@@ -125,6 +176,8 @@ private actor PrimaryFailureRunner: CLIRunning {
         case failedReconciliation
         case malformedSecondary
         case mismatchedSecondary
+        case routerIdentityMismatch
+        case routerStateMismatch
         case timedTypedError
         case timedSuccess
     }
@@ -210,6 +263,14 @@ private actor PrimaryFailureRunner: CLIRunning {
         if mode == .blocker {
             errorCode = "unfinished_mutation"
             blockingID = "older-operation"
+            reconciliationRequired = false
+        } else if mode == .routerIdentityMismatch {
+            errorCode = "router_identity_mismatch"
+            blockingID = nil
+            reconciliationRequired = false
+        } else if mode == .routerStateMismatch {
+            errorCode = "router_state_mismatch"
+            blockingID = nil
             reconciliationRequired = false
         } else if mode == .timedTypedError {
             errorCode = "stale_config_hash"
@@ -522,6 +583,24 @@ final class RuntimeCoordinationTests: XCTestCase {
             environment: ["BASETEN_SWITCH_GATEWAY_BIN": binaryPath])
     }
 
+    private func stableTestVariant(
+        binaryPath: String = "/usr/bin/true"
+    ) -> AppVariant {
+        AppVariant.resolve(
+            infoDictionary: [:],
+            homeDirectory: "/tmp/baseten-switch-home",
+            environment: ["BASETEN_SWITCH_GATEWAY_BIN": binaryPath])
+    }
+
+    @MainActor
+    private func drainMainQueue() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async {
+                continuation.resume()
+            }
+        }
+    }
+
     private func isolatedPreviewVariant() throws -> AppVariant {
         let home = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -597,6 +676,36 @@ final class RuntimeCoordinationTests: XCTestCase {
                     "storage_target": "zai-org/GLM-5.2",
                     "available": true,
                 ]],
+            ]],
+        ])
+    }
+
+    private func menuAuthStatus(
+        generation: Int,
+        signedIn: Bool,
+        health: String
+    ) -> AdminStatusSnapshot {
+        AdminStatusSnapshot(dict: [
+            "router_boot_id": "boot-menu-auth",
+            "active_generation": generation,
+            "active_config_hash": "sha256:menu-auth-\(generation)",
+            "desired_config_hash": "sha256:menu-auth-\(generation)",
+            "capabilities": ["global_routing"],
+            "health": "ready",
+            "config_path": previewConfigPath,
+            "global_routing_enabled": true,
+            "auth": [
+                "signed_in": signedIn,
+                "health": health,
+                "fallback_in_use": false,
+            ],
+            "clients": [[
+                "name": "claude-code",
+                "enabled": true,
+                "bind_addr": "127.0.0.1:45372",
+                "protocol_shape": "anthropic",
+                "effective_route": "baseten",
+                "native_route": "anthropic",
             ]],
         ])
     }
@@ -708,6 +817,32 @@ final class RuntimeCoordinationTests: XCTestCase {
         XCTAssertFalse(missing.isAuthoritative)
         XCTAssertFalse(acceptance.accept(missing))
         XCTAssertNil(acceptance.current)
+    }
+
+    func testPollEventAcceptanceRejectsLateOlderRequestWithSameToken() {
+        var acceptance = PollEventAcceptance()
+        let token = RoutingToken(
+            routerBootID: "boot-a",
+            activeGeneration: 4)
+
+        XCTAssertTrue(acceptance.accept(requestID: 2, token: token))
+        XCTAssertFalse(acceptance.accept(requestID: 1, token: token))
+        XCTAssertEqual(acceptance.latestRequestID, 2)
+    }
+
+    func testRejectedNewerTokenStillBlocksOlderRequest() {
+        var acceptance = PollEventAcceptance()
+        let current = RoutingToken(
+            routerBootID: "boot-a",
+            activeGeneration: 4)
+        let stale = RoutingToken(
+            routerBootID: "boot-a",
+            activeGeneration: 3)
+
+        XCTAssertTrue(acceptance.accept(requestID: 0, token: current))
+        XCTAssertFalse(acceptance.accept(requestID: 2, token: stale))
+        XCTAssertEqual(acceptance.latestRequestID, 2)
+        XCTAssertFalse(acceptance.accept(requestID: 1, token: current))
     }
 
     func testPollCoordinatorCoalescesConcurrentRefreshes() async {
@@ -1149,6 +1284,27 @@ final class RuntimeCoordinationTests: XCTestCase {
     }
 
     @MainActor
+    func testRouterMismatchFailuresUseReviewedActionableMessage() async {
+        for mode in [
+            PrimaryFailureRunner.Mode.routerStateMismatch,
+            .routerIdentityMismatch,
+        ] {
+            let runner = PrimaryFailureRunner(mode: mode)
+            let state = mutationTestState(runner: runner)
+            await state.refresh()
+
+            await state.setAllRoutesThroughBaseten(true)
+
+            XCTAssertEqual(
+                state.lastError,
+                "The app and routing command are connected to different local gateways. Restart Baseten Switch and try again.")
+            XCTAssertFalse(state.lastError?.contains("/Users/") == true)
+            XCTAssertFalse(state.lastError?.contains("model-id") == true)
+            state.stop()
+        }
+    }
+
+    @MainActor
     func testFailedSecondaryReconciliationCannotMaskPrimaryFailure() async {
         let runner = PrimaryFailureRunner(mode: .failedReconciliation)
         let state = mutationTestState(runner: runner)
@@ -1534,6 +1690,82 @@ final class RuntimeCoordinationTests: XCTestCase {
     }
 
     @MainActor
+    func testTrackedStatusMenuRefreshProjectsAndRebuildsAuthAttention() async {
+        let reader = SequencedAdminReader(statuses: [
+            menuAuthStatus(generation: 4, signedIn: true, health: "ok"),
+            menuAuthStatus(
+                generation: 5,
+                signedIn: false,
+                health: "signed_out"),
+            menuAuthStatus(generation: 6, signedIn: true, health: "ok"),
+        ])
+        let runner = ConcurrencyRecordingRunner()
+        let variant = stableTestVariant()
+        let state = BasetenSwitchState(
+            variant: variant,
+            reader: reader,
+            cliRunner: runner,
+            loginItemService: FakeLoginItemService(),
+            previewRuntimeValidator: { _ in nil },
+            startPolling: false)
+
+        await state.refresh()
+        let controller = StatusItemController(state: state, variant: variant)
+        XCTAssertEqual(
+            controller.fixedHeaderSubtitleForTesting,
+            "Routing rules are active")
+        XCTAssertEqual(controller.displayedIconStateForTesting, .active)
+        let healthyMenuTitles = controller.menuItemTitlesForTesting
+        XCTAssertFalse(healthyMenuTitles.contains("Sign In to Baseten…"))
+
+        // Opening the menu schedules one asynchronous status pass. A later
+        // signed-out snapshot must immediately project warning copy into the
+        // fixed header and amber icon. AppKit can add the action row on the
+        // next structural rebuild without mutating the tracked menu.
+        controller.menuWillOpenForTesting()
+        await state.waitForInteractiveRefresh()
+        await drainMainQueue()
+
+        XCTAssertEqual(
+            controller.fixedHeaderSubtitleForTesting,
+            "Sign in to use Baseten")
+        XCTAssertEqual(controller.displayedIconStateForTesting, .degraded)
+        XCTAssertEqual(
+            controller.menuItemTitlesForTesting,
+            healthyMenuTitles)
+        XCTAssertFalse(
+            controller.menuItemTitlesForTesting.contains("Sign In to Baseten…"))
+
+        controller.menuDidCloseForTesting()
+        controller.menuNeedsUpdateForTesting()
+        XCTAssertEqual(
+            controller.fixedHeaderSubtitleForTesting,
+            "Sign in to use Baseten")
+        XCTAssertTrue(
+            controller.menuItemTitlesForTesting.contains("Sign In to Baseten…"))
+
+        // A later healthy snapshot clears all three projections after the
+        // closed menu is rebuilt.
+        await state.refresh()
+        await drainMainQueue()
+        controller.menuNeedsUpdateForTesting()
+        XCTAssertEqual(
+            controller.fixedHeaderSubtitleForTesting,
+            "Routing rules are active")
+        XCTAssertEqual(controller.displayedIconStateForTesting, .active)
+        XCTAssertFalse(
+            controller.menuItemTitlesForTesting.contains("Sign In to Baseten…"))
+
+        let statusCalls = await reader.statusCalls
+        let statsCalls = await reader.statsCalls
+        let versionCalls = await runner.arguments
+        XCTAssertEqual(statusCalls, 3)
+        XCTAssertEqual(statsCalls, 1)
+        XCTAssertEqual(versionCalls, [["--version"]])
+        state.stop()
+    }
+
+    @MainActor
     func testFamilyMutationUsesCASAndReconcilesBeforeClearingPending() async {
         let reader = SequencedAdminReader(statuses: [
             previewStatus(
@@ -1583,6 +1815,56 @@ final class RuntimeCoordinationTests: XCTestCase {
                 client: "claude-code",
                 family: "opus"))
         XCTAssertNil(state.lastError)
+        state.stop()
+    }
+
+    @MainActor
+    func testFamilyMutationWaitsOutPreMutationStatusRequest() async {
+        let oldStatus = previewStatus(
+            generation: 4,
+            hash: "sha256:old",
+            familyTarget: "zai-org/GLM-5.2")
+        let confirmedStatus = previewStatus(
+            generation: 5,
+            hash: "sha256:new",
+            familyTarget: "native")
+        let reader = SuspendingMutationAdminReader(
+            initial: oldStatus,
+            stale: oldStatus,
+            confirmed: confirmedStatus)
+        let runner = ReconciliationReceiptRunner()
+        let state = BasetenSwitchState(
+            variant: previewVariant(),
+            reader: reader,
+            cliRunner: runner,
+            loginItemService: FakeLoginItemService(),
+            previewRuntimeValidator: { _ in nil },
+            startPolling: false)
+        await state.refresh()
+        let client = try! XCTUnwrap(state.clients.first)
+
+        let stalePoll = Task { @MainActor in
+            await state.refresh()
+        }
+        await reader.waitForStaleRequest()
+        let mutation = Task { @MainActor in
+            await state.routeFamily(client, family: "opus", choice: .native)
+        }
+        while (await runner.arguments).count < 2 {
+            await Task.yield()
+        }
+        await reader.releaseStaleRequest()
+        await stalePoll.value
+        await mutation.value
+
+        let statusCalls = await reader.statusCalls
+        XCTAssertEqual(statusCalls, 3)
+        XCTAssertNil(state.lastError)
+        XCTAssertEqual(
+            state.clients.first?.families.first(where: {
+                $0.family == "opus"
+            })?.configuredTarget,
+            "native")
         state.stop()
     }
 

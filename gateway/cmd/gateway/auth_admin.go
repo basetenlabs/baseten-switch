@@ -12,28 +12,88 @@ import (
 	"github.com/basetenlabs/baseten-switch/gateway/internal/auth"
 )
 
+const (
+	adminMutationHeader      = "X-Baseten-Switch-Admin"
+	adminMutationHeaderValue = "1"
+)
+
 func (g *Gateway) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		g.reject(w, 405, "method not allowed")
 		return
 	}
-	signedIn, authType, fallbackInUse := g.authState()
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, g.authStatusResponse())
+}
+
+func (g *Gateway) handleAuthReload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		g.reject(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	// This non-simple request header forces browser callers through a CORS
+	// preflight, which the loopback admin server does not approve. Check it
+	// before body or credential-store work.
+	if r.Header.Get(adminMutationHeader) != adminMutationHeaderValue {
+		g.reject(w, http.StatusForbidden, "admin mutation header required")
+		return
+	}
+	var body []byte
+	if r.Body != nil {
+		var err error
+		body, err = io.ReadAll(io.LimitReader(r.Body, 1))
+		if err != nil {
+			g.reject(w, http.StatusBadRequest, "could not read request body")
+			return
+		}
+	}
+	if len(body) != 0 {
+		g.reject(w, http.StatusBadRequest, "request body must be empty")
+		return
+	}
+
+	// Serialize with config reloads so refreshAuth cannot read an old runtime
+	// profile and publish it after a concurrent SIGHUP has installed a new one.
+	g.reloadMu.Lock()
+	defer g.reloadMu.Unlock()
+	g.refreshAuthLocked()
+	// refreshAuthLocked preserves the existing nonblocking catalog-refresh
+	// kick. The reload receipt does not wait for that work and performs no
+	// synchronous upstream identity lookup.
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, g.localAuthStatusResponse())
+}
+
+// authStatusResponse preserves the existing read-only status projection. Its
+// local subset is shared with the explicit reload endpoint so that mutation
+// can respond without an upstream user lookup.
+func (g *Gateway) authStatusResponse() map[string]any {
+	response := g.localAuthStatusResponse()
 	email, expiresAt := g.authEmailAndExpiry()
 	ah := g.authHealth()
+	response["last_refresh_error"] = ah.LastError
+	response["last_refresh_error_at"] = rfc3339OrEmpty(ah.LastErrorAt)
+	response["last_refresh_ok_at"] = rfc3339OrEmpty(ah.LastOKAt)
+	response["email"] = email
+	response["expires_at"] = expiresAt
+	return response
+}
+
+// localAuthStatusResponse reads only in-memory state and configuration. It
+// performs no synchronous upstream request and includes no credential values,
+// fingerprints, refresh errors, or remote response bodies.
+func (g *Gateway) localAuthStatusResponse() map[string]any {
+	signedIn, authType, fallbackInUse := g.authState()
+	ah := g.authHealth()
 	cfg := g.runtimeConfig()
-	writeJSON(w, 200, map[string]any{
-		"signed_in":             signedIn,
-		"auth_type":             authType,
-		"health":                ah.Health,
-		"last_refresh_error":    ah.LastError,
-		"last_refresh_error_at": rfc3339OrEmpty(ah.LastErrorAt),
-		"last_refresh_ok_at":    rfc3339OrEmpty(ah.LastOKAt),
-		"profile":               cfg.OAuthProfile,
-		"fallback_enabled":      cfg.APIKeyFallback,
-		"fallback_in_use":       fallbackInUse,
-		"email":                 email,
-		"expires_at":            expiresAt,
-	})
+	return map[string]any{
+		"signed_in":        signedIn,
+		"auth_type":        authType,
+		"health":           ah.Health,
+		"profile":          cfg.OAuthProfile,
+		"fallback_enabled": cfg.APIKeyFallback,
+		"fallback_in_use":  fallbackInUse,
+	}
 }
 
 func (g *Gateway) authEmailAndExpiry() (string, string) {

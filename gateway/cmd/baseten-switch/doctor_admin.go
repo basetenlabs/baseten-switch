@@ -6,7 +6,9 @@ import (
 )
 
 type doctorAdminStatus struct {
-	Clients []doctorAdminClient `json:"clients"`
+	ConfigPath   string                 `json:"config_path"`
+	TraceCapture traceRuntimeProjection `json:"trace_capture"`
+	Clients      []doctorAdminClient    `json:"clients"`
 }
 
 type doctorAdminClient struct {

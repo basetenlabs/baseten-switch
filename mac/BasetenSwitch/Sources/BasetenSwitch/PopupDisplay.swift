@@ -81,12 +81,74 @@ func authLineLabel(auth: AuthStatus?) -> String {
     return "Auth: not signed in"
 }
 
-/// True only in the dead-credential state: drives the warning tint on
-/// the auth line, the Reauthenticate button, and (via
-/// menubarIconState) the amber status icon. Transient "error" stays
-/// false so the popup never alarms on a blip.
+/// True only in the dead-credential state. Retained for display call sites
+/// that specifically need refresh-failure detail; shared menu attention is
+/// projected by authAttention so signed-out state can remain route-aware.
 func authNeedsReauth(auth: AuthStatus?) -> Bool {
     auth?.health == "refresh_failed"
+}
+
+enum AuthAttention: Equatable {
+    case none
+    case signIn
+    case reauthenticate
+}
+
+/// Whether this enabled client has any server-resolved destination that needs
+/// Baseten authentication. The gateway remains authoritative for each
+/// effective route; this traversal does not derive a route from configuration.
+func clientRequiresBasetenAuth(_ client: ClientStatus) -> Bool {
+    guard client.enabled else { return false }
+    if client.effectiveRoute == "baseten" { return true }
+    if client.unmatchedNativeModel?.effectiveRoute == "baseten" { return true }
+    return client.families.contains { $0.effectiveRoute == "baseten" }
+}
+
+/// Shared authentication-attention projection for every Mac surface.
+/// Refresh failure remains a route-independent alarm. Explicit signed-out
+/// state is actionable only when confirmed routing is on, an enabled effective
+/// destination needs Baseten, and the router is not using an API-key fallback.
+func authAttention(
+    gatewayUp: Bool,
+    globalRoutingEnabled: Bool,
+    clients: [ClientStatus],
+    auth: AuthStatus?
+) -> AuthAttention {
+    guard gatewayUp, let auth else { return .none }
+    if auth.health == "refresh_failed" { return .reauthenticate }
+    guard auth.health == "signed_out",
+          !auth.fallbackInUse,
+          globalRoutingEnabled,
+          clients.contains(where: clientRequiresBasetenAuth) else {
+        return .none
+    }
+    return .signIn
+}
+
+func authAttentionHeaderSubtitle(_ attention: AuthAttention) -> String? {
+    switch attention {
+    case .none: return nil
+    case .signIn: return "Sign in to use Baseten"
+    case .reauthenticate: return "Reauthentication required"
+    }
+}
+
+func authAttentionActionTitle(_ attention: AuthAttention) -> String? {
+    switch attention {
+    case .none: return nil
+    case .signIn: return "Sign In to Baseten…"
+    case .reauthenticate: return "Reauthenticate with Baseten…"
+    }
+}
+
+func authAttentionWarningMessage(_ attention: AuthAttention) -> String? {
+    switch attention {
+    case .none: return nil
+    case .signIn:
+        return "Sign in to Baseten to use configured Baseten routes."
+    case .reauthenticate:
+        return "Reauthenticate with Baseten to restore authentication."
+    }
 }
 
 /// Secondary detail line under "reauthentication required": the last
@@ -173,10 +235,19 @@ func globalRoutingState(_ clients: [ClientStatus]) -> GlobalRoutingState {
     return .mixed
 }
 
-func globalRoutingSubtitle(gatewayUp: Bool, clients: [ClientStatus],
+func globalRoutingSubtitle(gatewayUp: Bool,
+                           globalRoutingEnabled: Bool = true,
+                           clients: [ClientStatus],
                            auth: AuthStatus?) -> String {
     guard gatewayUp else { return "Gateway stopped" }
-    if authNeedsReauth(auth: auth) { return "Authentication required" }
+    let attention = authAttention(
+        gatewayUp: gatewayUp,
+        globalRoutingEnabled: globalRoutingEnabled,
+        clients: clients,
+        auth: auth)
+    if let subtitle = authAttentionHeaderSubtitle(attention) {
+        return subtitle
+    }
 
     let enabled = clients.filter(\.enabled)
     guard !enabled.isEmpty else { return "No enabled routing clients" }

@@ -132,11 +132,13 @@ func TestRunPreflightBanner(t *testing.T) {
 	apiKeyAuthJSON := `{"version":1,"current":"svc","profiles":{"svc":{"remote_url":"https://api.baseten.co","auth_type":"api_key","api_key":"sk-1"}}}`
 
 	cases := []struct {
-		name       string
-		resolved   []resolvedClientConfig
-		basetenKey string
-		authJSON   string // "" = empty store
-		wantBanner bool
+		name                 string
+		resolved             []resolvedClientConfig
+		basetenKey           string
+		apiKeyFallback       bool
+		authJSON             string // "" = empty store
+		wantBanner           bool
+		wantIgnoredKeyNotice bool
 	}{
 		{
 			name:       "baseten route without creds warns",
@@ -154,10 +156,18 @@ func TestRunPreflightBanner(t *testing.T) {
 			wantBanner: false,
 		},
 		{
-			name:       "api key suppresses banner",
-			resolved:   []resolvedClientConfig{{Name: "claude-code", Route: "baseten"}},
-			basetenKey: "sk-x",
-			wantBanner: false,
+			name:           "enabled api key fallback suppresses banner",
+			resolved:       []resolvedClientConfig{{Name: "claude-code", Route: "baseten"}},
+			basetenKey:     "sk-x",
+			apiKeyFallback: true,
+			wantBanner:     false,
+		},
+		{
+			name:                 "api key without fallback flag warns",
+			resolved:             []resolvedClientConfig{{Name: "claude-code", Route: "baseten"}},
+			basetenKey:           "sk-ignored",
+			wantBanner:           true,
+			wantIgnoredKeyNotice: true,
 		},
 		{
 			name:       "oauth credential suppresses banner",
@@ -183,17 +193,27 @@ func TestRunPreflightBanner(t *testing.T) {
 				t.Setenv("BASETEN_SWITCH_AUTH_FILE", path)
 			}
 			cfg := Config{
-				ConfigPath: filepath.Join(t.TempDir(), "no-such.yaml"),
-				BasetenKey: tc.basetenKey,
+				ConfigPath:     filepath.Join(t.TempDir(), "no-such.yaml"),
+				BasetenKey:     tc.basetenKey,
+				APIKeyFallback: tc.apiKeyFallback,
 			}
 			var buf bytes.Buffer
 			runPreflight(&cfg, tc.resolved, &buf)
 			out := buf.String()
-			gotBanner := strings.Contains(out, "WARNING: no Baseten credential")
+			gotBanner := strings.Contains(out, "WARNING: no Baseten credential found")
 			if gotBanner != tc.wantBanner {
 				t.Fatalf("banner = %t, want %t; output:\n%s", gotBanner, tc.wantBanner, out)
 			}
+			gotIgnoredKeyNotice := strings.Contains(out, "BASETEN_SWITCH_API_KEY_FALLBACK is not enabled")
+			if gotIgnoredKeyNotice != tc.wantIgnoredKeyNotice {
+				t.Fatalf("ignored-key notice = %t, want %t; output:\n%s", gotIgnoredKeyNotice, tc.wantIgnoredKeyNotice, out)
+			}
 			if tc.wantBanner {
+				if !strings.Contains(out, "cannot use Baseten") ||
+					!strings.Contains(out, "configured native fallback may serve") ||
+					strings.Contains(out, "requests will fail") {
+					t.Fatalf("banner does not describe the credential/fallback outcome accurately:\n%s", out)
+				}
 				if !strings.Contains(out, tc.resolved[0].Name) {
 					t.Fatalf("banner does not name client %q:\n%s", tc.resolved[0].Name, out)
 				}
@@ -228,7 +248,7 @@ clients:
 	if !strings.Contains(out, "${TEST_PF_MISSING_KEY}") {
 		t.Fatalf("expected placeholder warning, got:\n%s", out)
 	}
-	if strings.Contains(out, "WARNING: no Baseten credential") {
+	if strings.Contains(out, "WARNING: no Baseten credential found") {
 		t.Fatalf("passthrough-only client should not trigger the credential banner:\n%s", out)
 	}
 }

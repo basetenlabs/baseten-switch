@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/basetenlabs/baseten-switch/gateway/internal/config"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/launchd"
+	"github.com/basetenlabs/baseten-switch/gateway/internal/tracecapture"
 )
 
 type uninstallOptions struct {
@@ -58,6 +60,36 @@ func parseUninstallOptions(args []string) (uninstallOptions, error) {
 
 func runUninstall(opts uninstallOptions, steps []uninstallStep, out io.Writer) int {
 	failures := 0
+	var activeTracePaths tracecapture.RuntimePaths
+	path, _ := resolveConfigPath()
+	activeTracePaths, activeTracePathsErr := tracecapture.ResolveRuntimePaths(config.ExpandPath(path))
+	defaultTracePaths, defaultTracePathsErr := tracecapture.ResolveRuntimePaths(config.ExpandPath(config.DefaultPath()))
+	distinctDefaultRuntime := activeTracePathsErr != nil || defaultTracePathsErr != nil ||
+		(defaultTracePaths.TraceDir != activeTracePaths.TraceDir || defaultTracePaths.ExportDir != activeTracePaths.ExportDir)
+	retainedExports := tracecapture.ExportStatus{}
+	retainedExportsKnown := false
+	if activeTracePathsErr == nil {
+		if status, inspectErr := tracecapture.InspectRuntimeExports(activeTracePaths); inspectErr == nil {
+			retainedExports = status
+			retainedExportsKnown = true
+		}
+	}
+	if opts.purge {
+		if activeTracePathsErr != nil {
+			fmt.Fprintf(out, "uninstall: resolve active trace runtime before uninstall: %v\n", activeTracePathsErr)
+			failures++
+		} else if opts.dryRun {
+			fmt.Fprintf(out, "would permanently remove active trace store %s and export store %s\n", activeTracePaths.TraceDir, activeTracePaths.ExportDir)
+		}
+		if distinctDefaultRuntime {
+			if defaultTracePathsErr != nil {
+				fmt.Fprintf(out, "uninstall: resolve default trace runtime before broad purge: %v\n", defaultTracePathsErr)
+				failures++
+			} else if opts.dryRun {
+				fmt.Fprintf(out, "would permanently remove distinct default trace store %s and export store %s\n", defaultTracePaths.TraceDir, defaultTracePaths.ExportDir)
+			}
+		}
+	}
 	for _, step := range steps {
 		if opts.dryRun {
 			fmt.Fprintf(out, "would %s\n", step.description)
@@ -69,9 +101,28 @@ func runUninstall(opts uninstallOptions, steps []uninstallStep, out io.Writer) i
 		}
 	}
 	if opts.purge {
+		activeTracePurgeSucceeded := activeTracePathsErr == nil
+		if !opts.dryRun && activeTracePathsErr == nil {
+			if err := purgeActiveTraceRuntime(activeTracePaths); err != nil {
+				fmt.Fprintf(out, "uninstall: purge active trace runtime: %v\n", err)
+				failures++
+				activeTracePurgeSucceeded = false
+			}
+		}
+		if !opts.dryRun && activeTracePurgeSucceeded && distinctDefaultRuntime {
+			if defaultTracePathsErr != nil {
+				activeTracePurgeSucceeded = false
+			} else if err := purgeActiveTraceRuntime(defaultTracePaths); err != nil {
+				fmt.Fprintf(out, "uninstall: purge default trace runtime before broad product purge: %v\n", err)
+				failures++
+				activeTracePurgeSucceeded = false
+			}
+		}
 		root := basetenSwitchDataRoot()
 		if opts.dryRun {
 			fmt.Fprintf(out, "would permanently remove current product data root %s\n", root)
+		} else if !activeTracePurgeSucceeded {
+			fmt.Fprintln(out, "uninstall: skipped broad product data purge because validated trace-store removal did not succeed")
 		} else if err := purgeBasetenSwitchDataRoot(root); err != nil {
 			fmt.Fprintf(out, "uninstall: purge %s: %v\n", root, err)
 			failures++
@@ -88,9 +139,20 @@ func runUninstall(opts uninstallOptions, steps []uninstallStep, out io.Writer) i
 	if opts.purge {
 		fmt.Fprintln(out, "Baseten Switch uninstalled and current product data purged")
 	} else {
-		fmt.Fprintln(out, "Baseten Switch uninstalled; config, secrets, telemetry, logs, and backups were retained")
+		if retainedExportsKnown {
+			fmt.Fprintf(out, "Baseten Switch uninstalled; config, secrets, telemetry, captured traces, trace packages, logs, and backups were retained (%d package(s), %d package bytes, %d quarantine item(s), %d quarantine bytes)\n", retainedExports.PackageCount, retainedExports.PackageBytes, retainedExports.QuarantineCount, retainedExports.QuarantineBytes)
+		} else {
+			fmt.Fprintln(out, "Baseten Switch uninstalled; config, secrets, telemetry, captured traces, trace packages, logs, and backups were retained; retained trace package totals were unavailable")
+		}
 	}
 	return 0
+}
+
+func purgeActiveTraceRuntime(paths tracecapture.RuntimePaths) error {
+	return errors.Join(
+		tracecapture.RemoveRuntimeTraceStore(paths),
+		tracecapture.RemoveRuntimeExportStore(paths),
+	)
 }
 
 func defaultUninstallSteps() []uninstallStep {

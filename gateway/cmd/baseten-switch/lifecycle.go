@@ -740,6 +740,9 @@ func printStatus(lc *lifecycleConfig, out io.Writer, verbose bool) int {
 
 	// Auth.
 	fmt.Fprintf(out, "Auth:    %s\n", authLine(lc.adminAddr, routerState == portOurs))
+	if line := authUnavailableFallbackLine(lc.adminAddr, routerState == portOurs); line != "" {
+		fmt.Fprintf(out, "Fallback: %s\n", line)
+	}
 
 	// Logs (verbose only).
 	if verbose {
@@ -889,6 +892,40 @@ func authLine(adminAddr string, routerUp bool) string {
 	default:
 		return "not signed in (run 'baseten auth login')"
 	}
+}
+
+// authUnavailableFallbackLine surfaces otherwise successful requests that
+// bypassed Baseten because the router had no usable credential. Older routers
+// omit this additive status object, so an empty or unavailable value renders
+// no extra line.
+func authUnavailableFallbackLine(adminAddr string, routerUp bool) string {
+	if !routerUp {
+		return ""
+	}
+	var payload struct {
+		AuthUnavailableFallback struct {
+			Count      uint64 `json:"count"`
+			LastAt     string `json:"last_at"`
+			LastClient string `json:"last_client"`
+			LastRoute  string `json:"last_route"`
+		} `json:"auth_unavailable_fallback"`
+	}
+	if err := getJSON(adminAddr, "/v1/admin/status", &payload); err != nil || payload.AuthUnavailableFallback.Count == 0 {
+		return ""
+	}
+	fallback := payload.AuthUnavailableFallback
+	detail := ""
+	if fallback.LastClient != "" && fallback.LastRoute != "" {
+		detail = fmt.Sprintf("; last %s -> %s", fallback.LastClient, fallback.LastRoute)
+	}
+	if fallback.LastAt != "" {
+		detail += " at " + fallback.LastAt
+	}
+	return fmt.Sprintf(
+		"%d request(s) used native fallback because Baseten auth was unavailable since router start%s",
+		fallback.Count,
+		detail,
+	)
 }
 
 func getJSON(addr, path string, v any) error {

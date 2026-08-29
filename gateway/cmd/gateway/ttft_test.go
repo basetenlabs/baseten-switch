@@ -12,6 +12,7 @@ package gateway
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -158,8 +159,14 @@ func TestTTFTFiresFallbackBeforeFirstByteWithCooldown(t *testing.T) {
 }
 
 func TestAuthUnavailableBypassRecordsFallback(t *testing.T) {
+	var fallbackHits atomic.Int32
 	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if fallbackHits.Add(1) == 2 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"type":"authentication_error","message":"invalid native credential"}}`))
+			return
+		}
 		_, _ = w.Write([]byte(
 			`{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"FALLBACK"}],"model":"claude-opus-4-8","usage":{"input_tokens":2,"output_tokens":1}}`,
 		))
@@ -184,23 +191,63 @@ func TestAuthUnavailableBypassRecordsFallback(t *testing.T) {
 	if resp.StatusCode != http.StatusOK || !strings.Contains(body, "FALLBACK") {
 		t.Fatalf("status=%d body=%s, want fallback response", resp.StatusCode, body)
 	}
-	rows := waitForRows(t, cfg.TelemetryDir, 1, 2*time.Second)
-	row := rows[0]
-	if row.EffectiveProvider != "anthropic" ||
-		!row.Fallback.Attempted ||
-		row.Fallback.Count != 1 ||
-		valueOrZero(row.Fallback.Trigger) != fallbackTriggerAuthUnavailable {
-		t.Fatalf("fallback telemetry = provider %q, %+v; want anthropic auth-unavailable bypass",
-			row.EffectiveProvider, row.Fallback)
+	if got := resp.Header.Get(authUnavailableFallbackHeader); got != fallbackTriggerAuthUnavailable {
+		t.Fatalf("%s = %q, want %q", authUnavailableFallbackHeader, got, fallbackTriggerAuthUnavailable)
 	}
-	if primary := row.Primary; primary == nil ||
-		primary.Provider != "baseten" ||
-		primary.Model != "zai-org/GLM-5.2" ||
-		primary.Attempted ||
-		primary.Outcome != telemetry.PrimaryOutcomeAuthUnavailable ||
-		primary.Status != nil {
-		t.Errorf("auth-unavailable primary = %+v, want unattempted baseten zai-org/GLM-5.2", primary)
+
+	resp, _ = ttftPost(
+		t,
+		g,
+		`{"model":"claude-opus-4-8","stream":false,"messages":[{"role":"user","content":"ping again"}]}`,
+	)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("second fallback status = %d, want 401", resp.StatusCode)
 	}
+	if got := resp.Header.Get(authUnavailableFallbackHeader); got != fallbackTriggerAuthUnavailable {
+		t.Fatalf("second %s = %q, want %q", authUnavailableFallbackHeader, got, fallbackTriggerAuthUnavailable)
+	}
+
+	rows := waitForRows(t, cfg.TelemetryDir, 2, 2*time.Second)
+	for i, row := range rows {
+		if row.EffectiveProvider != "anthropic" ||
+			!row.Fallback.Attempted ||
+			row.Fallback.Count != 1 ||
+			valueOrZero(row.Fallback.Trigger) != fallbackTriggerAuthUnavailable {
+			t.Fatalf("row %d fallback telemetry = provider %q, %+v; want anthropic auth-unavailable bypass",
+				i, row.EffectiveProvider, row.Fallback)
+		}
+		if primary := row.Primary; primary == nil ||
+			primary.Provider != "baseten" ||
+			primary.Model != "zai-org/GLM-5.2" ||
+			primary.Attempted ||
+			primary.Outcome != telemetry.PrimaryOutcomeAuthUnavailable ||
+			primary.Status != nil {
+			t.Errorf("row %d auth-unavailable primary = %+v, want unattempted baseten zai-org/GLM-5.2", i, primary)
+		}
+	}
+
+	statusResp, err := http.Get(adminURL(g, "/v1/admin/status"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statusResp.Body.Close()
+	var status struct {
+		AuthUnavailableFallback struct {
+			Count      uint64 `json:"count"`
+			LastAt     string `json:"last_at"`
+			LastClient string `json:"last_client"`
+			LastRoute  string `json:"last_route"`
+		} `json:"auth_unavailable_fallback"`
+	}
+	if err := json.NewDecoder(statusResp.Body).Decode(&status); err != nil {
+		t.Fatal(err)
+	}
+	gotStatus := status.AuthUnavailableFallback
+	if gotStatus.Count != 2 || gotStatus.LastAt == "" ||
+		gotStatus.LastClient != "claude-code" || gotStatus.LastRoute != "anthropic" {
+		t.Fatalf("auth_unavailable_fallback status = %+v", gotStatus)
+	}
+
 }
 
 // TestTTFTHeadersWithoutBodyFiresFallback: an SSE upstream that sends

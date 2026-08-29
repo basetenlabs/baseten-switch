@@ -147,6 +147,159 @@ final class PopupDisplayTests: XCTestCase {
         XCTAssertFalse(authNeedsReauth(auth: nil))
     }
 
+    private func routedClient(
+        enabled: Bool = true,
+        route: String = "anthropic",
+        unmatchedRoute: String? = nil,
+        familyRoutes: [String] = [],
+        fallbackActive: Bool = false
+    ) -> ClientStatus {
+        var dict: [String: Any] = [
+            "name": "claude-code",
+            "enabled": enabled,
+            "effective_route": route,
+            "fallback": ["active": fallbackActive],
+        ]
+        if let unmatchedRoute {
+            dict["unmatched_native_model"] = [
+                "effective_route": unmatchedRoute,
+            ]
+        }
+        dict["families"] = familyRoutes.enumerated().map { index, route in
+            [
+                "family": "family-\(index)",
+                "effective_route": route,
+            ]
+        }
+        return ClientStatus(dict: dict)!
+    }
+
+    func testClientRequiresBasetenAuthAcrossEffectiveDestinations() {
+        XCTAssertTrue(clientRequiresBasetenAuth(routedClient(route: "baseten")))
+        XCTAssertTrue(clientRequiresBasetenAuth(routedClient(
+            unmatchedRoute: "baseten")))
+        XCTAssertTrue(clientRequiresBasetenAuth(routedClient(
+            familyRoutes: ["anthropic", "baseten"])))
+
+        XCTAssertFalse(clientRequiresBasetenAuth(routedClient()))
+        XCTAssertFalse(clientRequiresBasetenAuth(routedClient(
+            unmatchedRoute: "anthropic",
+            familyRoutes: ["anthropic"])))
+        XCTAssertFalse(clientRequiresBasetenAuth(routedClient(
+            enabled: false,
+            route: "baseten",
+            unmatchedRoute: "baseten",
+            familyRoutes: ["baseten"])))
+    }
+
+    func testAuthAttentionDecisionTable() {
+        let baseten = routedClient(route: "baseten")
+        let native = routedClient()
+        let disabled = routedClient(enabled: false, route: "baseten")
+        let signedOut = auth(
+            signedIn: false, profile: "", fallbackInUse: false,
+            health: "signed_out")
+
+        XCTAssertEqual(authAttention(
+            gatewayUp: true, globalRoutingEnabled: true,
+            clients: [baseten], auth: signedOut), .signIn)
+        XCTAssertEqual(authAttention(
+            gatewayUp: true, globalRoutingEnabled: true,
+            clients: [routedClient(unmatchedRoute: "baseten")],
+            auth: signedOut), .signIn)
+        XCTAssertEqual(authAttention(
+            gatewayUp: true, globalRoutingEnabled: true,
+            clients: [routedClient(familyRoutes: ["baseten"])],
+            auth: signedOut), .signIn)
+
+        XCTAssertEqual(authAttention(
+            gatewayUp: false, globalRoutingEnabled: true,
+            clients: [baseten], auth: signedOut), .none)
+        XCTAssertEqual(authAttention(
+            gatewayUp: true, globalRoutingEnabled: false,
+            clients: [baseten], auth: signedOut), .none)
+        XCTAssertEqual(authAttention(
+            gatewayUp: true, globalRoutingEnabled: true,
+            clients: [native], auth: signedOut), .none)
+        XCTAssertEqual(authAttention(
+            gatewayUp: true, globalRoutingEnabled: true,
+            clients: [disabled], auth: signedOut), .none)
+        XCTAssertEqual(authAttention(
+            gatewayUp: true, globalRoutingEnabled: true,
+            clients: [], auth: signedOut), .none)
+        XCTAssertEqual(authAttention(
+            gatewayUp: true, globalRoutingEnabled: true,
+            clients: [baseten], auth: nil), .none)
+    }
+
+    func testAuthAttentionFallbackAndHealthStates() {
+        let baseten = routedClient(route: "baseten")
+
+        XCTAssertEqual(authAttention(
+            gatewayUp: true, globalRoutingEnabled: true,
+            clients: [baseten],
+            auth: auth(signedIn: false, profile: "", fallbackInUse: true,
+                       health: "signed_out")), .none)
+        XCTAssertEqual(authAttention(
+            gatewayUp: true, globalRoutingEnabled: true,
+            clients: [routedClient(route: "baseten", fallbackActive: true)],
+            auth: auth(signedIn: false, profile: "", fallbackInUse: false,
+                       health: "signed_out")), .signIn)
+
+        // Preserve the existing route-independent dead-credential alarm.
+        for globalRoutingEnabled in [false, true] {
+            XCTAssertEqual(authAttention(
+                gatewayUp: true,
+                globalRoutingEnabled: globalRoutingEnabled,
+                clients: [],
+                auth: auth(signedIn: true, profile: "", fallbackInUse: false,
+                           health: "refresh_failed")), .reauthenticate)
+        }
+        XCTAssertEqual(authAttention(
+            gatewayUp: true, globalRoutingEnabled: false, clients: [],
+            auth: auth(signedIn: true, profile: "", fallbackInUse: true,
+                       health: "refresh_failed")), .reauthenticate)
+
+        // Transient and mixed-version health values remain quiet.
+        for health in ["ok", "error", ""] {
+            XCTAssertEqual(authAttention(
+                gatewayUp: true, globalRoutingEnabled: true,
+                clients: [baseten],
+                auth: auth(signedIn: true, profile: "", fallbackInUse: false,
+                           health: health)), .none, "health \(health)")
+        }
+        // Only an explicit signed_out health value triggers sign-in attention.
+        XCTAssertEqual(authAttention(
+            gatewayUp: true, globalRoutingEnabled: true,
+            clients: [baseten],
+            auth: auth(signedIn: false, profile: "", fallbackInUse: false,
+                       health: "")), .none)
+    }
+
+    func testAuthAttentionPresentation() {
+        XCTAssertNil(authAttentionHeaderSubtitle(.none))
+        XCTAssertNil(authAttentionActionTitle(.none))
+        XCTAssertNil(authAttentionWarningMessage(.none))
+        XCTAssertEqual(
+            authAttentionHeaderSubtitle(.signIn),
+            "Sign in to use Baseten")
+        XCTAssertEqual(
+            authAttentionActionTitle(.signIn),
+            "Sign In to Baseten…")
+        XCTAssertEqual(
+            authAttentionWarningMessage(.signIn),
+            "Sign in to Baseten to use configured Baseten routes.")
+        XCTAssertEqual(
+            authAttentionHeaderSubtitle(.reauthenticate),
+            "Reauthentication required")
+        XCTAssertEqual(
+            authAttentionActionTitle(.reauthenticate),
+            "Reauthenticate with Baseten…")
+        XCTAssertEqual(
+            authAttentionWarningMessage(.reauthenticate),
+            "Reauthenticate with Baseten to restore authentication.")
+    }
+
     // The detail line renders only in the dead-credential state, and
     // reuses the menu-safe truncation.
     func testAuthDetailLine() {
@@ -295,7 +448,17 @@ final class PopupDisplayTests: XCTestCase {
         let deadAuth = AuthStatus(dict: ["health": "refresh_failed"])
         XCTAssertEqual(globalRoutingSubtitle(gatewayUp: true, clients: [baseten],
                                              auth: deadAuth),
-                       "Authentication required")
+                       "Reauthentication required")
+        let signedOut = AuthStatus(dict: [
+            "signed_in": false,
+            "health": "signed_out",
+        ])
+        XCTAssertEqual(globalRoutingSubtitle(
+            gatewayUp: true,
+            globalRoutingEnabled: true,
+            clients: [baseten],
+            auth: signedOut),
+            "Sign in to use Baseten")
     }
 
     // MARK: - Sparkline bucket-to-points mapping

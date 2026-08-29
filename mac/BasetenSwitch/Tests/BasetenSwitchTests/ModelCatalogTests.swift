@@ -70,6 +70,132 @@ private actor FixedModelCatalogAdminReader: AdminStatusReading {
     }
 }
 
+private actor RecordingAuthWorkflow: AdminStatusReading, AuthReloading,
+                                      ModelCatalogReading {
+    private var statuses: [AdminStatusSnapshot]
+    private var catalogs: [LiveModelCatalogSnapshot]
+    private let reloadResult: Result<AuthStatus, Error>
+    private let reloadDelayNanoseconds: UInt64
+    private let suspendFirstReload: Bool
+    private let suspendFirstStatus: Bool
+    private let suspendFirstCatalog: Bool
+    private var firstReloadStarted = false
+    private var firstReloadContinuation: CheckedContinuation<Void, Never>?
+    private var firstStatusStarted = false
+    private var firstStatusContinuation: CheckedContinuation<Void, Never>?
+    private var firstCatalogStarted = false
+    private var firstCatalogContinuation: CheckedContinuation<Void, Never>?
+    private(set) var events: [String] = []
+
+    init(
+        statuses: [AdminStatusSnapshot],
+        catalogs: [LiveModelCatalogSnapshot],
+        reloadResult: Result<AuthStatus, Error> = .success(
+            AuthStatus(dict: ["signed_in": true, "health": "ok"])),
+        reloadDelayNanoseconds: UInt64 = 0,
+        suspendFirstReload: Bool = false,
+        suspendFirstStatus: Bool = false,
+        suspendFirstCatalog: Bool = false
+    ) {
+        self.statuses = statuses
+        self.catalogs = catalogs
+        self.reloadResult = reloadResult
+        self.reloadDelayNanoseconds = reloadDelayNanoseconds
+        self.suspendFirstReload = suspendFirstReload
+        self.suspendFirstStatus = suspendFirstStatus
+        self.suspendFirstCatalog = suspendFirstCatalog
+    }
+
+    func reloadAuth() async throws -> AuthStatus {
+        events.append("reload")
+        if suspendFirstReload, !firstReloadStarted {
+            firstReloadStarted = true
+            await withCheckedContinuation { continuation in
+                firstReloadContinuation = continuation
+            }
+        }
+        if reloadDelayNanoseconds > 0 {
+            try await Task.sleep(nanoseconds: reloadDelayNanoseconds)
+        }
+        return try reloadResult.get()
+    }
+
+    func fetchStatus() async throws -> AdminStatusSnapshot {
+        events.append("status")
+        if suspendFirstStatus, !firstStatusStarted {
+            firstStatusStarted = true
+            await withCheckedContinuation { continuation in
+                firstStatusContinuation = continuation
+            }
+        }
+        guard !statuses.isEmpty else {
+            throw GatewayClientError.invalidPayload
+        }
+        return statuses.removeFirst()
+    }
+
+    func fetchStats(windowSeconds: Int,
+                    bucketSeconds: Int) async throws -> StatsSnapshot {
+        StatsSnapshot(dict: [:])
+    }
+
+    func fetchModelCatalog() async throws -> LiveModelCatalogSnapshot {
+        events.append("catalog")
+        guard !catalogs.isEmpty else {
+            throw GatewayClientError.invalidPayload
+        }
+        let snapshot = catalogs.removeFirst()
+        if suspendFirstCatalog, !firstCatalogStarted {
+            firstCatalogStarted = true
+            await withCheckedContinuation { continuation in
+                firstCatalogContinuation = continuation
+            }
+        }
+        return snapshot
+    }
+
+    func waitForFirstReloadStart() async {
+        while !firstReloadStarted {
+            await Task.yield()
+        }
+    }
+
+    func waitForFirstStatusStart() async {
+        while !firstStatusStarted {
+            await Task.yield()
+        }
+    }
+
+    func waitForFirstCatalogStart() async {
+        while !firstCatalogStarted {
+            await Task.yield()
+        }
+    }
+
+    func waitForEvent(_ event: String) async {
+        while !events.contains(event) {
+            await Task.yield()
+        }
+    }
+
+    func releaseFirstStatus() {
+        firstStatusContinuation?.resume()
+        firstStatusContinuation = nil
+    }
+
+    func releaseFirstReload() {
+        firstReloadContinuation?.resume()
+        firstReloadContinuation = nil
+    }
+
+    func releaseFirstCatalog() {
+        firstCatalogContinuation?.resume()
+        firstCatalogContinuation = nil
+    }
+}
+
+private struct ModelCatalogTransportError: Error {}
+
 @MainActor
 private final class ModelCatalogLoginItemService: LoginItemServicing {
     var status: SMAppService.Status = .notRegistered
@@ -81,7 +207,14 @@ private final class ModelCatalogLoginItemService: LoginItemServicing {
 private final class ModelCatalogURLProtocol: URLProtocol {
     static var responseData = Data()
     static var statusCode = 200
+    static var responseDelay: TimeInterval = 0
     static var observedURL: URL?
+    static var observedMethod: String?
+    static var observedBody: Data?
+    static var observedAdminHeader: String?
+    static var observedTimeoutInterval: TimeInterval?
+
+    private var responseWorkItem: DispatchWorkItem?
 
     override class func canInit(with request: URLRequest) -> Bool {
         true
@@ -94,23 +227,140 @@ private final class ModelCatalogURLProtocol: URLProtocol {
 
     override func startLoading() {
         Self.observedURL = request.url
-        let response = HTTPURLResponse(
-            url: request.url!,
-            statusCode: Self.statusCode,
-            httpVersion: nil,
-            headerFields: ["Content-Type": "application/json"])!
-        client?.urlProtocol(
-            self,
-            didReceive: response,
-            cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Self.responseData)
-        client?.urlProtocolDidFinishLoading(self)
+        Self.observedMethod = request.httpMethod
+        Self.observedBody = request.httpBody
+        Self.observedAdminHeader = request.value(
+            forHTTPHeaderField: "X-Baseten-Switch-Admin")
+        Self.observedTimeoutInterval = request.timeoutInterval
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: Self.statusCode,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"])!
+            client?.urlProtocol(
+                self,
+                didReceive: response,
+                cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: Self.responseData)
+            client?.urlProtocolDidFinishLoading(self)
+        }
+        responseWorkItem = workItem
+        if Self.responseDelay > 0 {
+            DispatchQueue.global().asyncAfter(
+                deadline: .now() + Self.responseDelay,
+                execute: workItem)
+        } else {
+            workItem.perform()
+        }
     }
 
-    override func stopLoading() {}
+    override func stopLoading() {
+        responseWorkItem?.cancel()
+        responseWorkItem = nil
+    }
 }
 
 final class ModelCatalogTests: XCTestCase {
+    func testModelCatalogRequestOutlivesOrdinaryAdminTimeout() async throws {
+        ModelCatalogURLProtocol.responseData = Data("""
+        {
+          "state": "ready",
+          "models": [],
+          "signed_out_reason": "",
+          "fetched_at": "2026-08-17T05:00:00Z",
+          "error": ""
+        }
+        """.utf8)
+        ModelCatalogURLProtocol.statusCode = 200
+        ModelCatalogURLProtocol.responseDelay = 2.2
+        ModelCatalogURLProtocol.observedTimeoutInterval = nil
+        defer { ModelCatalogURLProtocol.responseDelay = 0 }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 2
+        configuration.timeoutIntervalForResource = 5
+        configuration.protocolClasses = [ModelCatalogURLProtocol.self]
+        let client = GatewayAPIClient(
+            runtime: .stable(),
+            session: URLSession(configuration: configuration))
+
+        let snapshot = try await client.fetchModelCatalog()
+
+        XCTAssertEqual(snapshot.state, .ready)
+        XCTAssertEqual(
+            ModelCatalogURLProtocol.observedTimeoutInterval ?? -1,
+            4,
+            accuracy: 0.001)
+    }
+
+    func testOrdinaryAdminReadRetainsTwoSecondTimeout() async throws {
+        ModelCatalogURLProtocol.responseData = Data("""
+        {
+          "router_boot_id": "boot-a",
+          "active_generation": 1,
+          "active_config_hash": "sha256:active",
+          "desired_config_hash": "sha256:active",
+          "capabilities": [],
+          "global_routing_enabled": false,
+          "clients": []
+        }
+        """.utf8)
+        ModelCatalogURLProtocol.statusCode = 200
+        ModelCatalogURLProtocol.responseDelay = 0
+        ModelCatalogURLProtocol.observedTimeoutInterval = nil
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 2
+        configuration.timeoutIntervalForResource = 5
+        configuration.protocolClasses = [ModelCatalogURLProtocol.self]
+        let client = GatewayAPIClient(
+            runtime: .stable(),
+            session: URLSession(configuration: configuration))
+
+        _ = try await client.fetchStatus()
+
+        XCTAssertEqual(
+            ModelCatalogURLProtocol.observedTimeoutInterval ?? -1,
+            2,
+            accuracy: 0.001)
+    }
+
+    func testGatewayClientReloadsAuthWithEmptyPOST() async throws {
+        ModelCatalogURLProtocol.responseData = Data("""
+        {
+          "signed_in": true,
+          "auth_type": "api_key",
+          "profile": "",
+          "fallback_enabled": false,
+          "fallback_in_use": false,
+          "health": "ok",
+          "last_refresh_error": ""
+        }
+        """.utf8)
+        ModelCatalogURLProtocol.statusCode = 200
+        ModelCatalogURLProtocol.observedURL = nil
+        ModelCatalogURLProtocol.observedMethod = nil
+        ModelCatalogURLProtocol.observedBody = nil
+        ModelCatalogURLProtocol.observedAdminHeader = nil
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ModelCatalogURLProtocol.self]
+        let client = GatewayAPIClient(
+            runtime: .stable(),
+            session: URLSession(configuration: configuration))
+
+        let auth = try await client.reloadAuth()
+
+        XCTAssertTrue(auth.signedIn)
+        XCTAssertEqual(auth.authType, "api_key")
+        XCTAssertEqual(auth.health, "ok")
+        XCTAssertEqual(
+            ModelCatalogURLProtocol.observedURL?.path,
+            "/v1/admin/auth/reload")
+        XCTAssertEqual(ModelCatalogURLProtocol.observedMethod, "POST")
+        XCTAssertEqual(ModelCatalogURLProtocol.observedAdminHeader, "1")
+        XCTAssertEqual(ModelCatalogURLProtocol.observedBody?.count ?? 0, 0)
+    }
+
     func testGatewayClientDecodesNarrowModelCatalogContract() async throws {
         ModelCatalogURLProtocol.responseData = Data("""
         {
@@ -447,6 +697,374 @@ final class ModelCatalogTests: XCTestCase {
     }
 
     @MainActor
+    func testClientPageRefreshCoalescesBurstIntoOnePendingRerun() async {
+        let ready = catalogSnapshot(
+            state: .ready,
+            models: [liveModel("vendor/ready")])
+        let signedOut = catalogSnapshot(
+            state: .signedOut,
+            signedOutReason: .notSignedIn)
+        let workflow = RecordingAuthWorkflow(
+            statuses: [
+                adminSnapshot(signedIn: false, health: "signed_out"),
+                adminSnapshot(signedIn: true, health: "ok"),
+            ],
+            catalogs: [signedOut, ready],
+            suspendFirstReload: true)
+        let state = makeState(
+            adminReader: workflow,
+            authReloader: workflow,
+            modelCatalogReader: workflow)
+
+        state.requestClientPageRefresh()
+        await workflow.waitForFirstReloadStart()
+        for _ in 0..<25 {
+            state.requestClientPageRefresh()
+        }
+        await workflow.releaseFirstReload()
+        await state.waitForClientPageRefresh()
+
+        let events = await workflow.events
+        XCTAssertEqual(
+            events,
+            [
+                "reload", "status", "catalog",
+                "reload", "status", "catalog",
+            ])
+        XCTAssertEqual(state.liveModelCatalogState, .ready(ready.models))
+    }
+
+    @MainActor
+    func testClientPageRefreshPreservesSavedPickerSelectionsWhileLoading() async {
+        let old = catalogSnapshot(
+            state: .ready,
+            models: [liveModel("vendor/old", label: "Old Model")])
+        let newest = catalogSnapshot(
+            state: .ready,
+            models: [liveModel("vendor/new", label: "New Model")])
+        let workflow = RecordingAuthWorkflow(
+            statuses: [adminSnapshot(signedIn: true, health: "ok")],
+            catalogs: [old, newest],
+            suspendFirstReload: true)
+        let state = makeState(
+            adminReader: workflow,
+            authReloader: workflow,
+            modelCatalogReader: workflow)
+        let claude = routingClient(name: "claude-code")
+        let codex = routingClient(name: "codex")
+
+        state.requestModelCatalogRefresh()
+        await state.waitForModelCatalogRefresh()
+        state.requestClientPageRefresh()
+        await workflow.waitForFirstReloadStart()
+
+        XCTAssertEqual(state.liveModelCatalogState, .loading)
+        XCTAssertFalse(state.modelCatalogAllowsMutation)
+        let claudeCatalog = state.modelCatalogProjection(for: claude).selectable
+        let codexCatalog = state.modelCatalogProjection(for: codex).selectable
+        XCTAssertEqual(claudeCatalog.map(\.slug), ["vendor/old"])
+        XCTAssertEqual(
+            familyPickerSelection(
+                claude.families[0],
+                catalog: claudeCatalog),
+            .catalog("vendor/old"))
+        XCTAssertEqual(
+            subagentPickerSelection(claude, catalog: claudeCatalog),
+            .catalog("vendor/old"))
+        XCTAssertEqual(
+            codexRoutePickerSelection(codex, catalog: codexCatalog),
+            .catalog("vendor/old"))
+
+        await workflow.releaseFirstReload()
+        await state.waitForClientPageRefresh()
+
+        XCTAssertTrue(state.modelCatalogAllowsMutation)
+        XCTAssertEqual(
+            state.modelCatalogProjection(for: claude).selectable.map(\.slug),
+            ["vendor/new"])
+    }
+
+    @MainActor
+    func testClientPageRefreshClearsPreservedCatalogOnTerminalResult() async {
+        let old = catalogSnapshot(
+            state: .ready,
+            models: [liveModel("vendor/old")])
+        let terminalResults = [
+            catalogSnapshot(
+                state: .signedOut,
+                signedOutReason: .notSignedIn),
+            catalogSnapshot(
+                state: .error,
+                error: "Catalog unavailable."),
+        ]
+
+        for terminal in terminalResults {
+            let workflow = RecordingAuthWorkflow(
+                statuses: [adminSnapshot(signedIn: true, health: "ok")],
+                catalogs: [old, terminal])
+            let state = makeState(
+                adminReader: workflow,
+                authReloader: workflow,
+                modelCatalogReader: workflow)
+            let claude = routingClient(name: "claude-code")
+
+            state.requestModelCatalogRefresh()
+            await state.waitForModelCatalogRefresh()
+            state.requestClientPageRefresh()
+            await state.waitForClientPageRefresh()
+
+            XCTAssertFalse(state.modelCatalogAllowsMutation)
+            XCTAssertTrue(
+                state.modelCatalogProjection(for: claude).selectable.isEmpty)
+        }
+    }
+
+    @MainActor
+    func testWindowCloseClearsCatalogPreservedDuringRefresh() async {
+        let old = catalogSnapshot(
+            state: .ready,
+            models: [liveModel("vendor/old")])
+        let workflow = RecordingAuthWorkflow(
+            statuses: [adminSnapshot(signedIn: true, health: "ok")],
+            catalogs: [old],
+            suspendFirstReload: true)
+        let state = makeState(
+            adminReader: workflow,
+            authReloader: workflow,
+            modelCatalogReader: workflow)
+        let claude = routingClient(name: "claude-code")
+
+        state.requestModelCatalogRefresh()
+        await state.waitForModelCatalogRefresh()
+        state.requestClientPageRefresh()
+        await workflow.waitForFirstReloadStart()
+        XCTAssertFalse(
+            state.modelCatalogProjection(for: claude).selectable.isEmpty)
+
+        state.routerWindowDidClose()
+        XCTAssertEqual(state.liveModelCatalogState, .idle)
+        XCTAssertTrue(
+            state.modelCatalogProjection(for: claude).selectable.isEmpty)
+        await workflow.releaseFirstReload()
+    }
+
+    @MainActor
+    func testClientPageRefreshBoundsReloadFailuresAndContinues() async {
+        let failures: [Error] = [
+            GatewayClientError.badResponse(405),
+            GatewayClientError.invalidPayload,
+            GatewayClientError.badResponse(500),
+            ModelCatalogTransportError(),
+        ]
+        for failure in failures {
+            let ready = catalogSnapshot(
+                state: .ready,
+                models: [liveModel("vendor/ready")])
+            let workflow = RecordingAuthWorkflow(
+                statuses: [adminSnapshot(signedIn: true, health: "ok")],
+                catalogs: [ready],
+                reloadResult: .failure(failure))
+            let state = makeState(
+                adminReader: workflow,
+                authReloader: workflow,
+                modelCatalogReader: workflow)
+
+            state.requestClientPageRefresh()
+            await state.waitForClientPageRefresh()
+
+            let events = await workflow.events
+            XCTAssertEqual(events, ["reload", "status", "catalog"])
+            XCTAssertEqual(state.liveModelCatalogState, .ready(ready.models))
+        }
+    }
+
+    @MainActor
+    func testClientPageRefreshWaitsOutPreReloadStatusRequest() async {
+        let ready = catalogSnapshot(
+            state: .ready,
+            models: [liveModel("vendor/ready")])
+        let workflow = RecordingAuthWorkflow(
+            statuses: [
+                adminSnapshot(signedIn: false, health: "signed_out"),
+                adminSnapshot(signedIn: true, health: "ok"),
+            ],
+            catalogs: [ready],
+            suspendFirstStatus: true)
+        let state = makeState(
+            adminReader: workflow,
+            authReloader: workflow,
+            modelCatalogReader: workflow)
+
+        let preReloadPoll = Task { await state.refresh() }
+        await workflow.waitForFirstStatusStart()
+        state.requestClientPageRefresh()
+        await workflow.waitForEvent("reload")
+        await workflow.releaseFirstStatus()
+        await preReloadPoll.value
+        await state.waitForClientPageRefresh()
+
+        let events = await workflow.events
+        XCTAssertEqual(
+            events,
+            ["status", "reload", "status", "catalog"])
+        XCTAssertTrue(state.auth?.signedIn == true)
+        XCTAssertEqual(state.auth?.health, "ok")
+        XCTAssertEqual(state.liveModelCatalogState, .ready(ready.models))
+    }
+
+    @MainActor
+    func testClientPageRefreshInvalidatesPreReloadCatalogResult() async {
+        let signedOut = catalogSnapshot(
+            state: .signedOut,
+            signedOutReason: .notSignedIn)
+        let ready = catalogSnapshot(
+            state: .ready,
+            models: [liveModel("vendor/ready")])
+        let workflow = RecordingAuthWorkflow(
+            statuses: [adminSnapshot(signedIn: true, health: "ok")],
+            catalogs: [signedOut, ready],
+            suspendFirstCatalog: true)
+        let state = makeState(
+            adminReader: workflow,
+            authReloader: workflow,
+            modelCatalogReader: workflow)
+
+        state.requestModelCatalogRefresh()
+        await workflow.waitForFirstCatalogStart()
+        state.requestClientPageRefresh()
+        await state.waitForClientPageRefresh()
+        await workflow.releaseFirstCatalog()
+        await Task.yield()
+
+        let events = await workflow.events
+        XCTAssertEqual(events, ["catalog", "reload", "status", "catalog"])
+        XCTAssertEqual(state.liveModelCatalogState, .ready(ready.models))
+    }
+
+    @MainActor
+    func testClosingWindowCancelsOrderedRefreshBeforeLateReads() async {
+        let workflow = RecordingAuthWorkflow(
+            statuses: [adminSnapshot(signedIn: true, health: "ok")],
+            catalogs: [catalogSnapshot(state: .ready)],
+            suspendFirstReload: true)
+        let state = makeState(
+            adminReader: workflow,
+            authReloader: workflow,
+            modelCatalogReader: workflow)
+
+        state.requestClientPageRefresh()
+        await workflow.waitForFirstReloadStart()
+        state.routerWindowDidClose()
+        await workflow.releaseFirstReload()
+        await Task.yield()
+
+        let events = await workflow.events
+        XCTAssertEqual(events, ["reload"])
+        XCTAssertEqual(state.liveModelCatalogState, .idle)
+    }
+
+    @MainActor
+    func testHealthyAuthTransitionRetriesNotSignedInCatalogOnce() async {
+        let signedOut = catalogSnapshot(
+            state: .signedOut,
+            signedOutReason: .notSignedIn)
+        let ready = catalogSnapshot(
+            state: .ready,
+            models: [liveModel("vendor/recovered")])
+        let workflow = RecordingAuthWorkflow(
+            statuses: [
+                adminSnapshot(signedIn: false, health: "signed_out"),
+                adminSnapshot(signedIn: true, health: "ok"),
+                adminSnapshot(signedIn: true, health: "ok"),
+            ],
+            catalogs: [signedOut, ready])
+        let state = makeState(
+            adminReader: workflow,
+            authReloader: workflow,
+            modelCatalogReader: workflow)
+
+        await state.refresh()
+        state.requestModelCatalogRefresh()
+        await state.waitForModelCatalogRefresh()
+        await state.refresh()
+        await state.waitForModelCatalogRefresh()
+        await state.refresh()
+        await state.waitForModelCatalogRefresh()
+
+        let events = await workflow.events
+        XCTAssertEqual(
+            events,
+            ["status", "catalog", "status", "catalog", "status"])
+        XCTAssertEqual(state.liveModelCatalogState, .ready(ready.models))
+    }
+
+    @MainActor
+    func testHealthyTransitionRetriesLateNotSignedInCatalogOnce() async {
+        let signedOut = catalogSnapshot(
+            state: .signedOut,
+            signedOutReason: .notSignedIn)
+        let ready = catalogSnapshot(
+            state: .ready,
+            models: [liveModel("vendor/recovered")])
+        let workflow = RecordingAuthWorkflow(
+            statuses: [
+                adminSnapshot(signedIn: false, health: "signed_out"),
+                adminSnapshot(signedIn: true, health: "ok"),
+            ],
+            catalogs: [signedOut, ready],
+            suspendFirstCatalog: true)
+        let state = makeState(
+            adminReader: workflow,
+            authReloader: workflow,
+            modelCatalogReader: workflow)
+
+        await state.refresh()
+        state.requestModelCatalogRefresh()
+        await workflow.waitForFirstCatalogStart()
+        await state.refresh()
+        await workflow.releaseFirstCatalog()
+        await state.waitForModelCatalogRefresh()
+
+        let events = await workflow.events
+        XCTAssertEqual(
+            events,
+            ["status", "catalog", "status", "catalog"])
+        XCTAssertEqual(state.liveModelCatalogState, .ready(ready.models))
+    }
+
+    @MainActor
+    func testHealthyAuthTransitionDoesNotRetryTerminalSignedOutCatalogs() async {
+        for reason in [
+            LiveModelCatalogSignedOutReason.sessionExpired,
+            .credentialRejected,
+        ] {
+            let terminal = catalogSnapshot(
+                state: .signedOut,
+                signedOutReason: reason)
+            let workflow = RecordingAuthWorkflow(
+                statuses: [
+                    adminSnapshot(signedIn: false, health: "signed_out"),
+                    adminSnapshot(signedIn: true, health: "ok"),
+                ],
+                catalogs: [terminal])
+            let state = makeState(
+                adminReader: workflow,
+                authReloader: workflow,
+                modelCatalogReader: workflow)
+
+            await state.refresh()
+            state.requestModelCatalogRefresh()
+            await state.waitForModelCatalogRefresh()
+            await state.refresh()
+            await state.waitForModelCatalogRefresh()
+
+            let events = await workflow.events
+            XCTAssertEqual(events, ["status", "catalog", "status"])
+            XCTAssertEqual(state.liveModelCatalogState, .signedOut(reason))
+        }
+    }
+
+    @MainActor
     func testNewerCatalogRefreshWinsWhenCancelledReaderReturnsLate() async {
         let old = catalogSnapshot(
             state: .ready,
@@ -549,8 +1167,11 @@ final class ModelCatalogTests: XCTestCase {
         ])!
     }
 
-    private func adminSnapshot() -> AdminStatusSnapshot {
-        AdminStatusSnapshot(dict: [
+    private func adminSnapshot(
+        signedIn: Bool? = nil,
+        health: String = ""
+    ) -> AdminStatusSnapshot {
+        var dict: [String: Any] = [
             "router_boot_id": "boot-a",
             "active_generation": 1,
             "active_config_hash": "sha256:active",
@@ -558,12 +1179,48 @@ final class ModelCatalogTests: XCTestCase {
             "capabilities": ["global_routing"],
             "global_routing_enabled": true,
             "clients": [],
-        ])
+        ]
+        if let signedIn {
+            dict["auth"] = [
+                "signed_in": signedIn,
+                "health": health,
+            ]
+        }
+        return AdminStatusSnapshot(dict: dict)
+    }
+
+    private func routingClient(name: String) -> ClientStatus {
+        ClientStatus(dict: [
+            "name": name,
+            "enabled": true,
+            "subagent_model": "old-alias",
+            "subagent_routing": "baseten",
+            "unmatched_native_model": [
+                "configured_target": "old-alias",
+                "effective_route": "baseten",
+                "effective_model": "vendor/old",
+            ],
+            "families": [[
+                "family": "fable",
+                "configured_target": "old-alias",
+                "configured_source": "explicit",
+                "effective_route": "baseten",
+                "effective_model": "vendor/old",
+            ]],
+            "model_catalog": [[
+                "label": "Configured Old",
+                "storage_target": "old-alias",
+                "slug": "vendor/old",
+                "alias": "old-alias",
+                "available": true,
+            ]],
+        ])!
     }
 
     @MainActor
     private func makeState(
         adminReader: (any AdminStatusReading)? = nil,
+        authReloader: (any AuthReloading)? = nil,
         modelCatalogReader: any ModelCatalogReading
     ) -> BasetenSwitchState {
         BasetenSwitchState(
@@ -572,6 +1229,7 @@ final class ModelCatalogTests: XCTestCase {
                 environment: [:]),
             reader: adminReader ?? FixedModelCatalogAdminReader(
                 snapshot: adminSnapshot()),
+            authReloader: authReloader,
             modelCatalogReader: modelCatalogReader,
             loginItemService: ModelCatalogLoginItemService(),
             startPolling: false)

@@ -36,6 +36,7 @@ import (
 	"github.com/basetenlabs/baseten-switch/gateway/internal/responsescompat"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/sanitize"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/telemetry"
+	"github.com/basetenlabs/baseten-switch/gateway/internal/tracecapture"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/translate"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/usage"
 )
@@ -63,6 +64,8 @@ type Config struct {
 	TelemetryDir           string
 	TelemetryEnabled       *bool
 	TelemetryRetentionDays int
+	TraceCapture           config.ResolvedTraceCapture
+	TraceDir               string
 	PidFile                string
 	BasetenURL             string
 	AnthropicURL           string
@@ -491,6 +494,28 @@ type Gateway struct {
 	telemetryLastDir       string
 	telemetryStopped       bool
 
+	// traceMu owns the explicitly enabled, high-sensitivity content writer,
+	// policy generation, and decoded-body memory budget. It is independent of
+	// metadata telemetry and remains completely dormant while disabled.
+	traceMu               sync.Mutex
+	traceOpenMu           sync.Mutex
+	traceWriter           *tracecapture.Writer
+	traceCorrelationKey   *tracecapture.CorrelationKey
+	traceCorrelationErr   string
+	tracePolicy           config.ResolvedTraceCapture
+	traceDir              string
+	traceGeneration       uint64
+	traceWriterTransition uint64
+	traceReservedBytes    int64
+	traceInFlight         int
+	traceCaptures         map[*traceRequestCapture]struct{}
+	traceStopped          bool
+	traceClosing          bool
+	traceLastStatus       tracecapture.Status
+	traceBodyOmissions    map[string]uint64
+	traceJanitorStop      chan struct{}
+	traceJanitorStopOnce  sync.Once
+
 	// Admin listener: lives for the entire gateway lifetime; never
 	// re-bound on SIGHUP.
 	adminListener net.Listener
@@ -577,6 +602,15 @@ type Gateway struct {
 	fallbackMu    sync.Mutex
 	fallbackUntil map[string]time.Time
 
+	// authUnavailableFallbackCount and its last-occurrence fields make the
+	// otherwise successful auth_unavailable fallback visible in admin status.
+	// The count is process-local, so it naturally represents this gateway boot.
+	authUnavailableFallbackCount  uint64
+	authUnavailableFallbackMu     sync.RWMutex
+	authUnavailableFallbackAt     time.Time
+	authUnavailableFallbackClient string
+	authUnavailableFallbackRoute  string
+
 	// Active routing snapshot. Admin status reads this exact accepted
 	// configuration instead of independently parsing gateway.yaml.
 	stateMu          sync.RWMutex
@@ -617,6 +651,7 @@ func New(cfg Config, p *pricing.Pricing, adminListener net.Listener, resolved []
 		if loaded, err := loadResolvedConfigSnapshot(&cfgForLoad); err == nil &&
 			sameResolvedClients(loaded.clients, resolved) {
 			snapshot = loaded
+			cfg = cfgForLoad
 		}
 	}
 	return newGatewayWithSnapshot(cfg, p, adminListener, resolved, snapshot)
@@ -640,6 +675,7 @@ func newGatewayWithSnapshot(
 		authTickStop:         make(chan struct{}),
 		authTickDone:         make(chan struct{}),
 		authTickKick:         make(chan struct{}, 1),
+		traceJanitorStop:     make(chan struct{}),
 		catalogRefresh:       newCatalogRefreshManager(),
 		publicCatalogRefresh: newPublicCatalogRefreshManager(),
 		routerBootID:         newRouterBootID(),
@@ -667,6 +703,15 @@ func newGatewayWithSnapshot(
 			return nil, fmt.Errorf("bind client %q at %s: %w", spec.displayName(), spec.addr, err)
 		}
 		prepared = append(prepared, lg)
+	}
+	if err := g.initializeTraceCapture(cfg); err != nil {
+		for _, candidate := range prepared {
+			_ = candidate.listener.Close()
+		}
+		if g.adminServer != nil {
+			_ = g.adminServer.Close()
+		}
+		return nil, fmt.Errorf("initialize trace capture: %w", err)
 	}
 	g.mu.Lock()
 	for _, lg := range prepared {
@@ -808,15 +853,49 @@ func (g *Gateway) shutdownAllClients() {
 }
 
 func (g *Gateway) refreshAuth() {
+	g.reloadMu.Lock()
+	defer g.reloadMu.Unlock()
+	g.refreshAuthLocked()
+}
+
+// refreshAuthLocked reloads the selected CLI credential while reloadMu is
+// held. Config reload and explicit auth reload both use this path so an auth
+// client built for an old profile cannot publish after a newer runtime config.
+// Credential-store and Keychain reads happen outside authMu, keeping status
+// reads and in-flight request auth selection responsive while the load runs.
+// Publishing preserves the existing nonblocking catalog-refresh kick.
+func (g *Gateway) refreshAuthLocked() {
 	cfg := g.runtimeConfig()
 	g.authMu.Lock()
-	defer g.authMu.Unlock()
-	// Each build is a new lineage: outcomes from clients built before
-	// this swap are stale and noteAuthRefresh drops them by generation.
-	g.authGen++
-	gen := g.authGen
+	previousGen := g.authGen
+	gen := previousGen + 1
+	g.authMu.Unlock()
+
 	notify := func(fp string, err error) { g.noteAuthRefresh(gen, fp, err) }
-	client, tick, credFP, err := auth.HTTPClientWithNotify(context.Background(), cfg.OAuthProfile, cfg.OAuthHost, notify)
+	client, tick, credFP, err := auth.HTTPClientWithNotifyDetailed(context.Background(), cfg.OAuthProfile, cfg.OAuthHost, notify)
+	storeFailure := ""
+	switch {
+	case errors.Is(err, auth.ErrStoreUnreadable):
+		storeFailure = "unreadable"
+	case errors.Is(err, auth.ErrStoreMalformed):
+		storeFailure = "malformed"
+	}
+	if storeFailure != "" {
+		fmt.Fprintf(os.Stderr, "[gateway] auth: credential store %s; preserving current auth: %v\n", storeFailure, err)
+		return
+	}
+
+	g.authMu.Lock()
+	defer g.authMu.Unlock()
+	if previousGen != g.authGen {
+		return
+	}
+	// Publishing a successfully resolved credential starts a new lineage.
+	// Outcomes from clients built before this swap are stale and
+	// noteAuthRefresh drops them by generation. A classified store failure
+	// returns above without invalidating the client that remains in use.
+	g.authGen = gen
+	previousStoreFP := g.authStoreFP
 	g.cliProfileAPIKey = ""
 	g.authStoreFP = ""
 	switch {
@@ -840,18 +919,30 @@ func (g *Gateway) refreshAuth() {
 			g.cliProfileAPIKey = strings.TrimSpace(apiKeyProfile.Key)
 			g.authStoreFP = apiKeyStoreFingerprint(apiKeyProfile.Profile, g.cliProfileAPIKey)
 		}
-		// API-key profiles have no OAuth refresh lineage. Do not carry
-		// OAuth-only health state across a profile transition.
-		g.authDead = false
-		g.authDeadFP = ""
-		g.authLastErr = ""
-		g.authLastErrAt = time.Time{}
-		g.authLastOKAt = time.Time{}
 	default:
 		g.oauthClient = nil
 		g.authTick = nil
 		g.oauthProfileErr = err
 		fmt.Fprintf(os.Stderr, "[gateway] auth refresh failed: %v\n", err)
+	}
+	credentialChanged := previousStoreFP != g.authStoreFP
+	if credentialChanged {
+		// Health belongs to one credential identity. Login, logout, profile
+		// replacement, and auth-type transitions must not inherit a prior
+		// OAuth failure or success timestamp.
+		g.authDead = false
+		g.authDeadFP = ""
+		g.authLastErr = ""
+		g.authLastErrAt = time.Time{}
+		g.authLastOKAt = time.Time{}
+
+		// Cached identity also belongs to the credential that fetched it.
+		// Clearing on the same store identity transition prevents status from
+		// showing the previous account for up to the cache TTL.
+		g.emailMu.Lock()
+		g.emailCached = ""
+		g.emailFetchedAt = time.Time{}
+		g.emailMu.Unlock()
 	}
 	// Re-login detection: if the credential was marked dead but the
 	// store now holds a DIFFERENT refresh token than the one that died
@@ -1811,15 +1902,28 @@ func (g *Gateway) forwardMessages(cl *clientListener, w http.ResponseWriter, r *
 		g.rejectCrossShape(w)
 		return
 	}
-	if rt == "monitor" {
-		g.monitorStubAnthropic(cl, w, r)
-		return
-	}
+	traceAdmission := g.traceAdmissionGeneration(cl)
 	start := time.Now()
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		g.reject(w, 400, "could not read request body")
 		return
+	}
+	if rt == "monitor" {
+		g.monitorStubAnthropic(cl, w, body, nil, start)
+		return
+	}
+	trace := g.beginTraceCaptureAtGeneration(
+		cl,
+		r,
+		start,
+		body,
+		tracecapture.APIKindMessages,
+		traceAdmission,
+	)
+	if trace != nil {
+		w = newTraceResponseWriter(w, trace)
+		defer trace.finalizeDefault()
 	}
 	requestedReasoning := reasoning.InspectAnthropicMessages(body)
 	// History repair for anthropic-shape upstreams: harnesses replay
@@ -1853,7 +1957,7 @@ func (g *Gateway) forwardMessages(cl *clientListener, w http.ResponseWriter, r *
 	if !isStream && strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
 		isStream = true
 	}
-	g.streamForward(cl, w, r, attempts, isStream, start)
+	g.streamForward(cl, w, r, attempts, isStream, start, trace)
 }
 
 // forwardChatCompletions handles openai-shape POST /v1/chat/completions.
@@ -1863,15 +1967,28 @@ func (g *Gateway) forwardChatCompletions(cl *clientListener, w http.ResponseWrit
 		g.rejectCrossShape(w)
 		return
 	}
-	if rt == "monitor" {
-		g.monitorStubOpenAI(cl, w, r)
-		return
-	}
+	traceAdmission := g.traceAdmissionGeneration(cl)
 	start := time.Now()
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		g.reject(w, 400, "could not read request body")
 		return
+	}
+	if rt == "monitor" {
+		g.monitorStubOpenAI(cl, w, body, nil, start)
+		return
+	}
+	trace := g.beginTraceCaptureAtGeneration(
+		cl,
+		r,
+		start,
+		body,
+		tracecapture.APIKindChatCompletions,
+		traceAdmission,
+	)
+	if trace != nil {
+		w = newTraceResponseWriter(w, trace)
+		defer trace.finalizeDefault()
 	}
 	attempts, err := g.resolveAttempts(cl, r, body, "chat")
 	if err != nil {
@@ -1887,7 +2004,7 @@ func (g *Gateway) forwardChatCompletions(cl *clientListener, w http.ResponseWrit
 	if !isStream && strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
 		isStream = true
 	}
-	g.streamForward(cl, w, r, attempts, isStream, start)
+	g.streamForward(cl, w, r, attempts, isStream, start, trace)
 }
 
 // forwardResponses handles openai-shape POST /v1/responses (the
@@ -1902,15 +2019,28 @@ func (g *Gateway) forwardResponses(cl *clientListener, w http.ResponseWriter, r 
 		g.rejectCrossShape(w)
 		return
 	}
-	if rt == "monitor" {
-		g.monitorStubOpenAIResponses(cl, w, r)
-		return
-	}
+	traceAdmission := g.traceAdmissionGeneration(cl)
 	start := time.Now()
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		g.reject(w, 400, "could not read request body")
 		return
+	}
+	if rt == "monitor" {
+		g.monitorStubOpenAIResponses(cl, w, body, nil, start)
+		return
+	}
+	trace := g.beginTraceCaptureAtGeneration(
+		cl,
+		r,
+		start,
+		body,
+		tracecapture.APIKindResponses,
+		traceAdmission,
+	)
+	if trace != nil {
+		w = newTraceResponseWriter(w, trace)
+		defer trace.finalizeDefault()
 	}
 	attempts, err := g.resolveAttempts(cl, r, body, "responses")
 	if err != nil {
@@ -1926,7 +2056,7 @@ func (g *Gateway) forwardResponses(cl *clientListener, w http.ResponseWriter, r 
 	if !isStream && strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
 		isStream = true
 	}
-	g.streamForward(cl, w, r, attempts, isStream, start)
+	g.streamForward(cl, w, r, attempts, isStream, start, trace)
 }
 
 // upstreamAttempt bundles everything needed to try one upstream for a
@@ -1961,6 +2091,16 @@ type upstreamAttempt struct {
 	// before it is sent. The served attempt supplies the event's actual cost.
 	telemetryRequest *telemetryRequestCaptureV1
 	telemetryAttempt telemetryAttemptCaptureV1
+	// traceCapture is shared by every attempt in one logical request. Only the
+	// attempt that produces the client-visible terminal response finalizes it.
+	traceCapture *traceRequestCapture
+	// traceGatewayOutcome marks a locally generated terminal response (for
+	// example monitor mode) even when metadata telemetry models it as a normal
+	// local attempt.
+	traceGatewayOutcome bool
+	// primaryAttempted records whether the configured primary request crossed
+	// the transport dispatch boundary. It is distinct from selecting a route.
+	primaryAttempted bool
 	fallbackCount    int
 	// translate: the request body has been converted from the anthropic
 	// shape to openai chat.completions, and the response must be
@@ -2122,6 +2262,30 @@ func (g *Gateway) tripFallback(name string) {
 		g.fallbackUntil = map[string]time.Time{}
 	}
 	g.fallbackUntil[name] = time.Now().Add(fallbackCooldown)
+}
+
+const authUnavailableFallbackHeader = "X-Baseten-Switch-Fallback"
+
+// noteAuthUnavailableFallback marks a response served by a configured native
+// fallback because the Baseten primary had no usable credential. This remains
+// an allowed fallback, but callers and local operators can now distinguish it
+// from a response served by the configured primary.
+func (g *Gateway) noteAuthUnavailableFallback(
+	w http.ResponseWriter,
+	cl *clientListener,
+	at upstreamAttempt,
+) {
+	if at.fallbackTrigger != fallbackTriggerAuthUnavailable {
+		return
+	}
+	g.authUnavailableFallbackMu.Lock()
+	now := time.Now().UTC()
+	g.authUnavailableFallbackCount++
+	g.authUnavailableFallbackAt = now
+	g.authUnavailableFallbackClient = cl.cfg.Name
+	g.authUnavailableFallbackRoute = at.route
+	g.authUnavailableFallbackMu.Unlock()
+	w.Header().Set(authUnavailableFallbackHeader, fallbackTriggerAuthUnavailable)
 }
 
 // errNeedsLogin marks an attempt whose route has no usable credentials
@@ -2996,20 +3160,43 @@ func ExpectedPrimaryRoute(c config.Client, globalRoutingEnabled bool, requestedI
 // choice, which has no fallback) surfaces as a 504 naming the model
 // and the deadline. Once the first response byte has arrived the
 // deadline is inert: a live stream is never truncated.
-func (g *Gateway) streamForward(cl *clientListener, w http.ResponseWriter, r *http.Request, attempts []upstreamAttempt, isStream bool, start time.Time) {
+func (g *Gateway) streamForward(
+	cl *clientListener,
+	w http.ResponseWriter,
+	r *http.Request,
+	attempts []upstreamAttempt,
+	isStream bool,
+	start time.Time,
+	trace *traceRequestCapture,
+) {
 	pricingSnapshot := attempts[0].catalogSnapshot
 	if pricingSnapshot == nil {
 		pricingSnapshot = g.pricing.Capture()
 	}
-	requestCapture, captureErr := captureTelemetryRequestProfileV1(
-		pricingSnapshot,
-		start,
-		cl.cfg.Name,
-		cl.cfg.Route,
-		cl.cfg.ProtocolShape,
-		attempts[0].telRequestedModel(),
-		attempts[0].requestProfile,
-	)
+	var requestCapture telemetryRequestCaptureV1
+	var captureErr error
+	if trace != nil {
+		requestCapture, captureErr = captureTelemetryRequestProfileWithEventIDV1(
+			pricingSnapshot,
+			start,
+			cl.cfg.Name,
+			cl.cfg.Route,
+			cl.cfg.ProtocolShape,
+			attempts[0].telRequestedModel(),
+			attempts[0].requestProfile,
+			trace.eventID,
+		)
+	} else {
+		requestCapture, captureErr = captureTelemetryRequestProfileV1(
+			pricingSnapshot,
+			start,
+			cl.cfg.Name,
+			cl.cfg.Route,
+			cl.cfg.ProtocolShape,
+			attempts[0].telRequestedModel(),
+			attempts[0].requestProfile,
+		)
+	}
 	if captureErr != nil {
 		fmt.Fprintf(os.Stderr, "[gateway] telemetry capture failed: %v\n", captureErr)
 	} else {
@@ -3019,9 +3206,15 @@ func (g *Gateway) streamForward(cl *clientListener, w http.ResponseWriter, r *ht
 		requestCapture.primaryReasoning = attempts[0].telemetryAttempt.reasoning
 		for i := range attempts {
 			attempts[i].telemetryRequest = &requestCapture
+			attempts[i].traceCapture = trace
 		}
 		if !requestCapture.nativeQuote.Priced {
 			g.kickPublicCatalogRefresh()
+		}
+	}
+	if captureErr != nil {
+		for i := range attempts {
+			attempts[i].traceCapture = trace
 		}
 	}
 	for _, candidate := range attempts {
@@ -3107,6 +3300,7 @@ attemptLoop:
 				ttftDeadline,
 			)
 			attemptDispatched = attemptDispatched || dispatched
+			at.primaryAttempted = attemptDispatched
 			if ttftExpired || err != nil {
 				watch.stop()
 				watch.cancel()
@@ -3316,6 +3510,8 @@ attemptLoop:
 		break
 	}
 	res := at.res
+	resp.Header.Del(authUnavailableFallbackHeader)
+	g.noteAuthUnavailableFallback(w, cl, at)
 	defer resp.Body.Close()
 
 	if at.translate {
@@ -3786,9 +3982,13 @@ func (g *Gateway) relayTranslated(cl *clientListener, w http.ResponseWriter, res
 
 // monitorStubAnthropic returns a 200 Anthropic-shape stub message
 // echoing the request model and records a telemetry row.
-func (g *Gateway) monitorStubAnthropic(cl *clientListener, w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	body, _ := io.ReadAll(r.Body)
+func (g *Gateway) monitorStubAnthropic(
+	cl *clientListener,
+	w http.ResponseWriter,
+	body []byte,
+	trace *traceRequestCapture,
+	start time.Time,
+) {
 	requested := ""
 	if res := proxy.RewriteModelInBody(body, ""); res.Parsed {
 		requested = res.RequestedModel
@@ -3808,7 +4008,7 @@ func (g *Gateway) monitorStubAnthropic(cl *clientListener, w http.ResponseWriter
 	h.Set("Content-Length", itoa(len(out)))
 	w.WriteHeader(200)
 	_, _ = w.Write(out)
-	if at, ok := g.captureLocalTelemetryAttemptV1(cl, start, requested); ok {
+	if at, ok := g.captureLocalTelemetryAttemptV1(cl, start, requested, trace); ok {
 		status := 200
 		stopReason := "end_turn"
 		g.recordTelemetryV1(cl, at, telemetryCompletionV1{
@@ -3829,9 +4029,13 @@ func (g *Gateway) monitorStubAnthropic(cl *clientListener, w http.ResponseWriter
 
 // monitorStubOpenAI returns a 200 OpenAI-shape stub chat completion
 // echoing the request model and records a telemetry row.
-func (g *Gateway) monitorStubOpenAI(cl *clientListener, w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	body, _ := io.ReadAll(r.Body)
+func (g *Gateway) monitorStubOpenAI(
+	cl *clientListener,
+	w http.ResponseWriter,
+	body []byte,
+	trace *traceRequestCapture,
+	start time.Time,
+) {
 	requested := ""
 	if res := proxy.RewriteModelInBody(body, ""); res.Parsed {
 		requested = res.RequestedModel
@@ -3849,7 +4053,7 @@ func (g *Gateway) monitorStubOpenAI(cl *clientListener, w http.ResponseWriter, r
 	h.Set("Content-Length", itoa(len(out)))
 	w.WriteHeader(200)
 	_, _ = w.Write(out)
-	if at, ok := g.captureLocalTelemetryAttemptV1(cl, start, requested); ok {
+	if at, ok := g.captureLocalTelemetryAttemptV1(cl, start, requested, trace); ok {
 		status := 200
 		stopReason := "stop"
 		g.recordTelemetryV1(cl, at, telemetryCompletionV1{
@@ -3873,9 +4077,13 @@ func (g *Gateway) monitorStubOpenAI(cl *clientListener, w http.ResponseWriter, r
 // Minimal valid-ish Responses API body: codex clients only need a
 // completed status and an output array; the monitor route is
 // local-echo only.
-func (g *Gateway) monitorStubOpenAIResponses(cl *clientListener, w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	body, _ := io.ReadAll(r.Body)
+func (g *Gateway) monitorStubOpenAIResponses(
+	cl *clientListener,
+	w http.ResponseWriter,
+	body []byte,
+	trace *traceRequestCapture,
+	start time.Time,
+) {
 	requested := ""
 	if res := proxy.RewriteModelInBody(body, ""); res.Parsed {
 		requested = res.RequestedModel
@@ -3893,7 +4101,7 @@ func (g *Gateway) monitorStubOpenAIResponses(cl *clientListener, w http.Response
 	h.Set("Content-Length", itoa(len(out)))
 	w.WriteHeader(200)
 	_, _ = w.Write(out)
-	if at, ok := g.captureLocalTelemetryAttemptV1(cl, start, requested); ok {
+	if at, ok := g.captureLocalTelemetryAttemptV1(cl, start, requested, trace); ok {
 		status := 200
 		stopReason := "stop"
 		g.recordTelemetryV1(cl, at, telemetryCompletionV1{
@@ -3916,6 +4124,8 @@ func (g *Gateway) Serve(ctx context.Context) error {
 	g.ctx = ctx
 	g.wg.Add(1)
 	go g.runAuthTick(ctx)
+	g.wg.Add(1)
+	go g.runTraceJanitor(ctx)
 	errCh := make(chan error, 2)
 	go func() { errCh <- g.adminServer.Serve(g.adminListener) }()
 	for _, lg := range g.snapshotGroups() {
@@ -3970,6 +4180,9 @@ func (g *Gateway) snapshotGroups() []*listenerGroup {
 
 func (g *Gateway) Shutdown(ctx context.Context) error {
 	g.authTickStopOnce.Do(func() { close(g.authTickStop) })
+	if g.traceJanitorStop != nil {
+		g.traceJanitorStopOnce.Do(func() { close(g.traceJanitorStop) })
+	}
 	g.stopCatalogRefresh()
 	g.stopPublicCatalogRefresh()
 	var firstErr error
@@ -3988,6 +4201,9 @@ func (g *Gateway) Shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 	}
 	if err := g.closeTelemetryWriter(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := g.closeTraceCapture(ctx); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	return firstErr
@@ -4041,6 +4257,16 @@ func loadResolvedClientsInto(cfg *Config, f *config.File, path string) ([]resolv
 	} else if cfg.TelemetryRetentionDays <= 0 {
 		cfg.TelemetryRetentionDays = config.DefaultTelemetryRetentionDays
 	}
+	tracePolicy, err := config.ResolveTraceCapture(f)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	traceDir, err := resolveTraceDirectory(path)
+	if err != nil {
+		return nil, fmt.Errorf("%s: resolve trace directory: %w", path, err)
+	}
+	cfg.TraceCapture = tracePolicy
+	cfg.TraceDir = traceDir
 	resolved, err := resolveFromFile(f)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
@@ -4430,6 +4656,16 @@ func (g *Gateway) reloadConfig() {
 		}
 		prepared[spec.key] = lg
 	}
+	preparedTraceWriter, preparedTraceKey, preparedTraceCorrelationErr, err := g.prepareTraceEnable(candidateCfg)
+	if err != nil {
+		for _, candidate := range prepared {
+			_ = candidate.listener.Close()
+		}
+		err = fmt.Errorf("enable trace capture: %s", traceCaptureErrorCode(err))
+		g.noteReloadError(err)
+		fmt.Fprintf(os.Stderr, "[gateway] config reload failed: %v; keeping current listeners\n", err)
+		return
+	}
 
 	// Apply validated auth/environment values only after topology preparation
 	// succeeds, so a rejected reload cannot partially mutate runtime config.
@@ -4488,9 +4724,11 @@ func (g *Gateway) reloadConfig() {
 	}
 	g.mu.Unlock()
 	g.setRuntimeConfig(candidateCfg)
+	g.installPreparedTraceEnable(candidateCfg, preparedTraceWriter, preparedTraceKey, preparedTraceCorrelationErr)
 	g.activateConfigSnapshot(activeFile, activeRaw)
 	g.routingMu.Unlock()
 	g.reconcileTelemetryWriter(candidateCfg)
+	g.reconcileTraceCapture(candidateCfg)
 
 	for _, lg := range added {
 		go func(lg *listenerGroup) {
@@ -4513,7 +4751,7 @@ func (g *Gateway) reloadConfig() {
 		}(lg)
 	}
 
-	g.refreshAuth()
+	g.refreshAuthLocked()
 	runtimeCfg := g.runtimeConfig()
 	runPreflight(&runtimeCfg, desired, os.Stderr)
 }

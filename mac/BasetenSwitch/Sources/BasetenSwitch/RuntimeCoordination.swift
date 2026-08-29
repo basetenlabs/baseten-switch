@@ -53,6 +53,25 @@ struct RoutingTokenAcceptance: Equatable, Sendable {
     }
 }
 
+/// Accepts poll responses in request order before applying routing-token
+/// ordering. Equal routing tokens cannot make a late older request current.
+struct PollEventAcceptance: Equatable, Sendable {
+    private(set) var latestRequestID: UInt64 = 0
+    private var routingTokens = RoutingTokenAcceptance()
+
+    mutating func accept(
+        requestID: UInt64,
+        token: RoutingToken?
+    ) -> Bool {
+        guard requestID >= latestRequestID else { return false }
+        latestRequestID = requestID
+        if let token, !routingTokens.accept(token) {
+            return false
+        }
+        return true
+    }
+}
+
 actor PollCoordinator {
     typealias Handler = @MainActor @Sendable (PollEvent) -> Void
 
@@ -60,8 +79,20 @@ actor PollCoordinator {
     private let clock: any RuntimeClock
     private let interval: TimeInterval
     private var loop: Task<Void, Never>?
-    private var inFlight: Task<Result<AdminStatusSnapshot, GatewayClientError>, Never>?
-    private var acceptance = RoutingTokenAcceptance()
+    private struct InFlightStatusRequest {
+        let id: UInt64
+        let task: Task<
+            Result<AdminStatusSnapshot, GatewayClientError>, Never>
+    }
+
+    private struct StatusRequestResult {
+        let id: UInt64
+        let result: Result<AdminStatusSnapshot, GatewayClientError>
+    }
+
+    private var inFlight: InFlightStatusRequest?
+    private var nextRequestID: UInt64 = 0
+    private var acceptance = PollEventAcceptance()
 
     init(reader: any AdminStatusReading,
          clock: any RuntimeClock,
@@ -90,31 +121,63 @@ actor PollCoordinator {
     func stop() {
         loop?.cancel()
         loop = nil
-        inFlight?.cancel()
+        inFlight?.task.cancel()
         inFlight = nil
     }
 
     func refresh() async -> PollEvent {
         let result = await fetchSingleFlight()
-        switch result {
+        return event(for: result)
+    }
+
+    /// Waits out any status request that existed at the call boundary, then
+    /// returns a snapshot from a request that began afterward. This provides
+    /// the read barrier needed after a local admin mutation.
+    func refreshFresh() async -> PollEvent {
+        if let pending = inFlight {
+            _ = await pending.task.value
+            if inFlight?.id == pending.id {
+                inFlight = nil
+            }
+        }
+        return event(for: await fetchSingleFlight())
+    }
+
+    private func event(
+        for request: StatusRequestResult
+    ) -> PollEvent {
+        switch request.result {
         case .success(let status):
-            guard acceptance.accept(status.token) else {
+            guard acceptance.accept(
+                requestID: request.id,
+                token: status.token
+            ) else {
                 return .ignoredStaleToken
             }
             return .snapshot(RoutingSnapshot(
                 status: status,
                 observedAt: clock.now))
         case .failure:
+            guard acceptance.accept(
+                requestID: request.id,
+                token: nil
+            ) else {
+                return .ignoredStaleToken
+            }
             return .unavailable(observedAt: clock.now)
         }
     }
 
     private func fetchSingleFlight()
-        async -> Result<AdminStatusSnapshot, GatewayClientError> {
+        async -> StatusRequestResult {
         if let inFlight {
-            return await inFlight.value
+            return StatusRequestResult(
+                id: inFlight.id,
+                result: await inFlight.task.value)
         }
         let reader = self.reader
+        nextRequestID &+= 1
+        let requestID = nextRequestID
         let task = Task<Result<AdminStatusSnapshot, GatewayClientError>, Never> {
             do {
                 return .success(try await reader.fetchStatus())
@@ -124,10 +187,12 @@ actor PollCoordinator {
                 return .failure(.invalidPayload)
             }
         }
-        inFlight = task
+        inFlight = InFlightStatusRequest(id: requestID, task: task)
         let result = await task.value
-        inFlight = nil
-        return result
+        if inFlight?.id == requestID {
+            inFlight = nil
+        }
+        return StatusRequestResult(id: requestID, result: result)
     }
 }
 

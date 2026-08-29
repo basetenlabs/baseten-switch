@@ -135,6 +135,36 @@ func captureTelemetryRequestProfileV1(
 	if err != nil {
 		return telemetryRequestCaptureV1{}, err
 	}
+	return captureTelemetryRequestProfileWithEventIDV1(
+		snapshot,
+		startedAt,
+		client,
+		configuredRoute,
+		protocolShape,
+		requestedModel,
+		profile,
+		eventID,
+	)
+}
+
+// captureTelemetryRequestProfileWithEventIDV1 binds telemetry to an event ID
+// created at logical request admission. Trace capture uses this entry point so
+// content and metadata stores share one exact join key. Callers that do not
+// capture content continue to use captureTelemetryRequestProfileV1, which
+// generates the identifier as before.
+func captureTelemetryRequestProfileWithEventIDV1(
+	snapshot *pricing.Snapshot,
+	startedAt time.Time,
+	client string,
+	configuredRoute string,
+	protocolShape string,
+	requestedModel string,
+	profile requestprofile.Profile,
+	eventID string,
+) (telemetryRequestCaptureV1, error) {
+	if len(eventID) != 32 {
+		return telemetryRequestCaptureV1{}, fmt.Errorf("telemetry event id has invalid length")
+	}
 	canonicalModel := profile.CanonicalModel
 	if canonicalModel == "" {
 		canonicalModel = normalizeModelID(requestedModel)
@@ -766,24 +796,43 @@ func (g *Gateway) captureLocalTelemetryAttemptV1(
 	cl *clientListener,
 	startedAt time.Time,
 	requestedModel string,
+	trace *traceRequestCapture,
 ) (upstreamAttempt, bool) {
 	snapshot := g.pricing.Capture()
-	request, err := captureTelemetryRequestV1(
-		snapshot,
-		startedAt,
-		cl.cfg.Name,
-		cl.cfg.Route,
-		cl.cfg.ProtocolShape,
-		requestedModel,
-	)
+	var request telemetryRequestCaptureV1
+	var err error
+	if trace != nil {
+		request, err = captureTelemetryRequestProfileWithEventIDV1(
+			snapshot,
+			startedAt,
+			cl.cfg.Name,
+			cl.cfg.Route,
+			cl.cfg.ProtocolShape,
+			requestedModel,
+			requestprofile.Profile{},
+			trace.eventID,
+		)
+	} else {
+		request, err = captureTelemetryRequestV1(
+			snapshot,
+			startedAt,
+			cl.cfg.Name,
+			cl.cfg.Route,
+			cl.cfg.ProtocolShape,
+			requestedModel,
+		)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[gateway] telemetry capture failed: %v\n", err)
 		return upstreamAttempt{}, false
 	}
 	attempt := upstreamAttempt{
-		route:            cl.cfg.Route,
-		modelForCost:     requestedModel,
-		telemetryRequest: &request,
+		route:               cl.cfg.Route,
+		modelForCost:        requestedModel,
+		telemetryRequest:    &request,
+		traceCapture:        trace,
+		traceGatewayOutcome: cl.cfg.Route == "monitor",
+		primaryAttempted:    true,
 		telemetryAttempt: captureTelemetryAttemptV1(
 			snapshot,
 			startedAt,
@@ -801,10 +850,6 @@ func (g *Gateway) recordTelemetryV1(
 	at upstreamAttempt,
 	completion telemetryCompletionV1,
 ) {
-	if at.telemetryRequest == nil {
-		fmt.Fprintln(os.Stderr, "[gateway] telemetry event skipped: missing request capture")
-		return
-	}
 	completion.fallbackCount = at.fallbackCount
 	if completion.fallbackTrigger == nil && at.fallbackTrigger != "" {
 		completion.fallbackTrigger = stringPointer(at.fallbackTrigger)
@@ -826,6 +871,11 @@ func (g *Gateway) recordTelemetryV1(
 		at.responsesCompatibility != nil {
 		completion.responsesCompatibility =
 			at.responsesCompatibility.telemetry()
+	}
+	g.finalizeTraceV1(cl, at, completion)
+	if at.telemetryRequest == nil {
+		fmt.Fprintln(os.Stderr, "[gateway] telemetry event skipped: missing request capture")
+		return
 	}
 	event, err := at.telemetryRequest.event(at.telemetryAttempt, completion)
 	if err != nil {
