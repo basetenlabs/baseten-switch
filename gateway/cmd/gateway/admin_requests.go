@@ -24,21 +24,22 @@ const (
 var adminRequestsNow = time.Now
 
 type adminRequestRow struct {
-	EventID              string                      `json:"event_id"`
-	CompletedAt          time.Time                   `json:"completed_at"`
-	Client               string                      `json:"client"`
-	ConfiguredRoute      string                      `json:"configured_route"`
-	EffectiveProvider    string                      `json:"effective_provider"`
-	RequestedModel       string                      `json:"requested_model"`
-	RequestedModelFamily string                      `json:"requested_model_family"`
-	ServedModel          string                      `json:"served_model"`
-	Status               *int                        `json:"status"`
-	TerminationReason    telemetry.TerminationReason `json:"termination_reason"`
-	DurationMS           int64                       `json:"duration_ms"`
-	TTFTMS               *int64                      `json:"ttft_ms"`
-	Subagent             bool                        `json:"subagent"`
-	Fallback             telemetry.FallbackV1        `json:"fallback"`
-	Primary              *telemetry.PrimaryV1        `json:"primary,omitempty"`
+	EventID               string                             `json:"event_id"`
+	CompletedAt           time.Time                          `json:"completed_at"`
+	Client                string                             `json:"client"`
+	ConfiguredRoute       string                             `json:"configured_route"`
+	EffectiveProvider     string                             `json:"effective_provider"`
+	RequestedModel        string                             `json:"requested_model"`
+	RequestedModelFamily  string                             `json:"requested_model_family"`
+	ServedModel           string                             `json:"served_model"`
+	Status                *int                               `json:"status"`
+	TerminationReason     telemetry.TerminationReason        `json:"termination_reason"`
+	DurationMS            int64                              `json:"duration_ms"`
+	TTFTMS                *int64                             `json:"ttft_ms"`
+	Subagent              bool                               `json:"subagent"`
+	Fallback              telemetry.FallbackV1               `json:"fallback"`
+	Primary               *telemetry.PrimaryV1               `json:"primary,omitempty"`
+	RequestClassification *telemetry.RequestClassificationV1 `json:"request_classification,omitempty"`
 }
 
 type adminRequestsCoverage struct {
@@ -184,6 +185,9 @@ func projectAdminRequest(event telemetry.EventV1) adminRequestRow {
 		Subagent:             event.Subagent,
 		Fallback:             event.Fallback,
 		Primary:              clonePrimaryV1(event.Primary),
+		RequestClassification: cloneRequestClassificationV1(
+			event.RequestClassification,
+		),
 	}
 }
 

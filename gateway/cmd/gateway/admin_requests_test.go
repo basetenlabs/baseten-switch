@@ -202,6 +202,67 @@ func TestAdminRequestsProjectsFallbackAndNullableFields(t *testing.T) {
 	}
 }
 
+func TestAdminRequestsProjectsAutoClassification(t *testing.T) {
+	now := time.Date(2026, time.August, 26, 12, 0, 0, 0, time.UTC)
+	setAdminRequestsNow(t, now)
+	gateway, dir := newAdminRequestsGateway(t, analytics.IndexOptions{})
+	event := adminRequestsEvent(1, now.Add(-time.Second))
+	event.EffectiveProvider = "anthropic"
+	event.ServedModel = "claude-sonnet-5"
+	event.RequestClassification = &telemetry.RequestClassificationV1{
+		Kind:          telemetry.RequestClassificationKindClaudeAutoPermissionCheck,
+		Detector:      telemetry.RequestClassificationDetectorClaudeAutoV1,
+		RoutingAction: telemetry.RequestClassificationRoutingActionNativeAnthropic,
+	}
+	writeAdminRequestEvents(t, dir, event)
+
+	recorder, response := requestAdminRequests(
+		t,
+		gateway,
+		"/v1/admin/requests",
+		http.MethodGet,
+	)
+	if recorder.Code != http.StatusOK || len(response.Items) != 1 {
+		t.Fatalf("response status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	classification := response.Items[0].RequestClassification
+	if classification == nil ||
+		classification.Kind != telemetry.RequestClassificationKindClaudeAutoPermissionCheck ||
+		classification.Detector != telemetry.RequestClassificationDetectorClaudeAutoV1 ||
+		classification.RoutingAction != telemetry.RequestClassificationRoutingActionNativeAnthropic {
+		t.Fatalf("row classification = %+v", classification)
+	}
+	if !strings.Contains(
+		recorder.Body.String(),
+		`"request_classification":{"kind":"claude_auto_permission_check","detector":"claude_auto_v1","routing_action":"native_anthropic"}`,
+	) {
+		t.Fatalf("classification missing from response: %s", recorder.Body.String())
+	}
+}
+
+func TestAdminRequestsOmitsClassificationForOrdinaryRows(t *testing.T) {
+	now := time.Date(2026, time.August, 26, 12, 0, 0, 0, time.UTC)
+	setAdminRequestsNow(t, now)
+	gateway, dir := newAdminRequestsGateway(t, analytics.IndexOptions{})
+	writeAdminRequestEvents(t, dir, adminRequestsEvent(1, now.Add(-time.Second)))
+
+	recorder, response := requestAdminRequests(
+		t,
+		gateway,
+		"/v1/admin/requests",
+		http.MethodGet,
+	)
+	if recorder.Code != http.StatusOK || len(response.Items) != 1 {
+		t.Fatalf("response status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if response.Items[0].RequestClassification != nil {
+		t.Fatalf("ordinary row classification = %+v", response.Items[0].RequestClassification)
+	}
+	if strings.Contains(recorder.Body.String(), `"request_classification"`) {
+		t.Fatalf("ordinary row emitted request classification: %s", recorder.Body.String())
+	}
+}
+
 func TestAdminRequestsFilters(t *testing.T) {
 	now := time.Date(2026, time.July, 26, 12, 0, 0, 0, time.UTC)
 	setAdminRequestsNow(t, now)

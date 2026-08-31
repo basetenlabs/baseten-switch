@@ -103,6 +103,23 @@ struct RequestPrimaryAttempt: Decodable, Equatable, Sendable {
     }
 }
 
+struct RequestClassification: Decodable, Equatable, Sendable {
+    var kind: String
+    var detector: String
+    var routingAction: String
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case detector
+        case routingAction = "routing_action"
+    }
+
+    var isClaudeAutoPermissionCheck: Bool {
+        kind == "claude_auto_permission_check"
+            && routingAction == "native_anthropic"
+    }
+}
+
 struct RequestItem: Decodable, Equatable, Identifiable, Sendable {
     var eventID: String
     var completedAt: Date
@@ -117,6 +134,7 @@ struct RequestItem: Decodable, Equatable, Identifiable, Sendable {
     var subagent: Bool
     var fallback: RequestFallback?
     var primary: RequestPrimaryAttempt?
+    var requestClassification: RequestClassification?
 
     var id: String { eventID }
 
@@ -151,6 +169,7 @@ struct RequestItem: Decodable, Equatable, Identifiable, Sendable {
         case subagent
         case fallback
         case primary
+        case requestClassification = "request_classification"
     }
 
     init(
@@ -166,7 +185,8 @@ struct RequestItem: Decodable, Equatable, Identifiable, Sendable {
         terminationReason: String?,
         subagent: Bool,
         fallback: RequestFallback?,
-        primary: RequestPrimaryAttempt? = nil
+        primary: RequestPrimaryAttempt? = nil,
+        requestClassification: RequestClassification? = nil
     ) {
         self.eventID = eventID
         self.completedAt = completedAt
@@ -181,6 +201,7 @@ struct RequestItem: Decodable, Equatable, Identifiable, Sendable {
         self.subagent = subagent
         self.fallback = fallback
         self.primary = primary
+        self.requestClassification = requestClassification
     }
 
     init(from decoder: Decoder) throws {
@@ -214,6 +235,9 @@ struct RequestItem: Decodable, Equatable, Identifiable, Sendable {
         primary = try values.decodeIfPresent(
             RequestPrimaryAttempt.self,
             forKey: .primary)
+        requestClassification = try? values.decode(
+            RequestClassification.self,
+            forKey: .requestClassification)
     }
 }
 

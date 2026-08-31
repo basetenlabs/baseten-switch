@@ -97,6 +97,8 @@ final class RequestsTests: XCTestCase {
 
         XCTAssertEqual(snapshot.items.map(\.eventID), [
             "request-newest",
+            "request-auto-success",
+            "request-auto-failed",
             "request-older",
         ])
         XCTAssertEqual(snapshot.nextCursor, "older-page-token")
@@ -117,9 +119,55 @@ final class RequestsTests: XCTestCase {
         XCTAssertEqual(primary.outcome, "image_input_unsupported")
         XCTAssertEqual(primary.status, 400)
         XCTAssertTrue(snapshot.items[0].isFallback)
-        XCTAssertNil(snapshot.items[1].primary)
-        XCTAssertNil(snapshot.items[1].status)
-        XCTAssertTrue(snapshot.items[1].isError)
+        XCTAssertNil(snapshot.items[0].requestClassification)
+        XCTAssertEqual(snapshot.items[1].status, 200)
+        XCTAssertTrue(
+            snapshot.items[1].requestClassification?
+                .isClaudeAutoPermissionCheck == true)
+        XCTAssertFalse(snapshot.items[1].isFallback)
+        XCTAssertEqual(snapshot.items[2].status, 401)
+        XCTAssertTrue(
+            snapshot.items[2].requestClassification?
+                .isClaudeAutoPermissionCheck == true)
+        XCTAssertFalse(snapshot.items[2].isFallback)
+        XCTAssertNil(snapshot.items[3].primary)
+        XCTAssertNil(snapshot.items[3].status)
+        XCTAssertTrue(snapshot.items[3].isError)
+        XCTAssertFalse(
+            snapshot.items[3].requestClassification?
+                .isClaudeAutoPermissionCheck == true)
+    }
+
+    func testClassificationDecodeIsTolerant() throws {
+        let malformed = Data(
+            """
+            {
+              "event_id": "malformed-classification",
+              "completed_at": 1785088860.25,
+              "request_classification": "unexpected"
+            }
+            """.utf8)
+        let incomplete = Data(
+            """
+            {
+              "event_id": "incomplete-classification",
+              "completed_at": 1785088860.25,
+              "request_classification": {
+                "kind": "claude_auto_permission_check",
+                "detector": "claude_auto_v1"
+              }
+            }
+            """.utf8)
+
+        let malformedItem = try JSONDecoder().decode(
+            RequestItem.self,
+            from: malformed)
+        let incompleteItem = try JSONDecoder().decode(
+            RequestItem.self,
+            from: incomplete)
+
+        XCTAssertNil(malformedItem.requestClassification)
+        XCTAssertNil(incompleteItem.requestClassification)
     }
 
     func testFallbackReasonLabelsMakeImageFallbackProminent() {

@@ -32,6 +32,7 @@ import (
 	"github.com/basetenlabs/baseten-switch/gateway/internal/pricing"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/proxy"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/reasoning"
+	"github.com/basetenlabs/baseten-switch/gateway/internal/requestclassification"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/requestprofile"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/responsescompat"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/sanitize"
@@ -1913,6 +1914,14 @@ func (g *Gateway) forwardMessages(cl *clientListener, w http.ResponseWriter, r *
 		g.monitorStubAnthropic(cl, w, body, nil, start)
 		return
 	}
+	classification := requestclassification.ClassifyClaudeMessages(
+		requestclassification.RequestContext{
+			ClaudeListener: cl.cfg.Name == "claude-code",
+			Method:         r.Method,
+			Path:           r.URL.Path,
+		},
+		body,
+	)
 	trace := g.beginTraceCaptureAtGeneration(
 		cl,
 		r,
@@ -1928,9 +1937,10 @@ func (g *Gateway) forwardMessages(cl *clientListener, w http.ResponseWriter, r *
 	requestedReasoning := reasoning.InspectAnthropicMessages(body)
 	// History repair for anthropic-shape upstreams: harnesses replay
 	// prior turns containing empty text blocks and (after a route flip
-	// through an openai-shape provider) tool ids Anthropic rejects.
+	// through an openai-shape provider) tool ids Anthropic rejects. Auto
+	// permission checks must retain their original admitted body.
 	sanitized := false
-	if cl.cfg.SanitizeHistory {
+	if classification == nil && cl.cfg.SanitizeHistory {
 		body, sanitized = sanitize.AnthropicBody(body)
 	}
 	attempts, err := g.resolveAttemptsWithRequestedReasoning(
@@ -1940,6 +1950,7 @@ func (g *Gateway) forwardMessages(cl *clientListener, w http.ResponseWriter, r *
 		"messages",
 		requestedReasoning,
 		true,
+		classification,
 	)
 	if err != nil {
 		if errors.Is(err, errNeedsLogin) {
@@ -2142,6 +2153,9 @@ type upstreamAttempt struct {
 	// stream repair counts, and the telemetry summary. It is present only
 	// for Baseten /v1/responses attempts with configured compatibility work.
 	responsesCompatibility *responsesCompatibilityRequest
+	// requestClassification is set only when gateway-owned compatibility
+	// routing selected this attempt. It contains no request-derived content.
+	requestClassification *requestclassification.Classification
 }
 
 // telRequestedModel returns the model to record as requested_model in
@@ -2669,6 +2683,7 @@ func (g *Gateway) resolveAttempts(cl *clientListener, r *http.Request, body []by
 		kind,
 		requested,
 		observed,
+		nil,
 	)
 }
 
@@ -2679,9 +2694,31 @@ func (g *Gateway) resolveAttemptsWithRequestedReasoning(
 	kind string,
 	requested reasoning.RequestedReasoning,
 	requestedObserved bool,
+	classification *requestclassification.Classification,
 ) ([]upstreamAttempt, error) {
 	snapshot := g.pricing.Capture()
 	profile := requestprofile.Inspect(body)
+	if classification != nil {
+		at, err := g.buildAttemptWithSnapshot(
+			snapshot,
+			requested,
+			requestedObserved,
+			cl,
+			r,
+			body,
+			"anthropic",
+			kind,
+		)
+		if err != nil {
+			return nil, err
+		}
+		at.requestedReasoning = requested
+		at.requestedReasoningObserved = requestedObserved
+		at.requestProfile = profile
+		at.subagent = r.Header.Get(subagentAgentIDHeader) != ""
+		at.requestClassification = classification
+		return []upstreamAttempt{at}, nil
+	}
 	isSubagent := false
 	origRequested := ""
 	subagentModel := ""
@@ -3204,6 +3241,13 @@ func (g *Gateway) streamForward(
 		requestCapture.requestedReasoningObserved =
 			attempts[0].requestedReasoningObserved
 		requestCapture.primaryReasoning = attempts[0].telemetryAttempt.reasoning
+		if classification := attempts[0].requestClassification; classification != nil {
+			requestCapture.setRequestClassificationV1(
+				classification.Kind,
+				classification.Detector,
+				classification.RoutingAction,
+			)
+		}
 		for i := range attempts {
 			attempts[i].telemetryRequest = &requestCapture
 			attempts[i].traceCapture = trace
@@ -3496,15 +3540,21 @@ attemptLoop:
 				cl.cfg.Name, at.route, at.modelForCost, cl.cfg.TTFTTimeout, time.Since(start))
 			g.reject(w, 504, fmt.Sprintf("upstream timeout: model %s sent no first byte within ttft_timeout %s", at.modelForCost, cl.cfg.TTFTTimeout))
 			status := 504
-			trigger := fallbackTriggerTTFT
-			g.recordTelemetryV1(cl, at, telemetryCompletionV1{
-				completedAt:     time.Now(),
-				status:          &status,
-				isStream:        isStream,
-				gatewayFailure:  true,
-				fallbackTrigger: &trigger,
-				requestBytes:    len(res.NewBody),
-			})
+			completion := telemetryCompletionV1{
+				completedAt:    time.Now(),
+				status:         &status,
+				isStream:       isStream,
+				gatewayFailure: true,
+				requestBytes:   len(res.NewBody),
+			}
+			// A terminal timeout is only a fallback trigger for ordinary
+			// routes. A classified Auto request has one mandatory native
+			// attempt and never participates in fallback or cooldown state.
+			if at.requestClassification == nil {
+				trigger := fallbackTriggerTTFT
+				completion.fallbackTrigger = &trigger
+			}
+			g.recordTelemetryV1(cl, at, completion)
 			return
 		}
 		break

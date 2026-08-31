@@ -42,6 +42,7 @@ type telemetryRequestCaptureV1 struct {
 	nativePricingUnsupported bool
 	nativeQuote              pricing.Quote
 	nativeQuoteCapturedAt    time.Time
+	requestClassification    *telemetry.RequestClassificationV1
 }
 
 // telemetryAttemptCaptureV1 is immutable attempt-start state. A fallback
@@ -101,6 +102,24 @@ func (request telemetryRequestCaptureV1) requestedReasoningEffort() *string {
 	}
 	effort := request.requestedReasoning.Effort
 	return &effort
+}
+
+// setRequestClassificationV1 binds the immutable, content-free result from
+// request admission to the logical request's telemetry row. Callers pass only
+// stable classifier metadata, never prompt-derived evidence.
+func (request *telemetryRequestCaptureV1) setRequestClassificationV1(
+	kind string,
+	detector string,
+	routingAction string,
+) {
+	if request == nil {
+		return
+	}
+	request.requestClassification = &telemetry.RequestClassificationV1{
+		Kind:          kind,
+		Detector:      detector,
+		RoutingAction: routingAction,
+	}
 }
 
 func captureTelemetryRequestV1(
@@ -357,6 +376,9 @@ func (request telemetryRequestCaptureV1) event(
 		ResponsesCompatibility: cloneResponsesCompatibilityV1(
 			completion.responsesCompatibility,
 		),
+		RequestClassification: cloneRequestClassificationV1(
+			request.requestClassification,
+		),
 		ToolCalls:    completion.toolCalls,
 		RequestBytes: completion.requestBytes,
 	}
@@ -367,6 +389,16 @@ func (request telemetryRequestCaptureV1) event(
 		return telemetry.EventV1{}, err
 	}
 	return event, nil
+}
+
+func cloneRequestClassificationV1(
+	in *telemetry.RequestClassificationV1,
+) *telemetry.RequestClassificationV1 {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
 }
 
 func clonePrimaryV1(in *telemetry.PrimaryV1) *telemetry.PrimaryV1 {

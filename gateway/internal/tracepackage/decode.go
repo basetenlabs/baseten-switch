@@ -766,8 +766,9 @@ func validateTraceRows(member extractedMember) (map[string]string, error) {
 func validateTelemetryRows(member extractedMember, events map[string]string) (int, error) {
 	seen := make(map[string]struct{})
 	return forEachJSONLine(member, MaxTelemetryLineBytes, func(line []byte) error {
+		// Telemetry schema v1 permits additive optional metadata. Validate the
+		// known contract without rejecting fields added by newer gateways.
 		decoder := json.NewDecoder(bytes.NewReader(line))
-		decoder.DisallowUnknownFields()
 		var event telemetry.EventV1
 		if err := decoder.Decode(&event); err != nil || event.Validate() != nil || event.SchemaVersion != telemetry.SchemaVersionV1 || event.Event != telemetry.EventRequest {
 			return errors.New("trace package decode: invalid telemetry row")

@@ -154,7 +154,11 @@ func TestWriterRecoversPartialFinalLine(t *testing.T) {
 	if err := os.WriteFile(path, content, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	w, err := NewWriter(Config{Dir: dir, RetentionDays: 7})
+	w, err := newWriter(
+		Config{Dir: dir, RetentionDays: 7},
+		defaultWriterLimits(),
+		func() time.Time { return now },
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

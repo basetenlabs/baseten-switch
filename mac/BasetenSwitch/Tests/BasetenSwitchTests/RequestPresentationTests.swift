@@ -94,6 +94,59 @@ final class RequestPresentationTests: XCTestCase {
             "Requests that end in an error will appear here.")
     }
 
+    func testAutoCheckTypeUsesServerKindAndRoutingAction() {
+        var item = requestItem()
+        XCTAssertNil(requestTypeLabel(item))
+        XCTAssertNil(requestTypeDescription(item))
+
+        item.requestClassification = RequestClassification(
+            kind: "claude_auto_permission_check",
+            detector: "claude_auto_v1",
+            routingAction: "native_anthropic")
+
+        XCTAssertEqual(requestTypeLabel(item), "Auto check")
+        XCTAssertEqual(
+            requestTypeDescription(item),
+            "Switch identified this as a Claude Code Auto permission check "
+                + "and routed it to Anthropic.")
+
+        item.requestClassification?.detector = "future_detector"
+        XCTAssertEqual(requestTypeLabel(item), "Auto check")
+        XCTAssertNotNil(requestTypeDescription(item))
+
+        item.requestClassification?.routingAction = "future_action"
+        XCTAssertNil(requestTypeLabel(item))
+        XCTAssertNil(requestTypeDescription(item))
+    }
+
+    func testAutoCheckTypeExplainsAnthropicAuthFailures() {
+        var item = requestItem()
+        item.requestClassification = RequestClassification(
+            kind: "claude_auto_permission_check",
+            detector: "claude_auto_v1",
+            routingAction: "native_anthropic")
+        let unauthorized = "Switch identified this as a Claude Code Auto "
+            + "permission check and routed it to Anthropic. Anthropic "
+            + "rejected the request credentials. Auto checks require a "
+            + "Claude login or Anthropic API key accepted by Anthropic."
+        let forbidden = "Switch identified this as a Claude Code Auto "
+            + "permission check and routed it to Anthropic. Anthropic denied "
+            + "access to the request. Check the Claude login or Anthropic API "
+            + "key, plus the account and model permissions."
+
+        item.status = 401
+        XCTAssertEqual(requestTypeDescription(item), unauthorized)
+
+        item.status = 403
+        XCTAssertEqual(requestTypeDescription(item), forbidden)
+
+        item.status = 429
+        XCTAssertEqual(
+            requestTypeDescription(item),
+            "Switch identified this as a Claude Code Auto permission check "
+                + "and routed it to Anthropic.")
+    }
+
     private func requestItem() -> RequestItem {
         RequestItem(
             eventID: "0123456789abcdef0123456789abcdef",

@@ -538,8 +538,9 @@ func stageTelemetry(
 	}
 	included := make(map[string]struct{}, len(eventIDs))
 	err = readSnapshotLines(ctx, snapshot, MaxTelemetryLineBytes, func(line []byte) error {
+		// Telemetry schema v1 permits additive optional metadata. Decode known
+		// fields for join validation while preserving the original row bytes.
 		decoder := json.NewDecoder(bytes.NewReader(line))
-		decoder.DisallowUnknownFields()
 		var event telemetry.EventV1
 		if err := decoder.Decode(&event); err != nil {
 			return fmt.Errorf("read telemetry row: %w", err)

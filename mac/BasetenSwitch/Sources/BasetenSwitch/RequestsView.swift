@@ -202,12 +202,13 @@ struct RequestsView: View {
 private enum RequestTableMetrics {
     static let time: CGFloat = 128
     static let harness: CGFloat = 132
+    static let type: CGFloat = 100
     static let requested: CGFloat = 190
     static let routing: CGFloat = 330
     static let result: CGFloat = 120
     static let duration: CGFloat = 86
     static let fallback: CGFloat = 270
-    static let totalWidth = time + harness + requested + routing
+    static let totalWidth = time + harness + type + requested + routing
         + result + duration + fallback
 }
 
@@ -216,6 +217,7 @@ private struct RequestTableHeader: View {
         HStack(spacing: 0) {
             headerCell("Time", width: RequestTableMetrics.time)
             headerCell("Harness", width: RequestTableMetrics.harness)
+            headerCell("Type", width: RequestTableMetrics.type)
             headerCell("Requested", width: RequestTableMetrics.requested)
             headerCell("Routing", width: RequestTableMetrics.routing)
             headerCell("Result", width: RequestTableMetrics.result)
@@ -269,6 +271,9 @@ private struct RequestTableRow: View {
             }
             .requestTableCell(width: RequestTableMetrics.harness)
 
+            RequestTypeCell(item: item)
+                .requestTableCell(width: RequestTableMetrics.type)
+
             Text(item.requestedModel.isEmpty ? "Unknown model" : item.requestedModel)
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -316,6 +321,27 @@ private struct RequestTableRow: View {
         .background(shaded ? Color.secondary.opacity(0.04) : Color.clear)
         .overlay(alignment: .bottom) {
             Divider()
+        }
+    }
+}
+
+private struct RequestTypeCell: View {
+    let item: RequestItem
+
+    var body: some View {
+        if let label = requestTypeLabel(item),
+           let description = requestTypeDescription(item) {
+            Text(label)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .help(description)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(description)
+                .accessibilityIdentifier("request-type-auto-check")
+        } else {
+            Text("")
+                .accessibilityHidden(true)
         }
     }
 }
@@ -374,6 +400,30 @@ private extension View {
             .frame(width: width, alignment: .leading)
             .contentShape(Rectangle())
     }
+}
+
+func requestTypeLabel(_ item: RequestItem) -> String? {
+    item.requestClassification?.isClaudeAutoPermissionCheck == true
+        ? "Auto check"
+        : nil
+}
+
+func requestTypeDescription(_ item: RequestItem) -> String? {
+    guard requestTypeLabel(item) != nil else { return nil }
+    if item.status == 401 {
+        return "Switch identified this as a Claude Code Auto permission check "
+            + "and routed it to Anthropic. Anthropic rejected the request "
+            + "credentials. Auto checks require a Claude login or Anthropic "
+            + "API key accepted by Anthropic."
+    }
+    if item.status == 403 {
+        return "Switch identified this as a Claude Code Auto permission check "
+            + "and routed it to Anthropic. Anthropic denied access to the "
+            + "request. Check the Claude login or Anthropic API key, plus the "
+            + "account and model permissions."
+    }
+    return "Switch identified this as a Claude Code Auto permission check "
+        + "and routed it to Anthropic."
 }
 
 func requestServedProviderLabel(_ item: RequestItem) -> String {
