@@ -78,6 +78,7 @@ type EventV1 struct {
 	Translated                    bool                      `json:"translated"`
 	StrippedToolTypes             []string                  `json:"stripped_tool_types"`
 	ResponsesCompatibility        *ResponsesCompatibilityV1 `json:"responses_compatibility,omitempty"`
+	RequestClassification         *RequestClassificationV1  `json:"request_classification,omitempty"`
 	ToolCalls                     int                       `json:"tool_calls"`
 	RequestBytes                  int                       `json:"request_bytes"`
 	requestedReasoningPresentNull bool
@@ -170,6 +171,21 @@ type ResponsesCompatibilityV1 struct {
 	RepairedEvents   int      `json:"repaired_events"`
 	ValidationErrors int      `json:"validation_errors"`
 }
+
+// RequestClassificationV1 records only the gateway-owned, content-free
+// result of a positive request classification. Prompt text, matched terms,
+// excerpts, hashes, and other content-derived signals never belong here.
+type RequestClassificationV1 struct {
+	Kind          string `json:"kind"`
+	Detector      string `json:"detector"`
+	RoutingAction string `json:"routing_action"`
+}
+
+const (
+	RequestClassificationKindClaudeAutoPermissionCheck = "claude_auto_permission_check"
+	RequestClassificationDetectorClaudeAutoV1          = "claude_auto_v1"
+	RequestClassificationRoutingActionNativeAnthropic  = "native_anthropic"
+)
 
 const (
 	ResponsesCompatibilityRuleTextFormatDefault            = "responses.text_format_default"
@@ -314,6 +330,21 @@ func (e EventV1) Validate() error {
 	if err := e.ResponsesCompatibility.validate(); err != nil {
 		return err
 	}
+	if err := e.RequestClassification.validate(); err != nil {
+		return err
+	}
+	if e.RequestClassification != nil {
+		switch {
+		case e.EffectiveProvider != "anthropic":
+			return errors.New("telemetry classified Auto request requires effective_provider=anthropic")
+		case e.Fallback.Attempted || e.Fallback.Count != 0 || e.Fallback.Trigger != nil:
+			return errors.New("telemetry classified Auto request cannot record fallback")
+		case e.Primary != nil:
+			return errors.New("telemetry classified Auto request cannot record a primary attempt")
+		case e.NativeCounterfactualCost != nil:
+			return errors.New("telemetry classified Auto request cannot record native counterfactual cost")
+		}
+	}
 	if err := e.Usage.validate(e.UsageComplete); err != nil {
 		return err
 	}
@@ -327,6 +358,31 @@ func (e EventV1) Validate() error {
 		); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (classification *RequestClassificationV1) validate() error {
+	if classification == nil {
+		return nil
+	}
+	if classification.Kind != RequestClassificationKindClaudeAutoPermissionCheck {
+		return fmt.Errorf(
+			"telemetry request_classification kind = %q is invalid",
+			classification.Kind,
+		)
+	}
+	if classification.Detector != RequestClassificationDetectorClaudeAutoV1 {
+		return fmt.Errorf(
+			"telemetry request_classification detector = %q is invalid",
+			classification.Detector,
+		)
+	}
+	if classification.RoutingAction != RequestClassificationRoutingActionNativeAnthropic {
+		return fmt.Errorf(
+			"telemetry request_classification routing_action = %q is invalid",
+			classification.RoutingAction,
+		)
 	}
 	return nil
 }

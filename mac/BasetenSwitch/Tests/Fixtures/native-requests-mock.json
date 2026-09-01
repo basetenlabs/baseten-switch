@@ -26,6 +26,52 @@
       }
     },
     {
+      "event_id": "request-auto-success",
+      "completed_at": "2026-07-26T18:01:45Z",
+      "client": "claude-code",
+      "configured_route": "baseten",
+      "effective_provider": "anthropic",
+      "requested_model": "claude-sonnet-4-5",
+      "served_model": "claude-sonnet-4-5",
+      "status": 200,
+      "duration_ms": 387,
+      "termination_reason": "completed",
+      "subagent": false,
+      "request_classification": {
+        "kind": "claude_auto_permission_check",
+        "detector": "claude_auto_v1",
+        "routing_action": "native_anthropic"
+      },
+      "fallback": {
+        "attempted": false,
+        "count": 0,
+        "trigger": null
+      }
+    },
+    {
+      "event_id": "request-auto-failed",
+      "completed_at": "2026-07-26T18:01:30Z",
+      "client": "claude-code",
+      "configured_route": "baseten",
+      "effective_provider": "anthropic",
+      "requested_model": "claude-sonnet-4-5",
+      "served_model": "claude-sonnet-4-5",
+      "status": 401,
+      "duration_ms": 213,
+      "termination_reason": "upstream_http_error",
+      "subagent": false,
+      "request_classification": {
+        "kind": "claude_auto_permission_check",
+        "detector": "claude_auto_v1",
+        "routing_action": "native_anthropic"
+      },
+      "fallback": {
+        "attempted": false,
+        "count": 0,
+        "trigger": null
+      }
+    },
+    {
       "event_id": "request-older",
       "completed_at": "2026-07-26T18:01:00Z",
       "client": "codex",
@@ -37,6 +83,11 @@
       "duration_ms": 721,
       "termination_reason": "client_cancelled",
       "subagent": true,
+      "request_classification": {
+        "kind": "future_request_kind",
+        "detector": "future_detector",
+        "routing_action": "future_action"
+      },
       "fallback": {
         "attempted": false,
         "count": 0,

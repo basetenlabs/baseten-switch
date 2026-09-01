@@ -249,6 +249,73 @@ func TestTelemetryV1CaptureRetainsRequestAndAttemptPrices(t *testing.T) {
 	}
 }
 
+func TestTelemetryV1CaptureCarriesAutoClassificationToNativeEvent(t *testing.T) {
+	startedAt := time.Date(2026, time.August, 26, 20, 0, 0, 0, time.UTC)
+	prices := telemetryVariantPricing(t, startedAt)
+	request, err := captureTelemetryRequestProfileV1(
+		prices.Capture(),
+		startedAt,
+		"claude-code",
+		pricing.ProviderBaseten,
+		pricing.ProviderAnthropic,
+		"claude-sonnet-5",
+		requestprofile.Profile{RawModel: "claude-sonnet-5"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.eventID = "00112233445566778899aabbccddeeff"
+	request.setRequestClassificationV1(
+		telemetry.RequestClassificationKindClaudeAutoPermissionCheck,
+		telemetry.RequestClassificationDetectorClaudeAutoV1,
+		telemetry.RequestClassificationRoutingActionNativeAnthropic,
+	)
+	attempt := captureTelemetryAttemptV1(
+		prices.Capture(),
+		startedAt,
+		pricing.ProviderAnthropic,
+		"claude-sonnet-5",
+	)
+	status := http.StatusOK
+	event, err := request.event(attempt, telemetryCompletionV1{
+		completedAt:      startedAt.Add(time.Second),
+		status:           &status,
+		responseComplete: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.ConfiguredRoute != pricing.ProviderBaseten ||
+		event.EffectiveProvider != pricing.ProviderAnthropic ||
+		event.Fallback.Attempted || event.Fallback.Count != 0 ||
+		event.Primary != nil || event.NativeCounterfactualCost != nil ||
+		event.RequestClassification == nil ||
+		event.RequestClassification.Kind != telemetry.RequestClassificationKindClaudeAutoPermissionCheck ||
+		event.RequestClassification.Detector != telemetry.RequestClassificationDetectorClaudeAutoV1 ||
+		event.RequestClassification.RoutingAction != telemetry.RequestClassificationRoutingActionNativeAnthropic {
+		t.Fatalf("classified native event = %+v", event)
+	}
+	failureStatus := http.StatusUnauthorized
+	failedEvent, err := request.event(attempt, telemetryCompletionV1{
+		completedAt:      startedAt.Add(2 * time.Second),
+		status:           &failureStatus,
+		responseComplete: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failedEvent.TerminationReason != telemetry.TerminationUpstreamHTTPError ||
+		failedEvent.Status == nil || *failedEvent.Status != http.StatusUnauthorized ||
+		failedEvent.RequestClassification == nil ||
+		failedEvent.RequestClassification.Kind != telemetry.RequestClassificationKindClaudeAutoPermissionCheck {
+		t.Fatalf("classified terminal event = %+v", failedEvent)
+	}
+	request.requestClassification.Kind = "changed"
+	if event.RequestClassification.Kind != telemetry.RequestClassificationKindClaudeAutoPermissionCheck {
+		t.Fatalf("event retained mutable classification: %+v", event.RequestClassification)
+	}
+}
+
 func TestTelemetryV1AnthropicActualPriceRequiresConfirmedFastSpeed(t *testing.T) {
 	startedAt := time.Date(2026, time.July, 25, 20, 0, 0, 0, time.UTC)
 	prices := telemetryVariantPricing(t, startedAt)

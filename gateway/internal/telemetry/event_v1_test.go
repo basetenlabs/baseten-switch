@@ -103,6 +103,143 @@ func TestEventV1PrimarySummaryRoundTrip(t *testing.T) {
 	}
 }
 
+func TestEventV1RequestClassificationRoundTrip(t *testing.T) {
+	now := time.Date(2026, time.August, 26, 12, 0, 0, 0, time.UTC)
+	event := validEventV1(now)
+	event.EffectiveProvider = "anthropic"
+	event.ServedModel = "claude-sonnet-5"
+	event.RequestClassification = &RequestClassificationV1{
+		Kind:          RequestClassificationKindClaudeAutoPermissionCheck,
+		Detector:      RequestClassificationDetectorClaudeAutoV1,
+		RoutingAction: RequestClassificationRoutingActionNativeAnthropic,
+	}
+	if err := event.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "auto mode") ||
+		strings.Contains(string(raw), "tool call") {
+		t.Fatalf("classification telemetry contains prompt-derived data: %s", raw)
+	}
+	var decoded EventV1
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.RequestClassification == nil ||
+		decoded.RequestClassification.Kind != RequestClassificationKindClaudeAutoPermissionCheck ||
+		decoded.RequestClassification.Detector != RequestClassificationDetectorClaudeAutoV1 ||
+		decoded.RequestClassification.RoutingAction != RequestClassificationRoutingActionNativeAnthropic {
+		t.Fatalf("request classification round trip = %+v", decoded.RequestClassification)
+	}
+
+	unclassified := validEventV1(now)
+	raw, err = json.Marshal(unclassified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"request_classification"`) {
+		t.Fatalf("unclassified event emitted request_classification: %s", raw)
+	}
+}
+
+func TestRequestClassificationV1Validation(t *testing.T) {
+	now := time.Date(2026, time.August, 26, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name    string
+		value   RequestClassificationV1
+		wantErr string
+	}{
+		{
+			name: "unknown kind",
+			value: RequestClassificationV1{
+				Kind:          "other",
+				Detector:      RequestClassificationDetectorClaudeAutoV1,
+				RoutingAction: RequestClassificationRoutingActionNativeAnthropic,
+			},
+			wantErr: "kind",
+		},
+		{
+			name: "unknown detector",
+			value: RequestClassificationV1{
+				Kind:          RequestClassificationKindClaudeAutoPermissionCheck,
+				Detector:      "other",
+				RoutingAction: RequestClassificationRoutingActionNativeAnthropic,
+			},
+			wantErr: "detector",
+		},
+		{
+			name: "unknown routing action",
+			value: RequestClassificationV1{
+				Kind:          RequestClassificationKindClaudeAutoPermissionCheck,
+				Detector:      RequestClassificationDetectorClaudeAutoV1,
+				RoutingAction: "other",
+			},
+			wantErr: "routing_action",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			event := validEventV1(now)
+			event.RequestClassification = &test.value
+			err := event.Validate()
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("Validate() error = %v, want %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestRequestClassificationV1RequiresNativeTerminalRouting(t *testing.T) {
+	now := time.Date(2026, time.August, 26, 12, 0, 0, 0, time.UTC)
+	classification := &RequestClassificationV1{
+		Kind:          RequestClassificationKindClaudeAutoPermissionCheck,
+		Detector:      RequestClassificationDetectorClaudeAutoV1,
+		RoutingAction: RequestClassificationRoutingActionNativeAnthropic,
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*EventV1)
+		wantErr string
+	}{
+		{
+			name: "non-Anthropic provider",
+			mutate: func(event *EventV1) {
+				event.EffectiveProvider = "baseten"
+			},
+			wantErr: "effective_provider=anthropic",
+		},
+		{
+			name: "fallback",
+			mutate: func(event *EventV1) {
+				event.Fallback = FallbackV1{Attempted: true, Count: 1}
+			},
+			wantErr: "cannot record fallback",
+		},
+		{
+			name: "native counterfactual",
+			mutate: func(event *EventV1) {
+				event.NativeCounterfactualCost = &CostSnapshotV1{}
+			},
+			wantErr: "cannot record native counterfactual",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			event := validEventV1(now)
+			event.EffectiveProvider = "anthropic"
+			event.RequestClassification = classification
+			test.mutate(&event)
+			err := event.Validate()
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("Validate() error = %v, want %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestPrimaryV1Validation(t *testing.T) {
 	status := func(value int) *int { return &value }
 	tests := []struct {

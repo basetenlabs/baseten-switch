@@ -91,6 +91,59 @@ func TestDecodeProducesVersionedContentFreeOutput(t *testing.T) {
 	}
 }
 
+func TestCreateAndDecodeAcceptForwardCompatibleTelemetryFields(t *testing.T) {
+	base := time.Date(2026, time.August, 26, 12, 0, 0, 0, time.UTC)
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	telemetryRow := telemetryJSON(t, selectedEventID, base.Add(time.Hour))
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(telemetryRow, &fields); err != nil {
+		t.Fatal(err)
+	}
+	fields["future_optional_metadata"] = json.RawMessage(`{"version":2}`)
+	telemetryRow, err = json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	source := filepath.Join(root, "source.zip")
+	options := basicOptions(
+		source,
+		base,
+		jsonl(traceJSON(t, selectedEventID, "claude-code", base.Add(time.Hour))),
+	)
+	options.Sources.Telemetry = func(
+		context.Context,
+		Selection,
+		[]string,
+	) (Snapshot, error) {
+		return bytesSnapshot(jsonl(telemetryRow), nil), nil
+	}
+	if _, err := Create(context.Background(), options); err != nil {
+		t.Fatalf("Create() rejected additive telemetry field: %v", err)
+	}
+
+	output := filepath.Join(root, "decoded")
+	if _, err := Decode(context.Background(), DecodeOptions{
+		PackagePath: source,
+		OutputDir:   output,
+	}); err != nil {
+		t.Fatalf("Decode() rejected additive telemetry field: %v", err)
+	}
+	copied, err := os.ReadFile(filepath.Join(
+		output,
+		filepath.FromSlash(TelemetryMemberName),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(copied, []byte(`"future_optional_metadata":{"version":2}`)) {
+		t.Fatalf("additive telemetry field was not preserved: %s", copied)
+	}
+}
+
 func TestInspectDecodeIsAuthoritativeAndPlanIsSingleUse(t *testing.T) {
 	source := createDecodeFixture(t)
 	plan, err := InspectDecode(context.Background(), source)
