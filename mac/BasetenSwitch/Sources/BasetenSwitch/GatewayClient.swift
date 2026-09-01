@@ -37,12 +37,17 @@ struct RoutingSnapshot: Equatable, Sendable {
     let configPath: String
     let capabilities: Set<String>
     let globalRoutingEnabled: Bool
+    let fallbackPolicy: FallbackPolicyStatus?
     let reload: ReloadStatus
     let auth: AuthStatus?
     let clients: [ClientStatus]
 
     var supportsGlobalRouting: Bool {
         capabilities.contains("global_routing")
+    }
+
+    var supportsFallbackPolicy: Bool {
+        capabilities.contains("fallback_policy")
     }
 
     var desiredMatchesActive: Bool {
@@ -63,6 +68,7 @@ struct RoutingSnapshot: Equatable, Sendable {
         configPath = status.configPath
         capabilities = Set(status.capabilities)
         globalRoutingEnabled = status.globalRoutingEnabled
+        fallbackPolicy = status.fallbackPolicy
         reload = status.reload
         auth = status.auth
         clients = status.clients
@@ -72,6 +78,8 @@ struct RoutingSnapshot: Equatable, Sendable {
          version: String,
          uptimeSeconds: Int64,
          globalRoutingEnabled: Bool,
+         capabilities: Set<String> = [],
+         fallbackPolicy: FallbackPolicyStatus? = nil,
          auth: AuthStatus?,
          clients: [ClientStatus]) {
         token = RoutingToken(routerBootID: "", activeGeneration: 0)
@@ -83,8 +91,9 @@ struct RoutingSnapshot: Equatable, Sendable {
         self.version = version
         self.uptimeSeconds = uptimeSeconds
         configPath = ""
-        capabilities = []
+        self.capabilities = capabilities
         self.globalRoutingEnabled = globalRoutingEnabled
+        self.fallbackPolicy = fallbackPolicy
         reload = ReloadStatus(state: "", error: "")
         self.auth = auth
         self.clients = clients
@@ -125,6 +134,7 @@ struct ClientStatus: Identifiable, Equatable, Sendable {
     var families: [FamilyEntry]
     var modelCatalog: [ModelCatalogEntry]
     var modelPicker: ClaudeModelPickerStatus?
+    var basetenModelFallback: BasetenModelFallbackStatus?
     var modelOptions: ClientModelOptions
 
     var id: String { name }
@@ -161,8 +171,97 @@ struct ClientStatus: Identifiable, Equatable, Sendable {
         modelCatalog = catalogArray.compactMap(ModelCatalogEntry.init)
         modelPicker = (dict["model_picker"] as? [String: Any])
             .flatMap(ClaudeModelPickerStatus.init)
+        basetenModelFallback = (dict["baseten_model_fallback"]
+            as? [String: Any])
+            .flatMap(BasetenModelFallbackStatus.init)
         modelOptions = decodeClientModelOptions(dict["model_options"])
     }
+}
+
+struct FallbackPolicyStatus: Equatable, Sendable {
+    let onBaseten429: Bool
+    let onBaseten5xx: Bool
+
+    init(onBaseten429: Bool, onBaseten5xx: Bool) {
+        self.onBaseten429 = onBaseten429
+        self.onBaseten5xx = onBaseten5xx
+    }
+
+    init?(dict: [String: Any]) {
+        guard let onBaseten429 = dict["on_baseten_429"] as? Bool,
+              let onBaseten5xx = dict["on_baseten_5xx"] as? Bool else {
+            return nil
+        }
+        self.onBaseten429 = onBaseten429
+        self.onBaseten5xx = onBaseten5xx
+    }
+}
+
+struct BasetenModelFallbackStatus: Equatable, Sendable {
+    let configuredModel: String
+    let resolvedModel: String
+    let displayName: String
+    let providerReady: Bool
+    let ready: Bool
+    let reason: String?
+    let availableModels: [BasetenModelFallbackOption]
+
+    init?(dict: [String: Any]) {
+        guard let configuredModel = dict["configured_model"] as? String,
+              let resolvedModel = dict["resolved_model"] as? String,
+              let displayName = dict["display_name"] as? String,
+              let providerReady = dict["provider_ready"] as? Bool,
+              let ready = dict["ready"] as? Bool else {
+            return nil
+        }
+        self.configuredModel = configuredModel
+        self.resolvedModel = resolvedModel
+        self.displayName = displayName
+        self.providerReady = providerReady
+        self.ready = ready
+        reason = dict["reason"] as? String
+        availableModels = decodeBasetenModelFallbackOptions(
+            dict["available_models"])
+    }
+}
+
+struct BasetenModelFallbackOption: Equatable, Sendable {
+    let model: String
+    let displayName: String
+
+    init(model: String, displayName: String) {
+        self.model = model
+        self.displayName = displayName
+    }
+
+    init?(dict: [String: Any]) {
+        guard let model = dict["model"] as? String,
+              !model.isEmpty,
+              let displayName = dict["display_name"] as? String,
+              !displayName.isEmpty else {
+            return nil
+        }
+        self.model = model
+        self.displayName = displayName
+    }
+}
+
+private func decodeBasetenModelFallbackOptions(
+    _ raw: Any?
+) -> [BasetenModelFallbackOption] {
+    // Missing means an older router. A malformed additive projection fails
+    // closed instead of presenting an unvalidated partial selector.
+    guard let raw else { return [] }
+    guard let rows = raw as? [[String: Any]] else { return [] }
+    var decoded: [BasetenModelFallbackOption] = []
+    for row in rows {
+        guard let option = BasetenModelFallbackOption(dict: row),
+              isAcceptedClaudeNativeModelID(option.model) else {
+            return []
+        }
+        decoded.append(option)
+    }
+    return decoded
 }
 
 struct FallbackStatus: Equatable, Sendable {
@@ -623,6 +722,7 @@ struct AdminStatusSnapshot: Equatable, Sendable {
     var configPath: String
     var reload: ReloadStatus
     var globalRoutingEnabled: Bool
+    var fallbackPolicy: FallbackPolicyStatus?
     var auth: AuthStatus?
     var clients: [ClientStatus]
 
@@ -646,6 +746,8 @@ struct AdminStatusSnapshot: Equatable, Sendable {
         clients = array.compactMap(ClientStatus.init)
 
         globalRoutingEnabled = dict["global_routing_enabled"] as? Bool ?? false
+        fallbackPolicy = (dict["fallback_policy"] as? [String: Any])
+            .flatMap(FallbackPolicyStatus.init)
     }
 }
 

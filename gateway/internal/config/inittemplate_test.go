@@ -37,6 +37,11 @@ func TestInitTemplateLoads(t *testing.T) {
 	if f.Global.RoutingEnabled == nil || !*f.Global.RoutingEnabled {
 		t.Errorf("global.routing_enabled = %v, want explicit true", f.Global.RoutingEnabled)
 	}
+	if f.Global.FallbackPolicy == nil ||
+		f.Global.FallbackPolicy.OnBaseten429 == nil || !*f.Global.FallbackPolicy.OnBaseten429 ||
+		f.Global.FallbackPolicy.OnBaseten5xx == nil || !*f.Global.FallbackPolicy.OnBaseten5xx {
+		t.Errorf("global.fallback_policy = %+v, want both triggers explicitly true", f.Global.FallbackPolicy)
+	}
 	if f.Global.Auth["baseten"] != "${BASETEN_API_KEY}" {
 		t.Errorf("global.auth.baseten = %q, want ${BASETEN_API_KEY} reference", f.Global.Auth["baseten"])
 	}
@@ -60,6 +65,9 @@ func TestInitTemplateLoads(t *testing.T) {
 	if cc.FallbackRoute != "anthropic" {
 		t.Errorf("fallback route %q, want anthropic", cc.FallbackRoute)
 	}
+	if cc.NativeFallbackModel != DefaultClaudeNativeFallbackModel {
+		t.Errorf("native_fallback_model %q, want %q", cc.NativeFallbackModel, DefaultClaudeNativeFallbackModel)
+	}
 	if !cc.Enabled {
 		t.Errorf("enabled %t, want true", cc.Enabled)
 	}
@@ -81,6 +89,9 @@ func TestInitTemplateLoads(t *testing.T) {
 	}
 	if cx.FallbackRoute != "openai" {
 		t.Errorf("codex fallback route %q, want openai", cx.FallbackRoute)
+	}
+	if cx.NativeFallbackModel != "" {
+		t.Errorf("codex native_fallback_model %q, want empty", cx.NativeFallbackModel)
 	}
 	if cx.DefaultModel != "zai-org/GLM-5.2" {
 		t.Errorf("codex default_model = %q, want zai-org/GLM-5.2", cx.DefaultModel)

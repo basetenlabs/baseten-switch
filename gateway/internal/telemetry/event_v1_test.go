@@ -9,6 +9,8 @@ import (
 
 func int64Pointer(value int64) *int64 { return &value }
 
+func stringPointer(value string) *string { return &value }
+
 func TestNewEventID(t *testing.T) {
 	first, err := NewEventID()
 	if err != nil {
@@ -704,6 +706,38 @@ func TestEventV1Validation(t *testing.T) {
 				event.Fallback.Count = 1
 			},
 			wantErr: "requires attempted",
+		},
+		{
+			name: "attempted fallback with suppression",
+			mutate: func(event *EventV1) {
+				event.Fallback.Attempted = true
+				event.Fallback.Count = 1
+				event.Fallback.SuppressedReason = stringPointer("policy_disabled_http_429")
+			},
+			wantErr: "cannot record a suppression reason",
+		},
+		{
+			name: "model source without attempted fallback",
+			mutate: func(event *EventV1) {
+				event.Fallback.ModelSource = stringPointer("original_request")
+			},
+			wantErr: "model source requires attempted=true",
+		},
+		{
+			name: "invalid fallback suppression reason",
+			mutate: func(event *EventV1) {
+				event.Fallback.SuppressedReason = stringPointer("disabled")
+			},
+			wantErr: "suppressed_reason",
+		},
+		{
+			name: "invalid fallback model source",
+			mutate: func(event *EventV1) {
+				event.Fallback.Attempted = true
+				event.Fallback.Count = 1
+				event.Fallback.ModelSource = stringPointer("rewritten")
+			},
+			wantErr: "model_source",
 		},
 		{
 			name: "zero context budget",

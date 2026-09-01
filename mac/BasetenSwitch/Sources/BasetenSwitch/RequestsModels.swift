@@ -41,17 +41,25 @@ struct RequestFallback: Decodable, Equatable, Sendable {
     var attempted: Bool
     var count: Int
     var trigger: String?
+    var suppressedReason: String?
 
     enum CodingKeys: String, CodingKey {
         case attempted
         case count
         case trigger
+        case suppressedReason = "suppressed_reason"
     }
 
-    init(attempted: Bool, count: Int = 0, trigger: String? = nil) {
+    init(
+        attempted: Bool,
+        count: Int = 0,
+        trigger: String? = nil,
+        suppressedReason: String? = nil
+    ) {
         self.attempted = attempted
         self.count = count
         self.trigger = trigger
+        self.suppressedReason = suppressedReason
     }
 
     init(from decoder: Decoder) throws {
@@ -61,6 +69,9 @@ struct RequestFallback: Decodable, Equatable, Sendable {
             forKey: .attempted) ?? false
         count = try values.decodeIfPresent(Int.self, forKey: .count) ?? 0
         trigger = try values.decodeIfPresent(String.self, forKey: .trigger)
+        suppressedReason = try values.decodeIfPresent(
+            String.self,
+            forKey: .suppressedReason)
     }
 }
 

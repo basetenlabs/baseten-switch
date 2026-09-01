@@ -197,6 +197,27 @@ struct PopupPreviewFixture: Identifiable {
                 "served_route": fallbackActive ? nativeRoute : "",
                 "cause": fallbackActive ? "http_429" : "",
             ],
+            "baseten_model_fallback": [
+                "configured_model": "claude-opus-5",
+                "resolved_model": "claude-opus-5",
+                "display_name": "Opus",
+                "provider_ready": true,
+                "ready": true,
+                "available_models": [
+                    [
+                        "model": "claude-opus-5",
+                        "display_name": "Opus",
+                    ],
+                    [
+                        "model": "claude-sonnet-5",
+                        "display_name": "Sonnet",
+                    ],
+                    [
+                        "model": "claude-haiku-4-5",
+                        "display_name": "Haiku",
+                    ],
+                ],
+            ],
             "subagent_model": "",
             "subagent_routing": "off",
             "subagent_effective": "inherit",
@@ -247,13 +268,13 @@ struct PopupPreviewFixture: Identifiable {
                         "alias": "claude-baseten-glm-5-2",
                         "slug": "zai-org/GLM-5.2",
                         "label": "GLM 5.2 via Baseten",
-                        "description": "Served by Baseten.",
+                        "description": "Baseten primary route.",
                     ],
                     [
                         "alias": "claude-baseten-kimi-k2-7-code",
                         "slug": "moonshotai/Kimi-K2.7-Code",
                         "label": "Kimi K2.7 Code via Baseten",
-                        "description": "Served by Baseten.",
+                        "description": "Baseten primary route.",
                     ],
                 ],
             ]

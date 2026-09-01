@@ -24,6 +24,7 @@ const (
 	mutationSurfaceSwitch = "switch"
 	mutationSurfaceClaude = "claude"
 	mutationSurfaceCodex  = "codex"
+	mutationSurfaceConfig = "config"
 )
 
 var (
@@ -87,41 +88,109 @@ type mutationError struct {
 	Retryable bool   `json:"retryable"`
 }
 
+type mutationWarning struct {
+	Code string `json:"code"`
+}
+
+func appendMutationWarning(warnings []mutationWarning, warning mutationWarning) []mutationWarning {
+	for _, existing := range warnings {
+		if existing.Code == warning.Code {
+			return warnings
+		}
+	}
+	return append(warnings, warning)
+}
+
+func printCapableRouterActivationWarning(opts mutationOptions, path string) {
+	if opts.JSON {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "router not running; %s is configured, but only a router with fallback policy support can activate it\n", path)
+}
+
 type mutationResult struct {
-	OK                        bool           `json:"ok"`
-	OperationID               string         `json:"operation_id"`
-	Operation                 string         `json:"operation"`
-	Requested                 bool           `json:"requested"`
-	RequestedTarget           string         `json:"requested_target,omitempty"`
-	Client                    string         `json:"client,omitempty"`
-	Key                       string         `json:"key,omitempty"`
-	ConfigPath                string         `json:"config_path"`
-	PreviousActiveToken       string         `json:"previous_active_token"`
-	PreviousDesiredConfigHash string         `json:"previous_desired_config_hash"`
-	DesiredConfigHash         string         `json:"desired_config_hash"`
-	ActiveToken               string         `json:"active_token"`
-	ActiveConfigHash          string         `json:"active_config_hash"`
-	Applied                   bool           `json:"applied"`
-	ReconciliationRequired    bool           `json:"reconciliation_required,omitempty"`
-	ReconciliationAction      string         `json:"reconciliation_action,omitempty"`
-	BlockingOperationID       string         `json:"blocking_operation_id,omitempty"`
-	Outcome                   string         `json:"outcome,omitempty"`
-	RequestFingerprint        string         `json:"request_fingerprint,omitempty"`
-	IdentityStrength          string         `json:"identity_strength,omitempty"`
-	CleanupPending            bool           `json:"cleanup_pending,omitempty"`
-	Warnings                  []string       `json:"warnings,omitempty"`
-	Error                     *mutationError `json:"error"`
+	OK                        bool              `json:"ok"`
+	OperationID               string            `json:"operation_id"`
+	Operation                 string            `json:"operation"`
+	Requested                 bool              `json:"requested"`
+	RequestedTarget           string            `json:"requested_target,omitempty"`
+	Client                    string            `json:"client,omitempty"`
+	Key                       string            `json:"key,omitempty"`
+	ConfigPath                string            `json:"config_path"`
+	PreviousActiveToken       string            `json:"previous_active_token"`
+	PreviousDesiredConfigHash string            `json:"previous_desired_config_hash"`
+	DesiredConfigHash         string            `json:"desired_config_hash"`
+	ActiveToken               string            `json:"active_token"`
+	ActiveConfigHash          string            `json:"active_config_hash"`
+	Applied                   bool              `json:"applied"`
+	ReconciliationRequired    bool              `json:"reconciliation_required,omitempty"`
+	ReconciliationAction      string            `json:"reconciliation_action,omitempty"`
+	BlockingOperationID       string            `json:"blocking_operation_id,omitempty"`
+	Outcome                   string            `json:"outcome,omitempty"`
+	RequestFingerprint        string            `json:"request_fingerprint,omitempty"`
+	IdentityStrength          string            `json:"identity_strength,omitempty"`
+	CleanupPending            bool              `json:"cleanup_pending,omitempty"`
+	Warnings                  []string          `json:"warnings,omitempty"`
+	StructuredWarnings        []mutationWarning `json:"-"`
+	Error                     *mutationError    `json:"error"`
+}
+
+func (r mutationResult) MarshalJSON() ([]byte, error) {
+	type alias mutationResult
+	base := alias(r)
+	base.Warnings = nil
+	warnings := any(nil)
+	if len(r.StructuredWarnings) > 0 {
+		warnings = r.StructuredWarnings
+	} else if len(r.Warnings) > 0 {
+		warnings = r.Warnings
+	}
+	return json.Marshal(struct {
+		alias
+		Warnings any `json:"warnings,omitempty"`
+	}{alias: base, Warnings: warnings})
+}
+
+func (r *mutationResult) UnmarshalJSON(data []byte) error {
+	type alias mutationResult
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	rawWarnings := fields["warnings"]
+	delete(fields, "warnings")
+	withoutWarnings, err := json.Marshal(fields)
+	if err != nil {
+		return err
+	}
+	var decoded alias
+	if err := json.Unmarshal(withoutWarnings, &decoded); err != nil {
+		return err
+	}
+	*r = mutationResult(decoded)
+	if len(rawWarnings) == 0 || string(rawWarnings) == "null" {
+		return nil
+	}
+	if err := json.Unmarshal(rawWarnings, &r.Warnings); err == nil {
+		return nil
+	}
+	if err := json.Unmarshal(rawWarnings, &r.StructuredWarnings); err != nil {
+		return fmt.Errorf("decode mutation warnings: %w", err)
+	}
+	return nil
 }
 
 type routingAdminStatus struct {
-	ConfigPath           string   `json:"config_path"`
-	RouterPID            int      `json:"router_pid"`
-	RouterBootID         string   `json:"router_boot_id"`
-	ActiveGeneration     uint64   `json:"active_generation"`
-	ActiveConfigHash     string   `json:"active_config_hash"`
-	DesiredConfigHash    string   `json:"desired_config_hash"`
-	GlobalRoutingEnabled bool     `json:"global_routing_enabled"`
-	Capabilities         []string `json:"capabilities"`
+	ConfigPath           string                        `json:"config_path"`
+	RouterPID            int                           `json:"router_pid"`
+	RouterBootID         string                        `json:"router_boot_id"`
+	ActiveGeneration     uint64                        `json:"active_generation"`
+	ActiveConfigHash     string                        `json:"active_config_hash"`
+	DesiredConfigHash    string                        `json:"desired_config_hash"`
+	GlobalRoutingEnabled bool                          `json:"global_routing_enabled"`
+	Capabilities         []string                      `json:"capabilities"`
+	FallbackPolicy       config.ResolvedFallbackPolicy `json:"fallback_policy"`
+	Clients              []fallbackAdminClient         `json:"clients"`
 }
 
 func (s routingAdminStatus) activeToken() string {
@@ -206,11 +275,14 @@ func normalizeMutationInvocation(args []string) ([]string, error) {
 		i += consumed
 	}
 	if i >= len(args) {
-		return nil, fmt.Errorf("mutation options require an on, off, claude, codex, or mutation command")
+		return nil, fmt.Errorf("mutation options require an on, off, claude, codex, config, or mutation command")
 	}
 	command := args[i]
-	if command != "on" && command != "off" && command != "claude" && command != "codex" && command != "mutation" {
-		return nil, fmt.Errorf("mutation options are supported only by on, off, claude, codex, and mutation reconcile")
+	if command != "on" && command != "off" && command != "claude" && command != "codex" && command != "config" && command != "mutation" {
+		return nil, fmt.Errorf("mutation options are supported only by on, off, claude, codex, config fallback, and mutation reconcile")
+	}
+	if command == "config" && (i+1 >= len(args) || args[i+1] != "fallback") {
+		return nil, fmt.Errorf("mutation options under config are supported only by config fallback")
 	}
 	out := []string{command}
 	out = append(out, args[i+1:]...)
@@ -657,6 +729,27 @@ func validateManagedRouterIdentity(status routingAdminStatus, managedPID int) er
 }
 
 func waitConfigHashActivation(adminAddr, configPath, desiredHash, previousToken string, requireAdvance bool, timeout time.Duration) (routingAdminStatus, bool) {
+	return waitConfigActivation(adminAddr, configPath, desiredHash, previousToken, requireAdvance, timeout, nil)
+}
+
+func waitConfigMutationActivation(
+	adminAddr, configPath, desiredHash, previousToken string,
+	requireAdvance bool,
+	timeout time.Duration,
+	operation, key, client, requestedTarget string,
+	requested bool,
+) (routingAdminStatus, bool) {
+	return waitConfigActivation(adminAddr, configPath, desiredHash, previousToken, requireAdvance, timeout, func(status routingAdminStatus) bool {
+		return mutationProjectionMatches(status, operation, key, client, requestedTarget, requested)
+	})
+}
+
+func waitConfigActivation(
+	adminAddr, configPath, desiredHash, previousToken string,
+	requireAdvance bool,
+	timeout time.Duration,
+	projectionMatches func(routingAdminStatus) bool,
+) (routingAdminStatus, bool) {
 	deadline := time.Now().Add(timeout)
 	var last routingAdminStatus
 	for {
@@ -672,7 +765,8 @@ func waitConfigHashActivation(adminAddr, configPath, desiredHash, previousToken 
 				status.ConfigPath != "" &&
 				canonicalPath(status.ConfigPath) == canonicalPath(configPath) &&
 				status.ActiveConfigHash == desiredHash &&
-				status.DesiredConfigHash == desiredHash {
+				status.DesiredConfigHash == desiredHash &&
+				(projectionMatches == nil || projectionMatches(status)) {
 				return status, true
 			}
 		}
@@ -681,6 +775,52 @@ func waitConfigHashActivation(adminAddr, configPath, desiredHash, previousToken 
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+func requiredMutationCapability(operation string) string {
+	switch operation {
+	case "set_fallback_policy", "set_native_fallback_model":
+		return "fallback_policy"
+	default:
+		return ""
+	}
+}
+
+func mutationProjectionMatches(status routingAdminStatus, operation, key, client, requestedTarget string, requested bool) bool {
+	if capability := requiredMutationCapability(operation); capability != "" && !containsString(status.Capabilities, capability) {
+		return false
+	}
+	switch operation {
+	case "set_fallback_policy":
+		switch key {
+		case "429":
+			return status.FallbackPolicy.OnBaseten429 == requested
+		case "5xx":
+			return status.FallbackPolicy.OnBaseten5xx == requested
+		default:
+			return false
+		}
+	case "set_native_fallback_model":
+		for _, activeClient := range status.Clients {
+			if activeClient.Name == client {
+				return activeClient.BasetenModelFallback.ResolvedModel == requestedTarget
+			}
+		}
+		return false
+	default:
+		return true
+	}
+}
+
+func mutationJournalProjectionMatches(status routingAdminStatus, journal routingMutationJournal) bool {
+	return mutationProjectionMatches(
+		status,
+		journal.Operation,
+		journal.Key,
+		journal.Client,
+		journal.RequestedTarget,
+		journal.Requested,
+	)
 }
 
 // signalExpectedRouter resolves the managed pidfile immediately before
@@ -728,14 +868,15 @@ func signalVerifiedRouter(expected routingAdminStatus, adminAddr string) (int, e
 }
 
 type journaledMutationSpec struct {
-	Operation       string
-	Surface         string
-	Requested       bool
-	RequestedTarget string
-	Client          string
-	Key             string
-	Apply           func(path string) error
-	HumanSuccess    string
+	Operation          string
+	Surface            string
+	Requested          bool
+	RequestedTarget    string
+	Client             string
+	Key                string
+	Apply              func(path string) error
+	HumanSuccess       string
+	StructuredWarnings []mutationWarning
 }
 
 func mutationResultForSpec(spec journaledMutationSpec, operationID, path, priorHash string) mutationResult {
@@ -749,6 +890,7 @@ func mutationResultForSpec(spec journaledMutationSpec, operationID, path, priorH
 		ConfigPath:                path,
 		PreviousDesiredConfigHash: priorHash,
 		DesiredConfigHash:         priorHash,
+		StructuredWarnings:        spec.StructuredWarnings,
 	}
 }
 
@@ -1309,6 +1451,9 @@ func runJournaledMutationLocked(path string, prior []byte, mode os.FileMode, opt
 		if err := validateManagedRouterIdentity(status, managedPID); err != nil {
 			return failMutation(opts, out, result, "router_identity_mismatch", err.Error(), false, 1)
 		}
+		if capability := requiredMutationCapability(spec.Operation); capability != "" && !containsString(status.Capabilities, capability) {
+			return failMutation(opts, out, result, "router_unsupported", reviewedMutationMessage("router_unsupported"), false, 1)
+		}
 		before = status
 		result.PreviousActiveToken = status.activeToken()
 		result.PreviousDesiredConfigHash = status.DesiredConfigHash
@@ -1323,6 +1468,9 @@ func runJournaledMutationLocked(path string, prior []byte, mode os.FileMode, opt
 	if opts.IfActiveToken != "" && opts.IfActiveToken != before.activeToken() {
 		return failMutation(opts, out, result, "stale_active_token",
 			fmt.Sprintf("router changed: expected active token %s, found %s", opts.IfActiveToken, before.activeToken()), true, 1)
+	}
+	if !routerRunning && requiredMutationCapability(spec.Operation) != "" {
+		result.StructuredWarnings = appendMutationWarning(result.StructuredWarnings, mutationWarning{Code: "capable_router_activation_required"})
 	}
 
 	desired, err := previewExactConfigEdit(path, prior, mode, spec.Apply)
@@ -1340,6 +1488,9 @@ func runJournaledMutationLocked(path string, prior []byte, mode os.FileMode, opt
 			fmt.Sprintf("edited config would not load in the gateway: %v", err), false, 1)
 	}
 	if desiredHash == priorHash {
+		if routerRunning && !mutationProjectionMatches(before, spec.Operation, spec.Key, spec.Client, spec.RequestedTarget, spec.Requested) {
+			return failMutation(opts, out, result, "router_state_mismatch", "the running router does not report the requested active fallback value", true, 1)
+		}
 		result.OK = true
 		result.Applied = routerRunning
 		result.Outcome = mutationOutcomeUnchanged
@@ -1361,6 +1512,9 @@ func runJournaledMutationLocked(path string, prior []byte, mode os.FileMode, opt
 			emitMutationResult(out, result)
 		} else if spec.HumanSuccess != "" {
 			fmt.Fprintln(out, spec.HumanSuccess+"  (unchanged)")
+		}
+		if !routerRunning && requiredMutationCapability(spec.Operation) != "" {
+			printCapableRouterActivationWarning(opts, path)
 		}
 		return 0
 	}
@@ -1416,13 +1570,29 @@ func runJournaledMutationLocked(path string, prior []byte, mode os.FileMode, opt
 			if spec.HumanSuccess != "" {
 				fmt.Fprintln(out, spec.HumanSuccess)
 			}
-			fmt.Fprintf(os.Stderr, "router not running; %s updated and applies at next start; reconcile operation %s after startup\n", path, opts.OperationID)
+			if requiredMutationCapability(spec.Operation) != "" {
+				fmt.Fprintf(os.Stderr, "router not running; %s updated, but only a router with fallback policy support can activate it; reconcile operation %s after startup\n", path, opts.OperationID)
+			} else {
+				fmt.Fprintf(os.Stderr, "router not running; %s updated and applies at next start; reconcile operation %s after startup\n", path, opts.OperationID)
+			}
 		}
 		return 0
 	}
 
 	signaledPID, signalErr := signalVerifiedRouter(before, adminAddr)
-	active, activated := waitConfigHashActivation(adminAddr, path, desiredHash, before.activeToken(), true, routeApplyTimeout)
+	active, activated := waitConfigMutationActivation(
+		adminAddr,
+		path,
+		desiredHash,
+		before.activeToken(),
+		true,
+		routeApplyTimeout,
+		spec.Operation,
+		spec.Key,
+		spec.Client,
+		spec.RequestedTarget,
+		spec.Requested,
+	)
 	if activated {
 		result.Applied = true
 		result.ActiveToken = active.activeToken()
@@ -1637,8 +1807,23 @@ func cmdMutation(args []string) int {
 		if err := validateManagedRouterIdentity(before, pid); err != nil {
 			return failMutation(opts, os.Stdout, result, "router_identity_mismatch", reviewedMutationMessage("router_identity_mismatch"), false, 1)
 		}
+		if capability := requiredMutationCapability(journal.Operation); capability != "" && !containsString(before.Capabilities, capability) {
+			return failMutation(opts, os.Stdout, result, "router_unsupported", reviewedMutationMessage("router_unsupported"), false, 1)
+		}
 		if currentHash == journal.DesiredConfigHash {
-			if active, ok := waitConfigHashActivation(adminAddr, path, journal.DesiredConfigHash, "", false, 250*time.Millisecond); ok {
+			if active, ok := waitConfigMutationActivation(
+				adminAddr,
+				path,
+				journal.DesiredConfigHash,
+				"",
+				false,
+				250*time.Millisecond,
+				journal.Operation,
+				journal.Key,
+				journal.Client,
+				journal.RequestedTarget,
+				journal.Requested,
+			); ok {
 				published, err := publishMutationTerminal(path, terminalFromJournal(journal, mutationOutcomeApplied, active, "", false), &journal)
 				if err != nil {
 					result.ReconciliationRequired = true
@@ -1658,7 +1843,19 @@ func cmdMutation(args []string) int {
 				return 0
 			}
 			if _, err := signalVerifiedRouter(before, adminAddr); err == nil {
-				if active, ok := waitConfigHashActivation(adminAddr, path, journal.DesiredConfigHash, journal.PreviousActiveToken, true, routeApplyTimeout); ok {
+				if active, ok := waitConfigMutationActivation(
+					adminAddr,
+					path,
+					journal.DesiredConfigHash,
+					journal.PreviousActiveToken,
+					true,
+					routeApplyTimeout,
+					journal.Operation,
+					journal.Key,
+					journal.Client,
+					journal.RequestedTarget,
+					journal.Requested,
+				); ok {
 					published, err := publishMutationTerminal(path, terminalFromJournal(journal, mutationOutcomeApplied, active, "", false), &journal)
 					if err != nil {
 						result.ReconciliationRequired = true

@@ -707,6 +707,7 @@ private struct RoutingOverviewView: View {
 
                 if state.routingSnapshot != nil {
                     routingGroup
+                    automaticFallbackGroup
                     statusGroup
                 } else {
                     stopped
@@ -946,6 +947,121 @@ private struct RoutingOverviewView: View {
             }
             .padding(6)
         }
+    }
+
+    private var automaticFallbackGroup: some View {
+        RoutingSectionCard {
+            HStack {
+                Label(
+                    "Automatic Fallback",
+                    systemImage: "arrow.uturn.forward.circle")
+                    .font(.headline)
+                Spacer()
+                if state.pendingFallbackPolicy != nil {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel(
+                            "Changing automatic fallback settings")
+                }
+            }
+        } content: {
+            VStack(alignment: .leading, spacing: 14) {
+                if let unavailable = state.fallbackPolicyUnavailableMessage {
+                    fallbackUnavailableRow(
+                        title: "Rate limits (HTTP 429)",
+                        identifier: "fallback-policy-429-unavailable")
+                    Divider()
+                    fallbackUnavailableRow(
+                        title: "Server errors (HTTP 5xx)",
+                        identifier: "fallback-policy-5xx-unavailable")
+                    Text(unavailable)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier(
+                            "fallback-policy-unavailable")
+                } else {
+                    fallbackToggle(
+                        title: "Rate limits (HTTP 429)",
+                        description: "When a request routed to Baseten is rate limited, try the client's native provider once and use it briefly while Baseten recovers.",
+                        trigger: .http429,
+                        isOn: state.displayedFallback429,
+                        identifier: "fallback-policy-429")
+                    Divider()
+                    fallbackToggle(
+                        title: "Server errors (HTTP 5xx)",
+                        description: "When a request routed to Baseten returns a server error, try the client's native provider once and use it briefly while Baseten recovers.",
+                        trigger: .http5xx,
+                        isOn: state.displayedFallback5xx,
+                        identifier: "fallback-policy-5xx")
+                }
+                Text("Native Claude requests fall back to the exact model Claude requested. Baseten models selected from /model fall back to the model configured on the Claude Code page.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if state.fallbackPolicyWarningVisible {
+                    Label(
+                        "Cross-provider fallback replays the current conversation. This includes models selected from /model; provider-specific reasoning history may be rejected during tool-use continuation.",
+                        systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier(
+                            "fallback-policy-provider-affinity-warning")
+                }
+                if state.fallbackPolicyUnavailableMessage == nil,
+                   let reason = state.fallbackPolicyMutationDisabledReason {
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(6)
+        }
+        .accessibilityIdentifier("overview-automatic-fallback")
+    }
+
+    private func fallbackToggle(
+        title: String,
+        description: String,
+        trigger: FallbackPolicyTrigger,
+        isOn: Bool,
+        identifier: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle(
+                title,
+                isOn: Binding(
+                    get: { isOn },
+                    set: { enabled in
+                        guard !isPreview else { return }
+                        state.requestFallbackPolicy(
+                            trigger,
+                            enabled: enabled)
+                    }))
+                .disabled(!state.canMutateFallbackSettings)
+                .accessibilityIdentifier(identifier)
+            Text(description)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func fallbackUnavailableRow(
+        title: String,
+        identifier: String
+    ) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text("Unavailable")
+                .foregroundStyle(.secondary)
+        }
+        .font(.callout)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier(identifier)
     }
 
     private var stopped: some View {

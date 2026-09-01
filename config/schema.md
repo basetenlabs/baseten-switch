@@ -20,6 +20,7 @@ SIGHUP. The native Mac app edits the same file through `baseten-switch`.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `routing_enabled` | bool | `true` in new configs | The one global routing gate. It must be explicitly present. Off is absolute: native requests use the protocol-native provider, and aliases, raw Baseten slugs, Baseten model mappings, dedicated Baseten subagents, fallback, and Baseten credentials are not consulted by request resolution. Saved policy remains editable and becomes active again when On. |
+| `fallback_policy` | object | both triggers On | Independent controls for automatic native fallback after Baseten HTTP 429 and HTTP 5xx responses. An absent block or absent child resolves On. Explicit `null` is invalid. See below. |
 | `auth` | map[route] -> secret ref | (empty) | Environment fallback credentials per upstream route. The selected Baseten CLI profile supplies its OAuth or API-key credential automatically. `${VAR}` resolves from env or `~/.config/baseten-switch/env`. |
 | `telemetry_dir` | string | `~/.config/baseten-switch/telemetry` | Private directory containing versioned, monthly JSONL request segments. |
 | `telemetry_enabled` | bool | `true` | Toggle per-request telemetry collection. Disabling collection preserves existing history. |
@@ -28,6 +29,27 @@ SIGHUP. The native Mac app edits the same file through `baseten-switch`.
 | `retry_max` | int | `3` | Gateway-level retry count against upstream failures. |
 | `request_timeout` | duration | `600s` | Hard per-request timeout (Go duration syntax). |
 | `ttft_timeout` | duration | (disabled) | Time-to-first-byte deadline per upstream attempt (Go duration syntax; absent or `0` disables). Expiry before a response begins permits the configured fallback; a final attempt or explicit model choice returns 504. The deadline never interrupts an active stream. Telemetry records `fallback_trigger: "ttft_timeout"`. Malformed or negative values refuse the config at load. Start with `30s` and tune for your workload. Per-client `ttft_timeout` overrides this value. |
+
+### `global.fallback_policy`
+
+```yaml
+global:
+  fallback_policy:
+    on_baseten_429: true
+    on_baseten_5xx: true
+```
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `on_baseten_429` | bool | `true` | Permit one configured protocol-native attempt after an eligible Baseten HTTP 429 response. Off relays the Baseten response and preserves `Retry-After`. |
+| `on_baseten_5xx` | bool | `true` | Permit one configured protocol-native attempt after an eligible Baseten status from 500 through 599. |
+
+The controls apply only when request resolution has a valid native target and
+before response bytes reach the harness. They do not create fallback for
+global routing Off, a native primary, an unknown alias, or a client without a
+native `fallback_route`. They do not expand transport, TTFT, authentication,
+request-build, image, or reasoning-policy fallback for explicit Baseten
+identities.
 
 ### `global.trace_capture`
 
@@ -120,7 +142,7 @@ Each client entry maps one harness to one local bind address.
 | `protocol_shape` | enum: `anthropic`,`openai` | `anthropic` | Wire shape the harness sends to the gateway. It selects the listener handler and native provider: `/v1/messages` and Anthropic for `anthropic`, `/v1/chat/completions` and OpenAI for `openai`. An anthropic listener with `upstream_shape: openai` uses cross-shape translation for Baseten traffic. The reverse translation is unsupported. |
 | `auth_token` | object | (empty) | Incoming-auth: what the harness sends to the gateway. |
 | `default_model` | baseten slug | (required for enabled clients) | Baseten target for requests that do not match an explicit `model_routes` family mapping. Must contain `/`. Disabled clients may omit it while parked. |
-| `model_aliases` | map[alias id] -> baseten slug | (empty) | Anthropic-shape clients only. Defines stable picker and request model IDs. The gateway also synthesizes aliases into `GET /v1/models` for compatibility with older Claude Code gateway-discovery clients. Alias ids must begin with `claude` or `anthropic` and must not shadow real Anthropic model names (`claude-opus-*`, `claude-sonnet-*`, `claude-haiku-*`, `claude-instant-*`, `claude-<digit>*`); violations refuse the config at load. While global routing is On, a request naming an alias or raw Baseten slug is an explicit Baseten choice with no fallback. While Off, it fails locally with guidance to select a native model or turn routing On; no Baseten credential or endpoint is accessed. Unknown gateway aliases remain a loud error. |
+| `model_aliases` | map[alias id] -> baseten slug | (empty) | Anthropic-shape clients only. Defines stable picker and request model IDs. The gateway also synthesizes aliases into `GET /v1/models` for compatibility with older Claude Code gateway-discovery clients. Alias ids must begin with `claude` or `anthropic` and must not shadow real Anthropic model names (`claude-opus-*`, `claude-sonnet-*`, `claude-haiku-*`, `claude-instant-*`, `claude-<digit>*`); violations refuse the config at load. While global routing is On, a request naming an alias or raw Baseten slug is an explicit Baseten primary. Eligible 429 and 5xx responses use `native_fallback_model` when configured. While Off, the request fails locally without consulting Baseten. Unknown gateway aliases remain a loud error. |
 | `model_picker` | object | (absent) | Anthropic-shape clients only. Ordered desired projection into Claude Code's user-level `modelPicker`. An absent block means the integration has not been configured; a present disabled or empty block remains explicit saved intent. See `model_picker` below. |
 | `subagent_model` | string | (empty) | Anthropic-shape clients only. Rewrite target for Claude Code subagent requests. When global routing is On, the rewrite runs before the normal explicit-choice, family-mapping, and default-mapping ladder. When Off, saved subagent configuration is inactive and the original native model passes through. |
 | `subagent_routing` | enum: `on`,`off` | (absent) | Anthropic-shape clients only. Live toggle for the `subagent_model` rewrite, so the menubar can flip it without losing the configured model. `on` enables the rewrite; `off` disables it (sidechain traffic passes untouched, exact factory behavior). Absent means `on` when `subagent_model` is set, so the field exists purely as the off switch. Enabled = `subagent_model` non-empty and `subagent_routing` is not `off`. Validation at load: a value other than empty/`on`/`off`, or `subagent_routing` set while `subagent_model` is empty, is a config-load error. The `baseten-switch claude subagents on|off` verb flips this field then SIGHUPs the gateway; live sessions pick it up on their next sidechain request. |
@@ -131,7 +153,15 @@ Each client entry maps one harness to one local bind address.
 | `responses_compatibility` | object | (absent, all rules `off`) | OpenAI-shape clients only. Configures isolated Responses API safeguards for Baseten attempts. A present block receives the per-rule defaults below; omitting the entire block keeps every rule off. Unknown fields and modes refuse the config. Changes replace the resolved policy on SIGHUP and participate in the listener config hash. |
 | `responses_strip_tool_types` | list[string] | (empty) | OpenAI-shape clients only; the field on an Anthropic-shape client refuses the config at load. Tool types listed here are stripped from `tools[]` before a Baseten `/v1/responses` attempt. An object-form `tool_choice` referencing a stripped type is rewritten; string forms like `auto` are untouched. A native fallback keeps the original body byte-for-byte. Telemetry and stderr logs report stripping. Empty entries are invalid, list order is preserved, and a list change respawns the listener on SIGHUP. |
 | `ttft_timeout` | duration | inherit `global.ttft_timeout` | Per-harness override of the first-byte deadline (see `global.ttft_timeout` for semantics). `0` disables it for this harness even when the global value is set. |
-| `fallback_route` | enum: `anthropic`,`openai` | protocol-native in new configs | Accepts only `NativeRoute(protocol_shape)` or an absent value. It is eligible after default or mapped Baseten policy fails, but is inactive for global Off, native mappings, and explicit alias or raw-slug choices. Anthropic-shape 429 responses relay to the harness without fallback or cooldown; OpenAI-shape 429 responses remain fallback-eligible. |
+| `fallback_route` | enum: `anthropic`,`openai` | protocol-native in new configs | Native provider for an eligible fallback attempt. It must equal `NativeRoute(protocol_shape)`. Global routing Off and native primary routes do not use it. |
+| `native_fallback_model` | string | (empty); `claude-opus-5` for Claude Code in new and migrated configs | Anthropic-shape client target used only when a request starts with a configured Baseten alias or raw slug. Native-origin requests preserve their exact ingress model and body. The value requires `fallback_route`, must be a full Anthropic model ID, and must not be a Baseten slug, configured alias, gateway alias, compatibility sentinel, family token, or whitespace-padded value. OpenAI-shape clients reject this field; managed Codex compatibility requests remain terminal. |
+
+Before a new router process activates an existing configuration, the launcher
+adds `native_fallback_model: claude-opus-5` to the `claude-code` client when
+that client has `fallback_route: anthropic` and no explicit target. The
+migration preserves an existing valid target, writes a unique exact-byte
+backup, preserves the active file's permissions and comments, validates the
+result before installation, and is idempotent.
 
 ### `model_picker`
 

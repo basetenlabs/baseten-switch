@@ -250,6 +250,10 @@ private struct RequestTableRow: View {
         requestFallbackReason(item.fallback)
     }
 
+    private var fallbackHelp: String? {
+        requestFallbackHelp(item.fallback)
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             Text(requestCompletedAtLabel(item.completedAt))
@@ -305,8 +309,9 @@ private struct RequestTableRow: View {
                         .background(
                             Color.orange.opacity(0.12),
                             in: Capsule())
-                        .help(fallbackReason)
+                        .help(fallbackHelp ?? fallbackReason)
                         .accessibilityIdentifier("request-fallback-reason")
+                        .accessibilityLabel(fallbackHelp ?? fallbackReason)
                 } else {
                     Text("None")
                         .font(.caption)
@@ -499,8 +504,35 @@ func requestIsError(_ item: RequestItem) -> Bool {
 }
 
 func requestFallbackReason(_ fallback: RequestFallback?) -> String? {
-    guard fallback?.attempted == true else { return nil }
-    return requestFallbackLabel(fallback?.trigger)
+    guard let fallback else { return nil }
+    if fallback.attempted {
+        return requestFallbackLabel(fallback.trigger)
+    }
+    switch fallback.suppressedReason {
+    case "policy_disabled_http_429", "policy_disabled_http_5xx":
+        return "Disabled by setting"
+    case "native_target_unconfigured":
+        return "Fallback target not configured"
+    default:
+        return nil
+    }
+}
+
+func requestFallbackHelp(_ fallback: RequestFallback?) -> String? {
+    guard let fallback else { return nil }
+    if fallback.attempted {
+        return requestFallbackLabel(fallback.trigger)
+    }
+    switch fallback.suppressedReason {
+    case "policy_disabled_http_429":
+        return "Automatic fallback for HTTP 429 is disabled by setting."
+    case "policy_disabled_http_5xx":
+        return "Automatic fallback for HTTP 5xx is disabled by setting."
+    case "native_target_unconfigured":
+        return "Automatic fallback was enabled, but a native fallback target is not configured."
+    default:
+        return nil
+    }
 }
 
 func requestModelLabel(_ item: RequestItem) -> String {

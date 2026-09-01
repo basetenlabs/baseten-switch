@@ -7,6 +7,11 @@ global:
   # One global switch. Off is absolute native passthrough; On applies saved routing policy.
   routing_enabled: true
 
+  # Independent status classes that may transition a Baseten attempt to the native provider.
+  fallback_policy:
+    on_baseten_429: true
+    on_baseten_5xx: true
+
   # The selected Baseten CLI profile supplies OAuth or API-key auth automatically.
   # baseten below is only the explicit environment fallback; see schema.md.
   auth:
@@ -67,9 +72,11 @@ clients:
     # Route Claude Code subagent (sidechain) traffic to a model; toggle with 'baseten-switch claude subagents'. See the subagent-routing contract.
     # subagent_model: claude-baseten-glm-5-2
     # subagent_routing: on
-    # Tried when baseten is unreachable, returns 5xx, or ttft_timeout expires (30s cooldown).
-    # Anthropic 429 responses relay to the harness without fallback or cooldown.
+    # Native provider used after an eligible Baseten attempt fails.
     fallback_route: anthropic
+    # Used only when a Claude request starts with a Baseten alias or raw slug.
+    # Native-origin requests retain the exact model Claude requested.
+    native_fallback_model: claude-opus-5
 
   # codex ships parked (enabled: false; no listener bound); 'baseten-switch codex on' offers to
   # enable it, or set enabled: true and SIGHUP the router yourself.

@@ -76,6 +76,8 @@ type telemetryCompletionV1 struct {
 	providerStopReason       *string
 	fallbackCount            int
 	fallbackTrigger          *string
+	fallbackSuppressedReason *string
+	fallbackModelSource      *string
 	primary                  *telemetry.PrimaryV1
 	subagent                 bool
 	subagentModel            *string
@@ -363,9 +365,11 @@ func (request telemetryRequestCaptureV1) event(
 		ActualCost:               actual,
 		NativeCounterfactualCost: nativeCounterfactual,
 		Fallback: telemetry.FallbackV1{
-			Attempted: completion.fallbackCount > 0,
-			Count:     completion.fallbackCount,
-			Trigger:   cloneStringPointer(completion.fallbackTrigger),
+			Attempted:        completion.fallbackCount > 0,
+			Count:            completion.fallbackCount,
+			Trigger:          cloneStringPointer(completion.fallbackTrigger),
+			SuppressedReason: cloneStringPointer(completion.fallbackSuppressedReason),
+			ModelSource:      cloneStringPointer(completion.fallbackModelSource),
 		},
 		Primary:           clonePrimaryV1(completion.primary),
 		Subagent:          completion.subagent,
@@ -885,6 +889,12 @@ func (g *Gateway) recordTelemetryV1(
 	completion.fallbackCount = at.fallbackCount
 	if completion.fallbackTrigger == nil && at.fallbackTrigger != "" {
 		completion.fallbackTrigger = stringPointer(at.fallbackTrigger)
+	}
+	if completion.fallbackSuppressedReason == nil && at.fallbackSuppressedReason != "" {
+		completion.fallbackSuppressedReason = stringPointer(at.fallbackSuppressedReason)
+	}
+	if completion.fallbackModelSource == nil && at.fallbackModelSource != "" {
+		completion.fallbackModelSource = stringPointer(at.fallbackModelSource)
 	}
 	if completion.primary == nil {
 		completion.primary = at.primary

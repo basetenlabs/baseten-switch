@@ -246,6 +246,9 @@ gateway binds 127.0.0.1 only.
 	{"config", "Initialize or reset gateway configuration", `Usage:
   baseten-switch config init [--force]
   baseten-switch config reset --yes [--preview-root PATH --router-addr HOST:PORT --door-addr HOST:PORT]
+  baseten-switch config fallback status
+  baseten-switch config fallback 429|5xx on|off [mutation options]
+  baseten-switch config fallback model <client> [<native-model>] [mutation options]
 
 init writes the canonical single-port gateway.yaml, refuses to overwrite by
 default, and backs up the old file before --force replacement.
@@ -254,6 +257,9 @@ reset replaces the entire active config, saves a unique 0600 exact-byte
 backup, validates, and hot-reloads a running router. Activation failure
 restores and reactivates the prior bytes. The three Preview flags must be
 supplied together.
+
+fallback reads or changes the automatic native-provider fallback policy and
+the per-client native target used for Baseten-specific model identities.
 `},
 	{"setup", "Check prerequisites, sign in, and initialize configuration", `Usage: baseten-switch setup
 
@@ -457,6 +463,8 @@ func commandOptionConsumesValue(args []string, index int) bool {
 			return valueOption &&
 				index+1 < len(args) &&
 				!strings.HasPrefix(args[index+1], "--")
+		case "fallback":
+			return mutationValue
 		case "preview-snapshot":
 			return option == "--source" ||
 				option == "--output" ||
@@ -647,6 +655,11 @@ func cmdGatewayStart(args []string) int {
 		fmt.Fprintf(os.Stderr, "gateway already running on 127.0.0.1:%d\n", port)
 		return 0
 	}
+	if err := migrateFallbackPolicyBeforeStart(cfg.ConfigPath, os.Stderr); err != nil {
+		fmt.Fprintf(os.Stderr, "gateway start: fallback policy config migration failed: %v\n", err)
+		return 1
+	}
+	cfg = gateway.LoadConfig()
 	if foreground {
 		return runForeground(cfg)
 	}

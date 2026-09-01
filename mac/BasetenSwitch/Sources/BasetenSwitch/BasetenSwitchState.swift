@@ -29,6 +29,25 @@ struct PendingGlobalRouting: Equatable, Sendable {
     var phase: MutationPhase
 }
 
+enum FallbackPolicyTrigger: String, Equatable, Sendable {
+    case http429 = "429"
+    case http5xx = "5xx"
+}
+
+struct PendingFallbackPolicyMutation: Equatable, Sendable {
+    let operationID: String
+    let trigger: FallbackPolicyTrigger
+    let requested: Bool
+    var phase: MutationPhase
+}
+
+struct PendingBasetenModelFallbackMutation: Equatable, Sendable {
+    let operationID: String
+    let client: String
+    let requestedModel: String
+    var phase: MutationPhase
+}
+
 struct PendingControlMutation: Equatable, Sendable {
     let operationID: String
     let requestedTarget: String
@@ -97,6 +116,10 @@ final class BasetenSwitchState: ObservableObject {
     @Published private(set) var reauthenticating = false
     @Published private(set) var runtimeTrust: RuntimeTrust
     @Published private(set) var pendingGlobalRouting: PendingGlobalRouting?
+    @Published private(set) var pendingFallbackPolicy:
+        PendingFallbackPolicyMutation?
+    @Published private(set) var pendingBasetenModelFallback:
+        PendingBasetenModelFallbackMutation?
     @Published private(set) var pendingFamilyRoutes: [String: PendingControlMutation] = [:]
     @Published private(set) var pendingCodexRoute: PendingControlMutation?
     @Published private(set) var pendingSubagents: [String: PendingControlMutation] = [:]
@@ -157,6 +180,40 @@ final class BasetenSwitchState: ObservableObject {
     }
     var globalMutationPhase: MutationPhase? {
         pendingGlobalRouting?.phase
+    }
+    var confirmedFallbackPolicy: FallbackPolicyStatus? {
+        routingSnapshot?.fallbackPolicy
+    }
+    var displayedFallback429: Bool {
+        if pendingFallbackPolicy?.trigger == .http429 {
+            return pendingFallbackPolicy?.requested ?? false
+        }
+        return confirmedFallbackPolicy?.onBaseten429 ?? false
+    }
+    var displayedFallback5xx: Bool {
+        if pendingFallbackPolicy?.trigger == .http5xx {
+            return pendingFallbackPolicy?.requested ?? false
+        }
+        return confirmedFallbackPolicy?.onBaseten5xx ?? false
+    }
+    var fallbackPolicyWarningVisible: Bool {
+        displayedFallback429 || displayedFallback5xx
+    }
+    var fallbackPolicyUnavailableMessage: String? {
+        automaticFallbackUnavailableMessage(
+            supportsFallbackPolicy:
+                routingSnapshot?.supportsFallbackPolicy == true,
+            policy: routingSnapshot?.fallbackPolicy)
+    }
+    var hasAnyConfigMutation: Bool {
+        pendingGlobalRouting != nil
+            || pendingFallbackPolicy != nil
+            || pendingBasetenModelFallback != nil
+            || !pendingFamilyRoutes.isEmpty
+            || pendingCodexRoute != nil
+            || !pendingSubagents.isEmpty
+            || pendingReasoning != nil
+            || pendingClaudeModelPicker != nil
     }
     var hasFallback: Bool {
         clients.contains { $0.enabled && $0.fallbackActive }
@@ -260,6 +317,10 @@ final class BasetenSwitchState: ObservableObject {
                 version: fixture.routerVersion,
                 uptimeSeconds: fixture.uptimeSeconds,
                 globalRoutingEnabled: globalRoutingState(fixture.clients) != .off,
+                capabilities: ["global_routing", "fallback_policy"],
+                fallbackPolicy: FallbackPolicyStatus(
+                    onBaseten429: true,
+                    onBaseten5xx: true),
                 auth: fixture.auth,
                 clients: fixture.clients)
         } else {
@@ -869,10 +930,233 @@ final class BasetenSwitchState: ObservableObject {
               canMutate,
               mutationRecoveryAllowsRouting,
               let snapshot = routingSnapshot else { return false }
-        return snapshot.supportsGlobalRouting
+        return pendingFallbackPolicy == nil
+            && pendingBasetenModelFallback == nil
+            && snapshot.supportsGlobalRouting
             && snapshot.token.isAuthoritative
             && snapshot.token.activeGeneration > 0
             && snapshot.desiredMatchesActive
+    }
+
+    // MARK: - Automatic fallback
+
+    var canMutateFallbackSettings: Bool {
+        guard gatewayUp,
+              canMutate,
+              mutationRecoveryAllowsRouting,
+              !hasAnyConfigMutation,
+              let snapshot = routingSnapshot else { return false }
+        return snapshot.supportsFallbackPolicy
+            && snapshot.fallbackPolicy != nil
+            && snapshot.token.isAuthoritative
+            && snapshot.token.activeGeneration > 0
+            && snapshot.desiredMatchesActive
+    }
+
+    var fallbackPolicyMutationDisabledReason: String? {
+        if let pendingFallbackPolicy {
+            let state = pendingFallbackPolicy.requested ? "On" : "Off"
+            return "Waiting for the gateway to confirm the "
+                + pendingFallbackPolicy.trigger.rawValue
+                + " setting as " + state + "."
+        }
+        if pendingBasetenModelFallback != nil || hasAnyConfigMutation {
+            return "Another configuration change is still in progress."
+        }
+        guard gatewayUp else { return "The local gateway is unavailable." }
+        guard canMutate else { return runtimeTrustError }
+        if let recoveryReason = mutationRecoveryDisabledReason {
+            return recoveryReason
+        }
+        guard let snapshot = routingSnapshot,
+              snapshot.supportsFallbackPolicy,
+              snapshot.fallbackPolicy != nil else {
+            return "Update the local gateway to configure automatic fallback."
+        }
+        guard snapshot.desiredMatchesActive else {
+            return "The saved and active configurations differ. Resolve the reload error first."
+        }
+        return nil
+    }
+
+    func requestFallbackPolicy(
+        _ trigger: FallbackPolicyTrigger,
+        enabled: Bool
+    ) {
+        Task { await setFallbackPolicy(trigger, enabled: enabled) }
+    }
+
+    func setFallbackPolicy(
+        _ trigger: FallbackPolicyTrigger,
+        enabled: Bool
+    ) async {
+        guard canMutateFallbackSettings else { return }
+        let confirmed = trigger == .http429
+            ? confirmedFallbackPolicy?.onBaseten429
+            : confirmedFallbackPolicy?.onBaseten5xx
+        guard confirmed != enabled else { return }
+        let operationID = UUID().uuidString.lowercased()
+        pendingFallbackPolicy = PendingFallbackPolicyMutation(
+            operationID: operationID,
+            trigger: trigger,
+            requested: enabled,
+            phase: .applying)
+        scheduleReconciling(
+            key: "fallback-policy",
+            operationID: operationID)
+
+        // A fresh read barrier prevents two quick changes from reusing stale
+        // active-token and config-hash preconditions.
+        await refreshAfterMutation()
+        guard pendingFallbackPolicy?.operationID == operationID,
+              let snapshot = routingSnapshot,
+              !snapshotIsStale,
+              snapshot.supportsFallbackPolicy,
+              snapshot.desiredMatchesActive else {
+            lastError = "Automatic fallback settings changed before this request could start. Refresh and try again."
+            clearFallbackPolicyMutation(operationID: operationID)
+            return
+        }
+        let requestedTarget = enabled ? "on" : "off"
+        let arguments = mutationArguments(
+            operationID: operationID,
+            snapshot: snapshot,
+            command: fallbackPolicyDispatchArgs(
+                trigger: trigger,
+                enabled: enabled))
+        let attempt = await executePolicyMutation(
+            arguments,
+            operationID: operationID,
+            requestIdentity: PolicyMutationRequestIdentity(
+                operation: "set_fallback_policy",
+                client: "",
+                key: trigger.rawValue,
+                requestedTarget: requestedTarget))
+        await refreshAfterMutation()
+        let policy = routingSnapshot?.fallbackPolicy
+        let activeValue = trigger == .http429
+            ? policy?.onBaseten429
+            : policy?.onBaseten5xx
+        let receipt = attempt.receipt
+        let confirmedMutation = !snapshotIsStale
+            && attempt.result.succeeded
+            && receipt?.ok == true
+            && receipt?.operationID == operationID
+            && receipt?.operation == "set_fallback_policy"
+            && receiptRequestIdentityConfirms(
+                receipt,
+                key: trigger.rawValue,
+                requestedTarget: requestedTarget,
+                verifiedTerminalReplay: attempt.verifiedTerminalReplay)
+            && receipt?.requested == enabled
+            && receipt?.applied == true
+            && activeValue == enabled
+            && hashesConfirm(receipt)
+        if confirmedMutation {
+            lastError = nil
+        } else {
+            lastError = attempt.primaryTimedOut
+                ? "The automatic fallback change timed out and could not be confirmed."
+                : mutationFailureMessage(
+                    receipt,
+                    fallback: "The automatic fallback change was not present in the active gateway state.")
+        }
+        clearFallbackPolicyMutation(operationID: operationID)
+    }
+
+    private func clearFallbackPolicyMutation(operationID: String) {
+        guard pendingFallbackPolicy?.operationID == operationID else { return }
+        clearPending(key: "fallback-policy", operationID: operationID)
+        pendingFallbackPolicy = nil
+    }
+
+    func requestBasetenModelFallback(
+        client: String,
+        model: String
+    ) {
+        Task { await setBasetenModelFallback(client: client, model: model) }
+    }
+
+    func setBasetenModelFallback(
+        client: String,
+        model: String
+    ) async {
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard canMutateFallbackSettings,
+              client == "claude-code",
+              isAcceptedClaudeNativeModelID(trimmed),
+              clients.first(where: { $0.name == client })?
+                .basetenModelFallback?.resolvedModel != trimmed else { return }
+        let operationID = UUID().uuidString.lowercased()
+        pendingBasetenModelFallback = PendingBasetenModelFallbackMutation(
+            operationID: operationID,
+            client: client,
+            requestedModel: trimmed,
+            phase: .applying)
+        scheduleReconciling(
+            key: "baseten-model-fallback",
+            operationID: operationID)
+        await refreshAfterMutation()
+        guard pendingBasetenModelFallback?.operationID == operationID,
+              let snapshot = routingSnapshot,
+              !snapshotIsStale,
+              snapshot.supportsFallbackPolicy,
+              snapshot.desiredMatchesActive else {
+            lastError = "The fallback target changed before this request could start. Refresh and try again."
+            clearBasetenModelFallbackMutation(operationID: operationID)
+            return
+        }
+        let arguments = mutationArguments(
+            operationID: operationID,
+            snapshot: snapshot,
+            command: basetenModelFallbackDispatchArgs(
+                client: client,
+                model: trimmed))
+        let attempt = await executePolicyMutation(
+            arguments,
+            operationID: operationID,
+            requestIdentity: PolicyMutationRequestIdentity(
+                operation: "set_native_fallback_model",
+                client: client,
+                key: "native_fallback_model",
+                requestedTarget: trimmed))
+        await refreshAfterMutation()
+        let receipt = attempt.receipt
+        let confirmedMutation = !snapshotIsStale
+            && attempt.result.succeeded
+            && receipt?.ok == true
+            && receipt?.operationID == operationID
+            && receipt?.operation == "set_native_fallback_model"
+            && receipt?.client == client
+            && receiptRequestIdentityConfirms(
+                receipt,
+                key: "native_fallback_model",
+                requestedTarget: trimmed,
+                verifiedTerminalReplay: attempt.verifiedTerminalReplay)
+            && receipt?.applied == true
+            && hashesConfirm(receipt)
+            && clients.first(where: { $0.name == client })?
+                .basetenModelFallback?.resolvedModel == trimmed
+        if confirmedMutation {
+            lastError = nil
+        } else {
+            lastError = attempt.primaryTimedOut
+                ? "The fallback target change timed out and could not be confirmed."
+                : mutationFailureMessage(
+                    receipt,
+                    fallback: "The fallback target was not present in the active gateway state.")
+        }
+        clearBasetenModelFallbackMutation(operationID: operationID)
+    }
+
+    private func clearBasetenModelFallbackMutation(operationID: String) {
+        guard pendingBasetenModelFallback?.operationID == operationID else {
+            return
+        }
+        clearPending(
+            key: "baseten-model-fallback",
+            operationID: operationID)
+        pendingBasetenModelFallback = nil
     }
 
     var routingMutationDisabledReason: String? {
@@ -1289,7 +1573,9 @@ final class BasetenSwitchState: ObservableObject {
               canMutate,
               mutationRecoveryAllowsRouting,
               let snapshot = routingSnapshot else { return false }
-        return snapshot.token.isAuthoritative
+        return pendingFallbackPolicy == nil
+            && pendingBasetenModelFallback == nil
+            && snapshot.token.isAuthoritative
             && snapshot.token.activeGeneration > 0
             && snapshot.desiredMatchesActive
     }
@@ -1567,7 +1853,9 @@ final class BasetenSwitchState: ObservableObject {
               canMutate,
               mutationRecoveryAllowsRouting,
               let snapshot = routingSnapshot else { return false }
-        return snapshot.token.isAuthoritative
+        return pendingFallbackPolicy == nil
+            && pendingBasetenModelFallback == nil
+            && snapshot.token.isAuthoritative
             && snapshot.token.activeGeneration > 0
             && snapshot.desiredMatchesActive
     }
@@ -1991,6 +2279,12 @@ final class BasetenSwitchState: ObservableObject {
         if pendingGlobalRouting?.operationID == operationID {
             pendingGlobalRouting?.phase = .reconciling
         }
+        if pendingFallbackPolicy?.operationID == operationID {
+            pendingFallbackPolicy?.phase = .reconciling
+        }
+        if pendingBasetenModelFallback?.operationID == operationID {
+            pendingBasetenModelFallback?.phase = .reconciling
+        }
         for key in pendingFamilyRoutes.keys
         where pendingFamilyRoutes[key]?.operationID == operationID {
             pendingFamilyRoutes[key]?.phase = .reconciling
@@ -2165,6 +2459,12 @@ final class BasetenSwitchState: ObservableObject {
             if key == "global",
                self.pendingGlobalRouting?.operationID == operationID {
                 self.pendingGlobalRouting?.phase = .reconciling
+            } else if key == "fallback-policy",
+                      self.pendingFallbackPolicy?.operationID == operationID {
+                self.pendingFallbackPolicy?.phase = .reconciling
+            } else if key == "baseten-model-fallback",
+                      self.pendingBasetenModelFallback?.operationID == operationID {
+                self.pendingBasetenModelFallback?.phase = .reconciling
             } else if key.hasPrefix("family:"),
                       self.pendingFamilyRoutes[key]?.operationID == operationID {
                 self.pendingFamilyRoutes[key]?.phase = .reconciling
@@ -2295,9 +2595,56 @@ func routingPresentationEqual(_ lhs: RoutingSnapshot,
         && lhs.configPath == rhs.configPath
         && lhs.capabilities == rhs.capabilities
         && lhs.globalRoutingEnabled == rhs.globalRoutingEnabled
+        && lhs.fallbackPolicy == rhs.fallbackPolicy
         && lhs.reload == rhs.reload
         && lhs.auth == rhs.auth
         && lhs.clients == rhs.clients
+}
+
+func isAcceptedClaudeNativeModelID(_ model: String) -> Bool {
+    guard model == model.trimmingCharacters(in: .whitespacesAndNewlines),
+          model.hasPrefix("claude-") else { return false }
+    let suffix = String(model.dropFirst("claude-".count))
+    guard let first = suffix.unicodeScalars.first else { return false }
+    let startsWithAllowedFamily = [
+        "opus", "sonnet", "haiku", "instant", "fable", "mythos",
+    ].contains(where: suffix.hasPrefix)
+    guard (48...57).contains(first.value)
+            || startsWithAllowedFamily else { return false }
+    return suffix.unicodeScalars.allSatisfy { scalar in
+        let value = scalar.value
+        return (48...57).contains(value)
+            || (65...90).contains(value)
+            || (97...122).contains(value)
+            || value == 46 || value == 95 || value == 45
+    }
+}
+
+func fallbackPolicyDispatchArgs(
+    trigger: FallbackPolicyTrigger,
+    enabled: Bool
+) -> [String] {
+    [
+        "config", "fallback", trigger.rawValue,
+        enabled ? "on" : "off",
+    ]
+}
+
+func automaticFallbackUnavailableMessage(
+    supportsFallbackPolicy: Bool,
+    policy: FallbackPolicyStatus?
+) -> String? {
+    guard supportsFallbackPolicy, policy != nil else {
+        return "Update the local gateway to configure automatic fallback."
+    }
+    return nil
+}
+
+func basetenModelFallbackDispatchArgs(
+    client: String,
+    model: String
+) -> [String] {
+    ["config", "fallback", "model", client, model]
 }
 
 func projectedUptimeSeconds(snapshot: RoutingSnapshot?,

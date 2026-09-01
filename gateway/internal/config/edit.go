@@ -1305,6 +1305,8 @@ func scalarFieldValue(c *Client, key string) string {
 		return c.SubagentModel
 	case "subagent_routing":
 		return c.SubagentRouting
+	case "native_fallback_model":
+		return c.NativeFallbackModel
 	case "enabled":
 		// Bool field rendered back to the written token; never "", so
 		// the missing-value check in scalarVerify cannot false-fire.

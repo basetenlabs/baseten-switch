@@ -236,9 +236,11 @@ type CostSnapshotV1 struct {
 }
 
 type FallbackV1 struct {
-	Attempted bool    `json:"attempted"`
-	Count     int     `json:"count"`
-	Trigger   *string `json:"trigger"`
+	Attempted        bool    `json:"attempted"`
+	Count            int     `json:"count"`
+	Trigger          *string `json:"trigger"`
+	SuppressedReason *string `json:"suppressed_reason,omitempty"`
+	ModelSource      *string `json:"model_source,omitempty"`
 }
 
 // PrimaryV1 preserves the bounded outcome of the planned primary route when
@@ -317,6 +319,19 @@ func (e EventV1) Validate() error {
 		return errors.New("telemetry fallback count must be nonnegative")
 	case !e.Fallback.Attempted && e.Fallback.Count != 0:
 		return errors.New("telemetry fallback count requires attempted=true")
+	case e.Fallback.Attempted && e.Fallback.SuppressedReason != nil:
+		return errors.New("telemetry attempted fallback cannot record a suppression reason")
+	case !e.Fallback.Attempted && e.Fallback.ModelSource != nil:
+		return errors.New("telemetry fallback model source requires attempted=true")
+	case e.Fallback.SuppressedReason != nil &&
+		*e.Fallback.SuppressedReason != "policy_disabled_http_429" &&
+		*e.Fallback.SuppressedReason != "policy_disabled_http_5xx" &&
+		*e.Fallback.SuppressedReason != "native_target_unconfigured":
+		return fmt.Errorf("telemetry fallback suppressed_reason = %q is invalid", *e.Fallback.SuppressedReason)
+	case e.Fallback.ModelSource != nil &&
+		*e.Fallback.ModelSource != "original_request" &&
+		*e.Fallback.ModelSource != "configured_target":
+		return fmt.Errorf("telemetry fallback model_source = %q is invalid", *e.Fallback.ModelSource)
 	case e.Primary != nil && !e.Fallback.Attempted:
 		return errors.New("telemetry primary summary requires fallback attempted=true")
 	case e.ToolCalls < 0:
@@ -337,7 +352,9 @@ func (e EventV1) Validate() error {
 		switch {
 		case e.EffectiveProvider != "anthropic":
 			return errors.New("telemetry classified Auto request requires effective_provider=anthropic")
-		case e.Fallback.Attempted || e.Fallback.Count != 0 || e.Fallback.Trigger != nil:
+		case e.Fallback.Attempted || e.Fallback.Count != 0 ||
+			e.Fallback.Trigger != nil || e.Fallback.SuppressedReason != nil ||
+			e.Fallback.ModelSource != nil:
 			return errors.New("telemetry classified Auto request cannot record fallback")
 		case e.Primary != nil:
 			return errors.New("telemetry classified Auto request cannot record a primary attempt")

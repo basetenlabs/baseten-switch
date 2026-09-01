@@ -407,10 +407,10 @@ func (g *Gateway) activeRoutingState() activeRoutingState {
 }
 
 func fallbackStatus(g *Gateway, rc resolvedClientConfig) map[string]any {
-	deadline, active := g.fallbackDeadline(rc.Name)
+	state, active := g.policyAwareFallbackCooldown(rc)
 	var retryAfter any
 	if active {
-		retryAfter = deadline.UTC().Format(time.RFC3339Nano)
+		retryAfter = state.Until.UTC().Format(time.RFC3339Nano)
 	}
 	cause := ""
 	served := ""
@@ -422,6 +422,86 @@ func fallbackStatus(g *Gateway, rc resolvedClientConfig) map[string]any {
 		"active": active, "served_route": served, "cause": cause,
 		"since": nil, "retry_after": retryAfter,
 	}
+}
+
+func (g *Gateway) policyAwareFallbackCooldown(rc resolvedClientConfig) (fallbackCooldownState, bool) {
+	state, active := g.activeFallbackCooldown(rc.Name)
+	return state, active && cooldownEligible(rc.resolvedFallbackPolicy(), fallbackAllowLegacy, state)
+}
+
+func basetenModelFallbackStatus(rc resolvedClientConfig, desiredActiveMismatch bool) map[string]any {
+	model := rc.NativeFallbackModel
+	providerReady := nativeFallbackProviderReady(rc)
+	ready := model != "" && providerReady && config.IsProtocolNativeModel(rc.ProtocolShape, model)
+	var reason any
+	switch {
+	case desiredActiveMismatch:
+		reason = "desired_active_mismatch"
+		ready = false
+	case model == "":
+		reason = "not_configured"
+	case !providerReady:
+		reason = "provider_auth_unavailable"
+	case !ready:
+		reason = "not_configured"
+	}
+	return map[string]any{
+		"configured_model": model,
+		"resolved_model":   model,
+		"display_name":     nativeFallbackDisplayName(model),
+		"provider_ready":   providerReady,
+		"ready":            ready,
+		"reason":           reason,
+		"available_models": nativeFallbackAvailableModels(rc),
+	}
+}
+
+func nativeFallbackAvailableModels(rc resolvedClientConfig) []map[string]any {
+	candidates := make([]string, 0, 2+len(modelFamilySet))
+	candidates = append(
+		candidates,
+		rc.NativeFallbackModel,
+		config.DefaultClaudeNativeFallbackModel,
+	)
+	for _, family := range modelFamilySet {
+		candidates = append(candidates, familyRepresentativeIDs[family])
+	}
+
+	seen := make(map[string]struct{}, len(candidates))
+	models := make([]map[string]any, 0, len(candidates))
+	for _, model := range candidates {
+		if !config.IsProtocolNativeModel(rc.ProtocolShape, model) {
+			continue
+		}
+		if _, duplicate := seen[model]; duplicate {
+			continue
+		}
+		seen[model] = struct{}{}
+		models = append(models, map[string]any{
+			"model":        model,
+			"display_name": nativeFallbackDisplayName(model),
+		})
+	}
+	return models
+}
+
+func nativeFallbackProviderReady(rc resolvedClientConfig) bool {
+	// Native attempts preserve per-request harness authentication. Readiness
+	// here therefore means the active client has a shape-compatible native
+	// route; process-level API-key environment is not authoritative.
+	return rc.FallbackRoute != "" && rc.FallbackRoute == config.NativeRoute(rc.ProtocolShape)
+}
+
+func nativeFallbackDisplayName(model string) string {
+	lower := strings.ToLower(model)
+	for _, family := range []struct{ token, label string }{
+		{"opus", "Opus"}, {"sonnet", "Sonnet"}, {"haiku", "Haiku"}, {"fable", "Fable"},
+	} {
+		if strings.Contains(lower, family.token) {
+			return family.label
+		}
+	}
+	return model
 }
 
 func providerDisplayName(provider string) string {
@@ -492,8 +572,11 @@ func resolvedStatusClient(f *config.File, c config.Client) resolvedClientConfig 
 		DefaultModel:         c.DefaultModel,
 		ModelAliases:         c.ModelAliases, SubagentModel: c.SubagentModel,
 		SubagentRouting: c.SubagentRouting, ModelRoutes: c.ModelRoutes,
-		ModelOptions:  cloneModelOptions(c.ModelOptions),
-		FallbackRoute: c.FallbackRoute, UpstreamShape: c.UpstreamShape,
+		ModelOptions:      cloneModelOptions(c.ModelOptions),
+		FallbackRoute:     c.FallbackRoute,
+		FallbackPolicy:    config.ResolveFallbackPolicy(f.Global.FallbackPolicy),
+		HasFallbackPolicy: true, NativeFallbackModel: c.NativeFallbackModel,
+		UpstreamShape: c.UpstreamShape,
 	}
 }
 
@@ -508,6 +591,11 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 	runtimeCfg := g.runtimeConfig()
 	g.routingMu.RUnlock()
 	catalogSnapshot := g.pricing.Capture()
+	desiredHash := ""
+	if raw, err := os.ReadFile(g.activeConfigPath()); err == nil {
+		desiredHash = exactConfigHash(raw)
+	}
+	desiredActiveMismatch := desiredHash != "" && state.activeHash != "" && desiredHash != state.activeHash
 	runtimeByName := map[string]resolvedClientConfig{}
 	boundByName := map[string]bool{}
 	for _, cl := range runtimeClients {
@@ -540,7 +628,7 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 			if configuredTarget != "" {
 				configuredTargetJSON = configuredTarget
 			}
-			clients = append(clients, map[string]any{
+			clientStatus := map[string]any{
 				"name":               c.Name,
 				"enabled":            c.Enabled,
 				"bind_addr":          c.BindAddr,
@@ -566,7 +654,11 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 					"effective_model":   unmatched.model,
 					"effective_source":  unmatched.source,
 				},
-			})
+			}
+			if c.Enabled && rcEff.ProtocolShape == "anthropic" {
+				clientStatus["baseten_model_fallback"] = basetenModelFallbackStatus(rcEff, desiredActiveMismatch)
+			}
+			clients = append(clients, clientStatus)
 		}
 	} else {
 		// Embedders that construct New without a backing config still get
@@ -583,7 +675,7 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 			if subagentEffective == "" || cl.cfg.SubagentRouting == "off" {
 				subagentEffective = "inherit"
 			}
-			clients = append(clients, map[string]any{
+			clientStatus := map[string]any{
 				"name":               cl.cfg.Name,
 				"bind_addr":          cl.Addr().String(),
 				"protocol_shape":     cl.cfg.ProtocolShape,
@@ -608,12 +700,12 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 					"effective_model":   unmatched.model,
 					"effective_source":  unmatched.source,
 				},
-			})
+			}
+			if cl.cfg.ProtocolShape == "anthropic" {
+				clientStatus["baseten_model_fallback"] = basetenModelFallbackStatus(cl.cfg, desiredActiveMismatch)
+			}
+			clients = append(clients, clientStatus)
 		}
-	}
-	desiredHash := ""
-	if raw, err := os.ReadFile(g.activeConfigPath()); err == nil {
-		desiredHash = exactConfigHash(raw)
 	}
 	reloadState := "applied"
 	reloadErr := state.reloadErr
@@ -623,11 +715,13 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 		reloadState = "pending"
 	}
 	globalEnabled := false
-	capabilities := []string{"global_routing"}
+	capabilities := []string{"global_routing", "fallback_policy"}
+	fallbackPolicy := config.ResolveFallbackPolicy(nil)
 	if state.file != nil {
 		if state.file.Global.RoutingEnabled != nil {
 			globalEnabled = *state.file.Global.RoutingEnabled
 		}
+		fallbackPolicy = config.ResolveFallbackPolicy(state.file.Global.FallbackPolicy)
 	}
 	signedIn, authType, fallbackInUse := g.authState()
 	ah := g.authHealth()
@@ -645,6 +739,7 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 			"error": reloadErr,
 		},
 		"global_routing_enabled": globalEnabled,
+		"fallback_policy":        fallbackPolicy,
 		"uptime_seconds":         g.uptimeSeconds(),
 		"version":                version.Version,
 		// Mutation clients must target the exact file this process has

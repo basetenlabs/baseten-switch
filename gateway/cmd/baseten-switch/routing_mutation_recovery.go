@@ -119,7 +119,7 @@ type mutationRecoveryResult struct {
 }
 
 func requestedPresent(operation string) bool {
-	return operation == "set_global_routing"
+	return operation == "set_global_routing" || operation == "set_fallback_policy"
 }
 
 func domainHash(domain, value string) string {
@@ -237,6 +237,10 @@ func validTerminalOperationShape(record mutationTerminalRecord) bool {
 	switch record.Operation {
 	case "set_global_routing":
 		return validMutationSurface(record.Operation, record.Surface) && record.Client == "" && record.KeyHash == "" && record.RequestedTargetHash == ""
+	case "set_fallback_policy":
+		return validMutationSurface(record.Operation, record.Surface) && record.Client == "" && validConfigHash(record.KeyHash) && validConfigHash(record.RequestedTargetHash)
+	case "set_native_fallback_model":
+		return validMutationSurface(record.Operation, record.Surface) && !record.Requested && record.Client != "" && validConfigHash(record.KeyHash) && validConfigHash(record.RequestedTargetHash)
 	case "set_claude_route", "set_claude_subagents",
 		"enable_claude_picker", "disable_claude_picker",
 		"add_claude_picker_model", "remove_claude_picker_model", "move_claude_picker_model":
@@ -255,6 +259,8 @@ func validMutationSurface(operation, surface string) bool {
 	switch operation {
 	case "set_global_routing":
 		return surface == mutationSurfaceSwitch
+	case "set_fallback_policy", "set_native_fallback_model":
+		return surface == mutationSurfaceConfig
 	case "set_claude_route", "set_claude_subagents",
 		"enable_claude_picker", "disable_claude_picker",
 		"add_claude_picker_model", "remove_claude_picker_model", "move_claude_picker_model":
@@ -656,6 +662,7 @@ func resultFromTerminal(path string, record mutationTerminalRecord, includeReque
 	if includeRequest {
 		result.Key = spec.Key
 		result.RequestedTarget = spec.RequestedTarget
+		result.StructuredWarnings = spec.StructuredWarnings
 	}
 	switch record.Outcome {
 	case mutationOutcomeApplied:
@@ -804,7 +811,7 @@ func reviewedMutationMessage(code string) string {
 	case "router_unavailable":
 		return "the router is unavailable; routing recovery state was preserved"
 	case "router_unsupported":
-		return "the router does not expose the state required for safe automatic cleanup"
+		return "the running router does not support the state required for this routing operation"
 	case "mutation_locked":
 		return "another routing mutation is in progress; retry this operation"
 	case "stale_config_hash", "stale_active_token":
@@ -1013,13 +1020,18 @@ func inspectRoutingMutationStatusLocked(configPath string) (routingMutationStatu
 		status.Error = &mutationError{Code: mutationStatusRouterUnsupported, Message: reviewedMutationMessage(mutationStatusRouterUnsupported)}
 		return status, nil
 	}
+	if capability := requiredMutationCapability(journal.Operation); capability != "" && !containsString(admin.Capabilities, capability) {
+		status.Classification = mutationStatusRouterUnsupported
+		status.Error = &mutationError{Code: mutationStatusRouterUnsupported, Message: reviewedMutationMessage(mutationStatusRouterUnsupported)}
+		return status, nil
+	}
 	if diskHash != journal.PreviousConfigHash && diskHash != journal.DesiredConfigHash {
 		status.Classification = mutationStatusExternalChange
 		status.Error = &mutationError{Code: mutationStatusExternalChange, Message: reviewedMutationMessage(mutationStatusExternalChange)}
 		return status, nil
 	}
 	if diskHash == journal.DesiredConfigHash {
-		if admin.DesiredConfigHash == diskHash && admin.ActiveConfigHash == diskHash {
+		if admin.DesiredConfigHash == diskHash && admin.ActiveConfigHash == diskHash && mutationJournalProjectionMatches(admin, journal) {
 			status.Classification = mutationStatusDesiredActive
 		} else {
 			status.Classification = mutationStatusDesiredPending
@@ -1084,10 +1096,13 @@ func finalCleanupSnapshot(configPath string, expected routingMutationStatus) (ro
 		canonicalPath(admin.ConfigPath) != canonicalPath(configPath) || validateManagedRouterIdentity(admin, managedPID) != nil {
 		return routingMutationJournal{}, routingAdminStatus{}, fmt.Errorf("cleanup predicate changed")
 	}
+	if capability := requiredMutationCapability(journal.Operation); capability != "" && !containsString(admin.Capabilities, capability) {
+		return routingMutationJournal{}, routingAdminStatus{}, fmt.Errorf("cleanup predicate changed")
+	}
 	classification := mutationStatusPriorPending
 	if diskHash == journal.DesiredConfigHash {
 		classification = mutationStatusDesiredPending
-		if admin.DesiredConfigHash == diskHash && admin.ActiveConfigHash == diskHash {
+		if admin.DesiredConfigHash == diskHash && admin.ActiveConfigHash == diskHash && mutationJournalProjectionMatches(admin, journal) {
 			classification = mutationStatusDesiredActive
 		}
 	} else if diskHash == journal.PreviousConfigHash {

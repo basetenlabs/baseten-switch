@@ -489,12 +489,26 @@ struct GlobalMutationReceipt: Equatable, Sendable {
         cleanupPending = dict["cleanup_pending"] as? Bool ?? false
         requestFingerprint = dict["request_fingerprint"] as? String ?? ""
         identityStrength = dict["identity_strength"] as? String ?? ""
-        warnings = (dict["warnings"] as? [String] ?? [])
-            .filter { !$0.isEmpty }
+        warnings = decodeMutationWarnings(dict["warnings"])
         let error = dict["error"] as? [String: Any]
         errorCode = error?["code"] as? String ?? ""
         errorMessage = error?["message"] as? String ?? ""
         errorRetryable = error?["retryable"] as? Bool ?? false
+    }
+}
+
+private func decodeMutationWarnings(_ raw: Any?) -> [String] {
+    guard let values = raw as? [Any] else { return [] }
+    return values.compactMap { value in
+        if let warning = value as? String {
+            return warning.isEmpty ? nil : warning
+        }
+        if let object = value as? [String: Any],
+           let code = object["code"] as? String,
+           !code.isEmpty {
+            return code
+        }
+        return nil
     }
 }
 

@@ -72,6 +72,100 @@ enum ClaudeModelPickerMutationKind: Equatable, Sendable {
     }
 }
 
+func basetenFallbackTargetStatusLine(
+    fallback: BasetenModelFallbackStatus?,
+    policy: FallbackPolicyStatus?,
+    desiredMatchesActive: Bool,
+    supportsFallbackPolicy: Bool
+) -> String {
+    let readiness: String
+    if !supportsFallbackPolicy {
+        readiness = "Unavailable"
+    } else if !desiredMatchesActive {
+        readiness = "Needs reload"
+    } else if fallback?.ready == true {
+        readiness = "Ready"
+    } else {
+        readiness = "Not ready"
+    }
+    guard let policy else { return readiness + " · Policy unavailable" }
+    return readiness
+        + " · 429 " + (policy.onBaseten429 ? "On" : "Off")
+        + " · 5xx " + (policy.onBaseten5xx ? "On" : "Off")
+}
+
+func basetenFallbackTargetReadinessDetail(
+    fallback: BasetenModelFallbackStatus?,
+    desiredMatchesActive: Bool,
+    supportsFallbackPolicy: Bool
+) -> String? {
+    guard supportsFallbackPolicy else {
+        return "Update the local gateway to configure automatic fallback."
+    }
+    guard desiredMatchesActive else {
+        return "The saved and active configurations differ. Resolve the reload error first."
+    }
+    guard let fallback else {
+        return "Fallback target status is unavailable."
+    }
+    switch fallback.reason {
+    case nil where fallback.ready:
+        return nil
+    case "not_configured":
+        return "A fallback target is not configured."
+    case "provider_auth_unavailable":
+        return "Anthropic authentication is unavailable to the local gateway."
+    case "desired_active_mismatch":
+        return "The saved fallback target is not active yet."
+    case "unsupported_router":
+        return "Update the local gateway to configure this fallback target."
+    default:
+        return fallback.ready
+            ? nil
+            : "The fallback target is not ready."
+    }
+}
+
+struct ClaudeNativeFallbackOption: Equatable, Sendable {
+    let label: String
+    let model: String
+}
+
+func claudeNativeFallbackOptions(
+    client: ClientStatus
+) -> [ClaudeNativeFallbackOption] {
+    var options: [ClaudeNativeFallbackOption] = []
+    if let current = client.basetenModelFallback?.resolvedModel,
+       isAcceptedClaudeNativeModelID(current) {
+        let displayName = client.basetenModelFallback?.displayName ?? ""
+        options.append(ClaudeNativeFallbackOption(
+            label: displayName.isEmpty
+                ? claudeNativeModelLabel(current)
+                : displayName,
+            model: current))
+    }
+    for available in client.basetenModelFallback?.availableModels ?? []
+    where isAcceptedClaudeNativeModelID(available.model) {
+        options.append(ClaudeNativeFallbackOption(
+            label: available.displayName.isEmpty
+                ? claudeNativeModelLabel(available.model)
+                : available.displayName,
+            model: available.model))
+    }
+    var seen = Set<String>()
+    return options.filter { option in
+        seen.insert(option.model).inserted
+    }
+}
+
+func claudeNativeModelLabel(_ model: String) -> String {
+    for family in ["fable", "opus", "sonnet", "haiku"]
+    where model.contains("-" + family + "-") {
+        return family.prefix(1).uppercased() + family.dropFirst()
+    }
+    return model
+}
+
 struct PendingClaudeModelPickerMutation: Equatable, Sendable {
     let operationID: String
     let kind: ClaudeModelPickerMutationKind
@@ -440,6 +534,8 @@ struct ClaudeModelPickerSectionView: View {
     @State private var previewError: String?
     @State private var previewingSlug: String?
     @State private var previewingEnable = false
+    @State private var showsFallbackTargetEditor = false
+    @State private var fallbackTargetDraft = ""
 
     var body: some View {
         RoutingSectionCard {
@@ -475,6 +571,8 @@ struct ClaudeModelPickerSectionView: View {
 
                 diagnosticsSection
 
+                basetenFallbackSection
+                Divider()
                 configuredSection
                 Divider()
                 availableSection
@@ -543,6 +641,163 @@ struct ClaudeModelPickerSectionView: View {
                 EmptyView()
             }
         }
+        .sheet(isPresented: $showsFallbackTargetEditor) {
+            fallbackTargetEditor
+        }
+    }
+
+    private var basetenFallbackSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Fallback for Baseten models")
+                        .font(.subheadline.weight(.semibold))
+                    Text(displayedFallbackTarget)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+                Spacer()
+                Text(displayedFallbackName)
+                    .font(.callout.weight(.medium))
+                if state.pendingBasetenModelFallback != nil {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel("Changing fallback target")
+                }
+                Button("Change") {
+                    guard !isPreview else { return }
+                    fallbackTargetDraft = fallbackTargetOptions.first(where: {
+                        $0.model == displayedFallbackTarget
+                    })?.model ?? fallbackTargetOptions.first?.model ?? ""
+                    showsFallbackTargetEditor = true
+                }
+                .disabled(!canEditFallbackTarget)
+                .accessibilityIdentifier("claude-fallback-target-change")
+            }
+            Text("Used when a Baseten model returns a rate limit or server error and Automatic Fallback is enabled.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(fallbackTargetStatusLine)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(fallbackTargetStatusColor)
+                .accessibilityIdentifier("claude-fallback-target-status")
+            if let detail = fallbackTargetReadinessDetail {
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .accessibilityIdentifier("claude-baseten-model-fallback")
+    }
+
+    private var fallbackTargetEditor: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Fallback for Baseten models")
+                .font(.headline)
+            Text("Choose a full Claude model ID accepted by Anthropic. Switch writes the concrete model ID, not a Baseten alias.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Picker("Model", selection: $fallbackTargetDraft) {
+                ForEach(fallbackTargetOptions, id: \.model) { option in
+                    VStack(alignment: .leading) {
+                        Text(option.label)
+                        Text(option.model)
+                    }
+                    .tag(option.model)
+                }
+            }
+                .pickerStyle(.radioGroup)
+                .accessibilityIdentifier("claude-fallback-target-model")
+            Label(
+                "Cross-provider fallback replays the current conversation. Provider-specific reasoning history may be rejected during tool-use continuation.",
+                systemImage: "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button("Cancel") {
+                    showsFallbackTargetEditor = false
+                }
+                Button("Save") {
+                    let target = fallbackTargetDraft
+                    showsFallbackTargetEditor = false
+                    state.requestBasetenModelFallback(
+                        client: client.name,
+                        model: target)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(
+                    !isAcceptedClaudeNativeModelID(fallbackTargetDraft)
+                        || fallbackTargetDraft == displayedFallbackTarget)
+                .accessibilityIdentifier("claude-fallback-target-save")
+            }
+        }
+        .padding(20)
+        .frame(width: 500)
+    }
+
+    private var fallbackProjection: BasetenModelFallbackStatus? {
+        client.basetenModelFallback
+    }
+
+    private var fallbackTargetOptions: [ClaudeNativeFallbackOption] {
+        claudeNativeFallbackOptions(client: client)
+    }
+
+    private var displayedFallbackTarget: String {
+        if let pending = state.pendingBasetenModelFallback,
+           pending.client == client.name {
+            return pending.requestedModel
+        }
+        return fallbackProjection?.resolvedModel.isEmpty == false
+            ? fallbackProjection?.resolvedModel ?? ""
+            : "Not configured"
+    }
+
+    private var displayedFallbackName: String {
+        if state.pendingBasetenModelFallback?.client == client.name {
+            return "Changing"
+        }
+        let label = fallbackProjection?.displayName ?? ""
+        return label.isEmpty ? "Unavailable" : label
+    }
+
+    private var canEditFallbackTarget: Bool {
+        !isPreview
+            && fallbackProjection != nil
+            && !fallbackTargetOptions.isEmpty
+            && state.canMutateFallbackSettings
+    }
+
+    private var fallbackTargetStatusLine: String {
+        basetenFallbackTargetStatusLine(
+            fallback: fallbackProjection,
+            policy: state.confirmedFallbackPolicy,
+            desiredMatchesActive:
+                state.routingSnapshot?.desiredMatchesActive == true,
+            supportsFallbackPolicy:
+                state.routingSnapshot?.supportsFallbackPolicy == true)
+    }
+
+    private var fallbackTargetReadinessDetail: String? {
+        basetenFallbackTargetReadinessDetail(
+            fallback: fallbackProjection,
+            desiredMatchesActive:
+                state.routingSnapshot?.desiredMatchesActive == true,
+            supportsFallbackPolicy:
+                state.routingSnapshot?.supportsFallbackPolicy == true)
+    }
+
+    private var fallbackTargetStatusColor: Color {
+        fallbackProjection?.ready == true
+            && state.routingSnapshot?.desiredMatchesActive == true
+            ? Color(nsColor: AppColors.basetenGreen)
+            : .orange
     }
 
     @ViewBuilder

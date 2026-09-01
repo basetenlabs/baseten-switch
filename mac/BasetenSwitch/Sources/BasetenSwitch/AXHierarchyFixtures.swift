@@ -24,6 +24,8 @@ struct AXHierarchyFixtureView: View {
     let level: AXHierarchyFixtureLevel
     @State private var selection: String? = "overview"
     @State private var enabled = true
+    @State private var rateLimitsEnabled = true
+    @State private var serverErrorsEnabled = true
     @State private var model = "GLM-5.2"
 
     @ViewBuilder
@@ -134,6 +136,14 @@ struct AXHierarchyFixtureView: View {
             } detail: {
                 Form {
                     Toggle("Global Routing", isOn: $enabled)
+                    Toggle(
+                        "Rate limits (HTTP 429)",
+                        isOn: $rateLimitsEnabled)
+                        .accessibilityIdentifier("fallback-policy-429")
+                    Toggle(
+                        "Server errors (HTTP 5xx)",
+                        isOn: $serverErrorsEnabled)
+                        .accessibilityIdentifier("fallback-policy-5xx")
                     Picker("Model", selection: $model) {
                         Text("GLM-5.2").tag("GLM-5.2")
                         Text("Native Provider").tag("native")

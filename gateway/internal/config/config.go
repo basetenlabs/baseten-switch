@@ -146,11 +146,15 @@ type Client struct {
 	// (strip empty text blocks, normalize tool_use ids). Default true;
 	// tri-state so an absent key is distinguishable from explicit false.
 	SanitizeHistory *bool `yaml:"sanitize_history,omitempty" json:"sanitize_history,omitempty"`
-	// FallbackRoute is tried when the primary route's upstream is
-	// unreachable, returns 5xx, or returns 429 for openai-shape traffic.
-	// Anthropic-shape 429 responses relay without fallback. The fallback
-	// must be the native route for protocol_shape.
+	// FallbackRoute is the optional protocol-native target for an eligible
+	// fallback attempt after Baseten. It must be the native route for
+	// protocol_shape.
 	FallbackRoute string `yaml:"fallback_route,omitempty" json:"fallback_route,omitempty"`
+	// NativeFallbackModel is the protocol-native model used only when an
+	// Anthropic-shape request starts with a Baseten-specific identity that the
+	// native provider cannot accept. Native-origin requests preserve their
+	// exact ingress model instead. Empty means no catch-all native target.
+	NativeFallbackModel string `yaml:"native_fallback_model,omitempty" json:"native_fallback_model,omitempty"`
 	// UpstreamShape overrides the wire shape used toward the upstream on
 	// the baseten route. Setting "openai" on an anthropic listener makes
 	// the gateway translate /v1/messages traffic to /v1/chat/completions
@@ -234,7 +238,10 @@ type ModelOptions map[string]map[string]ModelOption
 type Global struct {
 	// RoutingEnabled is intentionally a pointer so validation can
 	// distinguish an explicit false from an omitted required field.
-	RoutingEnabled *bool             `yaml:"routing_enabled,omitempty" json:"routing_enabled,omitempty"`
+	RoutingEnabled *bool `yaml:"routing_enabled,omitempty" json:"routing_enabled,omitempty"`
+	// FallbackPolicy independently controls Baseten HTTP 429 and HTTP 5xx
+	// transitions to a protocol-native fallback. Omitted fields default on.
+	FallbackPolicy *FallbackPolicy   `yaml:"fallback_policy,omitempty" json:"fallback_policy,omitempty"`
 	Auth           map[string]string `yaml:"auth" json:"auth"`
 	TelemetryDir   string            `yaml:"telemetry_dir" json:"telemetry_dir"`
 	// TelemetryEnabled is a pointer so an omitted value retains the
@@ -475,6 +482,9 @@ func ValidateRoutingPolicy(f *File) error {
 		if c.FallbackRoute != "" && c.FallbackRoute != NativeRoute(c.ProtocolShape) {
 			return fmt.Errorf("routing policy: client %q fallback_route %q must be its native route %q", c.Name, c.FallbackRoute, NativeRoute(c.ProtocolShape))
 		}
+		if err := ValidateNativeFallbackModel(c); err != nil {
+			return err
+		}
 		if !c.Enabled {
 			continue
 		}
@@ -658,6 +668,9 @@ func UnmarshalStrict(data []byte, out any) error {
 		if err := validateRawModelPickerNodes(data); err != nil {
 			return err
 		}
+		if err := validateRawFallbackPolicyNodes(data); err != nil {
+			return err
+		}
 	}
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
@@ -670,6 +683,72 @@ func UnmarshalStrict(data []byte, out any) error {
 			return fmt.Errorf("multiple YAML documents are not supported")
 		}
 		return err
+	}
+	return nil
+}
+
+// validateRawFallbackPolicyNodes preserves omission versus explicit null for
+// the optional block and its pointer-boolean children. yaml.v3 otherwise
+// decodes both states to nil, which would silently turn malformed saved intent
+// into the default-on policy.
+func validateRawFallbackPolicyNodes(data []byte) error {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return err
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) != 1 {
+		return nil
+	}
+	if err := validateRawNativeFallbackModelNodes(doc.Content[0]); err != nil {
+		return err
+	}
+	_, global := mappingEntry(doc.Content[0], "global")
+	if global == nil || global.Kind != yaml.MappingNode {
+		return nil
+	}
+	_, policy := mappingEntry(global, "fallback_policy")
+	if policy == nil {
+		return nil
+	}
+	if policy.Kind == yaml.ScalarNode && policy.Tag == "!!null" {
+		return fmt.Errorf("global.fallback_policy must be an object, not null")
+	}
+	if policy.Kind != yaml.MappingNode {
+		return nil
+	}
+	for _, key := range []string{"on_baseten_429", "on_baseten_5xx"} {
+		_, value := mappingEntry(policy, key)
+		if value != nil && value.Kind == yaml.ScalarNode && value.Tag == "!!null" {
+			return fmt.Errorf("global.fallback_policy.%s must be true or false, not null", key)
+		}
+	}
+	return nil
+}
+
+func validateRawNativeFallbackModelNodes(root *yaml.Node) error {
+	_, clients := mappingEntry(root, "clients")
+	if clients == nil || clients.Kind != yaml.SequenceNode {
+		return nil
+	}
+	for _, client := range clients.Content {
+		if client.Kind != yaml.MappingNode {
+			continue
+		}
+		_, nameNode := mappingEntry(client, "name")
+		name := "<unnamed>"
+		if nameNode != nil && nameNode.Kind == yaml.ScalarNode {
+			name = nameNode.Value
+		}
+		_, value := mappingEntry(client, "native_fallback_model")
+		if value == nil {
+			continue
+		}
+		if value.Kind == yaml.ScalarNode && value.Tag == "!!null" {
+			return fmt.Errorf("client %q native_fallback_model must be a full native model ID, not null", name)
+		}
+		if value.Kind == yaml.ScalarNode && strings.TrimSpace(value.Value) == "" {
+			return fmt.Errorf("client %q native_fallback_model must be a full native model ID, not empty", name)
+		}
 	}
 	return nil
 }
