@@ -131,6 +131,101 @@ struct ClaudeNativeFallbackOption: Equatable, Sendable {
     let model: String
 }
 
+func initialClaudeNativeFallbackSelection(
+    options: [ClaudeNativeFallbackOption],
+    currentModel: String
+) -> String {
+    options.first(where: { $0.model == currentModel })?.model
+        ?? options.first?.model
+        ?? ""
+}
+
+struct ClaudeNativeFallbackEditorDraft: Equatable, Identifiable, Sendable {
+    let id: UUID
+    var selectedModel: String
+
+    init?(
+        options: [ClaudeNativeFallbackOption],
+        currentModel: String,
+        id: UUID = UUID()
+    ) {
+        let selectedModel = initialClaudeNativeFallbackSelection(
+            options: options,
+            currentModel: currentModel)
+        guard !selectedModel.isEmpty else { return nil }
+        self.id = id
+        self.selectedModel = selectedModel
+    }
+}
+
+struct ClaudeNativeFallbackEditorView: View {
+    let options: [ClaudeNativeFallbackOption]
+    let currentModel: String
+    let onCancel: () -> Void
+    let onSave: (String) -> Void
+
+    @State private var selectedModel: String
+
+    init(
+        options: [ClaudeNativeFallbackOption],
+        presentedModel: String,
+        currentModel: String,
+        onCancel: @escaping () -> Void,
+        onSave: @escaping (String) -> Void
+    ) {
+        self.options = options
+        self.currentModel = currentModel
+        self.onCancel = onCancel
+        self.onSave = onSave
+        _selectedModel = State(initialValue:
+            initialClaudeNativeFallbackSelection(
+                options: options,
+                currentModel: presentedModel))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Fallback for Baseten models")
+                .font(.headline)
+            Text("Choose a full Claude model ID accepted by Anthropic. Switch writes the concrete model ID, not a Baseten alias.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Picker("Model", selection: $selectedModel) {
+                ForEach(options, id: \.model) { option in
+                    VStack(alignment: .leading) {
+                        Text(option.label)
+                        Text(option.model)
+                    }
+                    .tag(option.model)
+                }
+            }
+                .pickerStyle(.radioGroup)
+                .accessibilityIdentifier("claude-fallback-target-model")
+            Label(
+                "Cross-provider fallback replays the current conversation. Provider-specific reasoning history may be rejected during tool-use continuation.",
+                systemImage: "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                Button("Save") {
+                    onSave(selectedModel)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(
+                    !isAcceptedClaudeNativeModelID(selectedModel)
+                        || selectedModel == currentModel)
+                .accessibilityIdentifier("claude-fallback-target-save")
+            }
+        }
+        .padding(20)
+        .frame(width: 500)
+    }
+}
+
 func claudeNativeFallbackOptions(
     client: ClientStatus
 ) -> [ClaudeNativeFallbackOption] {
@@ -534,8 +629,8 @@ struct ClaudeModelPickerSectionView: View {
     @State private var previewError: String?
     @State private var previewingSlug: String?
     @State private var previewingEnable = false
-    @State private var showsFallbackTargetEditor = false
-    @State private var fallbackTargetDraft = ""
+    @State private var fallbackTargetEditorDraft:
+        ClaudeNativeFallbackEditorDraft?
 
     var body: some View {
         RoutingSectionCard {
@@ -641,8 +736,20 @@ struct ClaudeModelPickerSectionView: View {
                 EmptyView()
             }
         }
-        .sheet(isPresented: $showsFallbackTargetEditor) {
-            fallbackTargetEditor
+        .sheet(item: $fallbackTargetEditorDraft) { draft in
+            ClaudeNativeFallbackEditorView(
+                options: fallbackTargetOptions,
+                presentedModel: draft.selectedModel,
+                currentModel: displayedFallbackTarget,
+                onCancel: {
+                    fallbackTargetEditorDraft = nil
+                },
+                onSave: { target in
+                    fallbackTargetEditorDraft = nil
+                    state.requestBasetenModelFallback(
+                        client: client.name,
+                        model: target)
+                })
         }
     }
 
@@ -667,10 +774,10 @@ struct ClaudeModelPickerSectionView: View {
                 }
                 Button("Change") {
                     guard !isPreview else { return }
-                    fallbackTargetDraft = fallbackTargetOptions.first(where: {
-                        $0.model == displayedFallbackTarget
-                    })?.model ?? fallbackTargetOptions.first?.model ?? ""
-                    showsFallbackTargetEditor = true
+                    fallbackTargetEditorDraft =
+                        ClaudeNativeFallbackEditorDraft(
+                            options: fallbackTargetOptions,
+                            currentModel: displayedFallbackTarget)
                 }
                 .disabled(!canEditFallbackTarget)
                 .accessibilityIdentifier("claude-fallback-target-change")
@@ -691,54 +798,6 @@ struct ClaudeModelPickerSectionView: View {
             }
         }
         .accessibilityIdentifier("claude-baseten-model-fallback")
-    }
-
-    private var fallbackTargetEditor: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Fallback for Baseten models")
-                .font(.headline)
-            Text("Choose a full Claude model ID accepted by Anthropic. Switch writes the concrete model ID, not a Baseten alias.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Picker("Model", selection: $fallbackTargetDraft) {
-                ForEach(fallbackTargetOptions, id: \.model) { option in
-                    VStack(alignment: .leading) {
-                        Text(option.label)
-                        Text(option.model)
-                    }
-                    .tag(option.model)
-                }
-            }
-                .pickerStyle(.radioGroup)
-                .accessibilityIdentifier("claude-fallback-target-model")
-            Label(
-                "Cross-provider fallback replays the current conversation. Provider-specific reasoning history may be rejected during tool-use continuation.",
-                systemImage: "exclamationmark.triangle.fill")
-                .font(.caption)
-                .foregroundStyle(.orange)
-                .fixedSize(horizontal: false, vertical: true)
-            HStack {
-                Spacer()
-                Button("Cancel") {
-                    showsFallbackTargetEditor = false
-                }
-                Button("Save") {
-                    let target = fallbackTargetDraft
-                    showsFallbackTargetEditor = false
-                    state.requestBasetenModelFallback(
-                        client: client.name,
-                        model: target)
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(
-                    !isAcceptedClaudeNativeModelID(fallbackTargetDraft)
-                        || fallbackTargetDraft == displayedFallbackTarget)
-                .accessibilityIdentifier("claude-fallback-target-save")
-            }
-        }
-        .padding(20)
-        .frame(width: 500)
     }
 
     private var fallbackProjection: BasetenModelFallbackStatus? {

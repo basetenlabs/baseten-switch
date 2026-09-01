@@ -152,6 +152,59 @@ final class FallbackPolicyTests: XCTestCase {
         XCTAssertTrue(isAcceptedClaudeNativeModelID("claude-3-7-sonnet"))
     }
 
+    func testFallbackTargetEditorPresentationStartsWithCurrentModel() throws {
+        let options = [
+            ClaudeNativeFallbackOption(
+                label: "Opus",
+                model: "claude-opus-5"),
+            ClaudeNativeFallbackOption(
+                label: "Sonnet",
+                model: "claude-sonnet-5"),
+        ]
+
+        var presentedDraft: ClaudeNativeFallbackEditorDraft?
+        XCTAssertNil(presentedDraft)
+
+        let draftID = UUID()
+        presentedDraft = ClaudeNativeFallbackEditorDraft(
+            options: options,
+            currentModel: "claude-sonnet-5",
+            id: draftID)
+        let draft = try XCTUnwrap(presentedDraft)
+        XCTAssertEqual(
+            draft.selectedModel,
+            "claude-sonnet-5")
+        XCTAssertEqual(
+            draft.id,
+            draftID)
+
+        presentedDraft = nil
+        XCTAssertNil(presentedDraft)
+    }
+
+    func testFallbackTargetEditorDoesNotPresentWithoutOptions() {
+        XCTAssertNil(ClaudeNativeFallbackEditorDraft(
+            options: [],
+            currentModel: "claude-sonnet-5"))
+    }
+
+    func testFallbackTargetEditorStateUsesPresentedModel() {
+        let options = [
+            ClaudeNativeFallbackOption(
+                label: "Opus",
+                model: "claude-opus-5"),
+            ClaudeNativeFallbackOption(
+                label: "Sonnet",
+                model: "claude-sonnet-5"),
+        ]
+
+        XCTAssertEqual(
+            initialClaudeNativeFallbackSelection(
+                options: options,
+                currentModel: "claude-sonnet-5"),
+            "claude-sonnet-5")
+    }
+
     func testNativeTargetSelectorFailsClosedOnServerAlias() throws {
         let client = try XCTUnwrap(ClientStatus(dict: [
             "name": "claude-code",
