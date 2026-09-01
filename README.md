@@ -232,6 +232,16 @@ Request content leaves the machine only for the upstream chosen by the active
 routing policy. Baseten credentials go only to Baseten, and native credentials
 go only to their matching native provider.
 
+### Compatibility routing
+
+Switch may route narrowly identified compatibility requests to a harness's
+native provider even when ordinary requests are mapped to Baseten. For example,
+recognized Claude Code Auto permission checks are sent to Anthropic and labeled
+`Auto check` in the Requests view. These checks require credentials accepted
+by Anthropic, and a native failure is returned directly instead of being
+retried through Baseten. Other requests continue to follow the configured
+routing policy.
+
 Local telemetry contains request metadata, not prompts, responses,
 credentials, headers, or request bodies. Disable future records by setting
 `telemetry_enabled: false` in `gateway.yaml`, then reload the configuration.
