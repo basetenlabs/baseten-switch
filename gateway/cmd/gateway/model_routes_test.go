@@ -25,6 +25,7 @@ import (
 	"github.com/basetenlabs/baseten-switch/gateway/internal/config"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/pricing"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/telemetry"
+	"github.com/basetenlabs/baseten-switch/gateway/internal/version"
 )
 
 // modelRoutesClient returns an anthropic-shape resolved client with
@@ -410,15 +411,19 @@ func TestModelRoutePassthroughByteIdentical(t *testing.T) {
 // Anthropic. The fallback is NOT built from the family target.
 func TestModelRouteFallbackOriginalID(t *testing.T) {
 	var fbHits int32
+	gotPrimaryHeaders := make(chan http.Header, 1)
 	basSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPrimaryHeaders <- r.Header.Clone()
 		// Primary (baseten, forced target) returns 503.
 		w.WriteHeader(503)
 		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"overloaded_error","message":"overloaded"}}`))
 	}))
 	defer basSrv.Close()
 	gotFbModel := make(chan string, 1)
+	gotFallbackHeaders := make(chan http.Header, 1)
 	antSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&fbHits, 1)
+		gotFallbackHeaders <- r.Header.Clone()
 		b, _ := io.ReadAll(r.Body)
 		var m map[string]any
 		_ = json.Unmarshal(b, &m)
@@ -437,8 +442,19 @@ func TestModelRouteFallbackOriginalID(t *testing.T) {
 
 	// Request claude-opus-4-8; pin forces baseten with GLM. Primary 503
 	// -> fallback to anthropic with the ORIGINAL id.
-	resp, rb := postModelMessages(t, g, "claude-opus-4-8", "")
-	if resp.StatusCode != 200 || !strings.Contains(rb, "FALLBACK") {
+	body := []byte(`{"model":"claude-opus-4-8","stream":false,"messages":[{"role":"user","content":"ping"}]}`)
+	req, _ := http.NewRequest("POST", clientURL(g, "claude-code", "/v1/messages"), bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer tok")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	req.Header.Set("User-Agent", "header-isolation-test/1.0")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rb, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || !strings.Contains(string(rb), "FALLBACK") {
 		t.Fatalf("got %d: %s, want fallback 200", resp.StatusCode, rb)
 	}
 	if n := atomic.LoadInt32(&fbHits); n != 1 {
@@ -452,6 +468,29 @@ func TestModelRouteFallbackOriginalID(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("fallback upstream never received the request")
+	}
+	select {
+	case headers := <-gotPrimaryHeaders:
+		wantUserAgent := "baseten-switch/" + version.Version + " header-isolation-test/1.0"
+		if got := headers.Get("User-Agent"); got != wantUserAgent {
+			t.Errorf("Baseten User-Agent = %q, want %q", got, wantUserAgent)
+		}
+		if got := headers.Get(switchVersionHeader); got != version.Version {
+			t.Errorf("Baseten %s = %q, want %q", switchVersionHeader, got, version.Version)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Baseten primary headers were not captured")
+	}
+	select {
+	case headers := <-gotFallbackHeaders:
+		if got := headers.Get("User-Agent"); got != "header-isolation-test/1.0" {
+			t.Errorf("Anthropic User-Agent = %q, want unchanged", got)
+		}
+		if got := headers.Get(switchVersionHeader); got != "" {
+			t.Errorf("Anthropic %s = %q, want empty", switchVersionHeader, got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Anthropic fallback headers were not captured")
 	}
 	rows := waitForRows(t, cfg.TelemetryDir, 1, 2*time.Second)
 	// The fallback attempt served with route_effective=anthropic (differs
