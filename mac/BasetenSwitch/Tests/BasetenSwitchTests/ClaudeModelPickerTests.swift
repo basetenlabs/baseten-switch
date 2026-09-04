@@ -526,18 +526,17 @@ final class ClaudeModelPickerTests: XCTestCase {
             "Unverified")
     }
 
-    func testConfiguredRowStatePrefersAllowlistConflictOtherwiseRuntime()
+    func testConfiguredRowStateOnlyShowsAllowlistConflict()
     {
         XCTAssertEqual(
             claudeModelPickerConfiguredRowState(
                 allowlistPolicy: "possible_conflict",
                 knownPolicy: "possible_allowlist_conflict"),
             "Possible allowlist conflict")
-        XCTAssertEqual(
+        XCTAssertNil(
             claudeModelPickerConfiguredRowState(
                 allowlistPolicy: "no_known_conflict",
-                knownPolicy: "no_known_conflict"),
-            "Runtime unverified")
+                knownPolicy: "no_known_conflict"))
     }
 
     func testRetrySyncRequiresActionableOutOfSyncConfiguredPicker() {

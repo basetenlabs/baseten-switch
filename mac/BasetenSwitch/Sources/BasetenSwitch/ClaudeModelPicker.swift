@@ -486,12 +486,12 @@ func claudeModelPickerDiagnosticLabel(
 func claudeModelPickerConfiguredRowState(
     allowlistPolicy: String,
     knownPolicy: String
-) -> String {
+) -> String? {
     if allowlistPolicy == "possible_conflict"
         || knownPolicy == "possible_allowlist_conflict" {
         return "Possible allowlist conflict"
     }
-    return "Runtime unverified"
+    return nil
 }
 
 func claudeModelPickerCanRetrySync(
@@ -1128,12 +1128,11 @@ struct ClaudeModelPickerSectionView: View {
                     .font(.caption2.monospaced())
                     .foregroundStyle(.tertiary)
                     .textSelection(.enabled)
-                Text(configuredRowState)
-                    .font(.caption2)
-                    .foregroundStyle(
-                        configuredRowHasAllowlistConflict
-                            ? .orange
-                            : .secondary)
+                if let configuredRowState {
+                    Text(configuredRowState)
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
             }
             Spacer(minLength: 12)
             Button {
@@ -1299,16 +1298,12 @@ struct ClaudeModelPickerSectionView: View {
             hasConfiguredPicker: client.modelPicker != nil)
     }
 
-    private var configuredRowState: String {
+    private var configuredRowState: String? {
         claudeModelPickerConfiguredRowState(
             allowlistPolicy:
                 state.claudeModelPickerDiagnostics?.allowlistPolicy ?? "",
             knownPolicy:
                 state.claudeModelPickerDiagnostics?.knownPolicy ?? "")
-    }
-
-    private var configuredRowHasAllowlistConflict: Bool {
-        configuredRowState == "Possible allowlist conflict"
     }
 
     private var confirmationTitle: String {
