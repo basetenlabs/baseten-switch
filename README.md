@@ -246,6 +246,11 @@ Request content leaves the machine only for the upstream chosen by the active
 routing policy. Baseten credentials go only to Baseten, and native credentials
 go only to their matching native provider.
 
+Baseten-routed inference requests identify Switch and its version in the
+standard `User-Agent` header and `X-Baseten-Switch-Version`. Switch does not
+add a user or installation identifier. Switch does not add these markers to
+native-provider requests.
+
 ### Compatibility routing
 
 Switch may route narrowly identified compatibility requests to a harness's
