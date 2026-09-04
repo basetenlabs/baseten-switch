@@ -498,6 +498,49 @@ func TestPickerEnableAbsentCreatesEmptySelectionWithoutCopyingAliases(t *testing
 	}
 }
 
+func TestPickerEnableAbsentWithRunningRouterPublishesTerminalAndSyncsSettings(t *testing.T) {
+	env := newSubagentTestEnv(t, false)
+	stubPickerVersion(t, "2.1.243")
+	a, err := newClaudeAdapterFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rc := a.on(); rc != 0 {
+		t.Fatalf("claude on rc=%d", rc)
+	}
+	const operationID = "empty-enable-running-router"
+	var out bytes.Buffer
+	if rc := a.mutatePickerConfig(
+		[]string{"enable"},
+		mutationOptions{JSON: true, OperationID: operationID},
+		&out,
+	); rc != 0 {
+		t.Fatalf("enable rc=%d output=%s", rc, out.String())
+	}
+	receipt := decodeMutationResult(t, out.String())
+	if !receipt.OK || !receipt.Applied || receipt.ReconciliationRequired ||
+		receipt.Outcome != mutationOutcomeApplied {
+		t.Fatalf("enable receipt = %+v", receipt)
+	}
+	terminal, err := readMutationTerminal(env.cfgPath, operationID)
+	if err != nil {
+		t.Fatalf("read enable terminal: %v", err)
+	}
+	if terminal.Operation != "enable_claude_picker" ||
+		terminal.RequestedTargetHash != "" ||
+		terminal.Outcome != mutationOutcomeApplied {
+		t.Fatalf("enable terminal = %+v", terminal)
+	}
+	obj, exists, err := modelPickerObject(readTree(t, env.settings))
+	if err != nil || !exists {
+		t.Fatalf("Claude settings modelPicker exists=%t err=%v", exists, err)
+	}
+	rows, err := modelPickerOptions(obj)
+	if err != nil || len(rows) != 0 || obj["replaceBuiltInOptions"] != false {
+		t.Fatalf("Claude settings modelPicker = %#v, rows=%#v, err=%v", obj, rows, err)
+	}
+}
+
 func TestPickerEnableAbsentSucceedsWithoutAliases(t *testing.T) {
 	env := newSubagentTestEnv(t, true)
 	raw, err := os.ReadFile(env.cfgPath)

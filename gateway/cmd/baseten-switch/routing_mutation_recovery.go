@@ -242,9 +242,10 @@ func validTerminalOperationShape(record mutationTerminalRecord) bool {
 	case "set_native_fallback_model":
 		return validMutationSurface(record.Operation, record.Surface) && !record.Requested && record.Client != "" && validConfigHash(record.KeyHash) && validConfigHash(record.RequestedTargetHash)
 	case "set_claude_route", "set_claude_subagents",
-		"enable_claude_picker", "disable_claude_picker",
 		"add_claude_picker_model", "remove_claude_picker_model", "move_claude_picker_model":
 		return validMutationSurface(record.Operation, record.Surface) && !record.Requested && record.Client != "" && validConfigHash(record.KeyHash) && validConfigHash(record.RequestedTargetHash)
+	case "enable_claude_picker", "disable_claude_picker":
+		return validMutationSurface(record.Operation, record.Surface) && !record.Requested && record.Client != "" && validConfigHash(record.KeyHash) && record.RequestedTargetHash == ""
 	case "set_codex_route":
 		return validMutationSurface(record.Operation, record.Surface) && !record.Requested && record.Client != "" && validConfigHash(record.KeyHash) && validConfigHash(record.RequestedTargetHash)
 	case "set_model_reasoning":
