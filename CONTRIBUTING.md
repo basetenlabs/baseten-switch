@@ -49,6 +49,8 @@ full gate includes a live identity refresh against the maintainer's existing
 Baseten CLI credential store. It must not be run with credentials supplied by
 an untrusted pull request.
 
+See [RELEASING.md](RELEASING.md) for the beta release process.
+
 ## Pull requests
 
 Keep changes focused and include tests for user-visible behavior. Describe any
