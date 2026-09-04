@@ -117,7 +117,7 @@ baseten-switch claude route sonnet zai-org/GLM-5.2
 baseten-switch claude route sonnet native
 baseten-switch claude subagents zai-org/GLM-5.2
 baseten-switch claude picker status
-baseten-switch claude picker enable --dry-run --json
+baseten-switch claude picker enable
 baseten-switch claude picker add <baseten-model-slug> --dry-run --json
 baseten-switch claude picker add <baseten-model-slug> --alias <alias>
 baseten-switch claude picker remove <alias>
@@ -128,6 +128,10 @@ baseten-switch claude picker sync
 editable while routing is off. A Claude family can map to `native`, a
 configured alias, or a Baseten model slug. Run
 `baseten-switch claude route <family> default` to remove a family override.
+On an existing installation without picker configuration,
+`claude picker enable` enables an empty picker. Add each Baseten model you
+want to expose with `claude picker add`; enabling the picker does not add
+routing aliases as picker rows.
 Picker add, remove, and reorder operations do not delete routing aliases or
 change a running Claude Code session. Reopen `/model` after a change, and
 restart Claude Code if the picker has not refreshed.

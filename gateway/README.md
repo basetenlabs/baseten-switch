@@ -64,11 +64,13 @@ the Claude client's `model_aliases`. The gateway config owns desired alias
 membership and order. The Claude adapter generates presentation, safely
 projects rows into user settings, and reports policy or runtime visibility
 without weakening managed Claude configuration.
-Use `claude picker enable --dry-run --json` to preview every configured alias,
-including aliases that share a slug. If `add <slug> --dry-run --json` reports
-multiple alias choices, repeat it with `--alias <alias>`. Converting an
-existing Claude picker from replacement mode requires the explicit
-`--convert-replacement-mode` flag on `enable` or `sync`.
+When no picker configuration exists, `claude picker enable` creates an enabled
+picker with no rows. Add models explicitly with `claude picker add <slug>`;
+enable does not copy `model_aliases` into the picker. If
+`add <slug> --dry-run --json` reports multiple alias choices, repeat it with
+`--alias <alias>`.
+Converting an existing Claude picker from replacement mode requires the
+explicit `--convert-replacement-mode` flag on `enable` or `sync`.
 
 ## Module layout
 

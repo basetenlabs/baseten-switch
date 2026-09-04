@@ -348,7 +348,7 @@ func TestDisabledPickerStatusSyncedWithExternalRowsAndNoOwnership(t *testing.T) 
 	}
 }
 
-func TestPickerEnableDryRunListsEveryAliasInSortedOrder(t *testing.T) {
+func TestPickerEnableDryRunForAbsentPickerReturnsNoModels(t *testing.T) {
 	env := newSubagentTestEnv(t, true)
 	if err := config.SetClientModelAliases(env.cfgPath, "claude-code", map[string]string{
 		"claude-baseten-another-glm": "zai-org/GLM-5.2",
@@ -364,13 +364,35 @@ func TestPickerEnableDryRunListsEveryAliasInSortedOrder(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &preview); err != nil {
 		t.Fatal(err)
 	}
-	if len(preview.Models) != 3 {
-		t.Fatalf("preview aliases = %+v", preview.Models)
+	if len(preview.Models) != 0 {
+		t.Fatalf("preview models = %+v, want empty", preview.Models)
 	}
-	for i := 1; i < len(preview.Models); i++ {
-		if preview.Models[i-1].Alias >= preview.Models[i].Alias {
-			t.Fatalf("preview not sorted: %+v", preview.Models)
-		}
+}
+
+func TestPickerEnableDryRunReflectsDisabledSavedRows(t *testing.T) {
+	env := newSubagentTestEnv(t, true)
+	if err := config.SetClientModelPicker(env.cfgPath, "claude-code", &config.ModelPicker{
+		Enabled: false,
+		Models: []config.ModelPickerModel{
+			{Alias: "claude-baseten-kimi-k2-7"},
+			{Alias: "claude-baseten-glm-5-2"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := newClaudeAdapterFromEnv()
+	var out bytes.Buffer
+	if rc := a.picker([]string{"enable", "--dry-run", "--json"}, &out); rc != 0 {
+		t.Fatalf("enable preview rc=%d, output=%s", rc, out.String())
+	}
+	var preview claudePickerEnablePreview
+	if err := json.Unmarshal(out.Bytes(), &preview); err != nil {
+		t.Fatal(err)
+	}
+	if len(preview.Models) != 2 ||
+		preview.Models[0].Alias != "claude-baseten-kimi-k2-7" ||
+		preview.Models[1].Alias != "claude-baseten-glm-5-2" {
+		t.Fatalf("preview models = %+v, want saved row order", preview.Models)
 	}
 }
 
@@ -397,7 +419,86 @@ func TestPickerEnablePreservesExplicitEmptySelection(t *testing.T) {
 	}
 }
 
-func TestPickerEnableAbsentFailsWithoutAliases(t *testing.T) {
+func TestPickerEnablePreservesDisabledSavedRows(t *testing.T) {
+	env := newSubagentTestEnv(t, true)
+	if err := config.SetClientModelPicker(env.cfgPath, "claude-code", &config.ModelPicker{
+		Enabled: false,
+		Models: []config.ModelPickerModel{{
+			Alias: "claude-baseten-kimi-k2-7",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stubPickerVersion(t, "2.1.243")
+	a, _ := newClaudeAdapterFromEnv()
+	if rc := a.on(); rc != 0 {
+		t.Fatalf("claude on rc=%d", rc)
+	}
+	var out bytes.Buffer
+	if rc := a.picker([]string{"enable", "--json"}, &out); rc != 0 {
+		t.Fatalf("enable rc=%d, output=%s", rc, out.String())
+	}
+	f, err := config.Load(env.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	picker := f.Clients[0].ModelPicker
+	if picker == nil || !picker.Enabled || len(picker.Models) != 1 ||
+		picker.Models[0].Alias != "claude-baseten-kimi-k2-7" {
+		t.Fatalf("re-enabled picker = %+v, want saved row", picker)
+	}
+	obj, _, err := modelPickerObject(readTree(t, env.settings))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := modelPickerOptions(obj)
+	if err != nil || len(rows) != 1 ||
+		rowModel(rows[0]) != "claude-baseten-kimi-k2-7" {
+		t.Fatalf("installed rows = %#v, err=%v", rows, err)
+	}
+}
+
+func TestPickerEnableAbsentCreatesEmptySelectionWithoutCopyingAliases(t *testing.T) {
+	env := newSubagentTestEnv(t, true)
+	stubPickerVersion(t, "2.1.243")
+	a, err := newClaudeAdapterFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rc := a.on(); rc != 0 {
+		t.Fatalf("claude on rc=%d", rc)
+	}
+	var out bytes.Buffer
+	if rc := a.mutatePickerConfig(
+		[]string{"enable"},
+		mutationOptions{JSON: true, OperationID: "empty-enable"},
+		&out,
+	); rc != 0 {
+		t.Fatalf("enable rc=%d output=%s", rc, out.String())
+	}
+	f, err := config.Load(env.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := f.Clients[0]
+	if client.ModelPicker == nil || !client.ModelPicker.Enabled ||
+		len(client.ModelPicker.Models) != 0 {
+		t.Fatalf("enabled picker = %+v, want no models", client.ModelPicker)
+	}
+	if len(client.ModelAliases) == 0 {
+		t.Fatal("fixture unexpectedly has no model aliases")
+	}
+	obj, exists, err := modelPickerObject(readTree(t, env.settings))
+	if err != nil || !exists {
+		t.Fatalf("Claude settings modelPicker exists=%t err=%v", exists, err)
+	}
+	rows, err := modelPickerOptions(obj)
+	if err != nil || len(rows) != 0 || obj["replaceBuiltInOptions"] != false {
+		t.Fatalf("Claude settings modelPicker = %#v, rows=%#v, err=%v", obj, rows, err)
+	}
+}
+
+func TestPickerEnableAbsentSucceedsWithoutAliases(t *testing.T) {
 	env := newSubagentTestEnv(t, true)
 	raw, err := os.ReadFile(env.cfgPath)
 	if err != nil {
@@ -413,16 +514,25 @@ func TestPickerEnableAbsentFailsWithoutAliases(t *testing.T) {
 	if err := os.WriteFile(env.cfgPath, []byte(withoutAliases), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	stubPickerVersion(t, "2.1.243")
 	a, err := newClaudeAdapterFromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
+	if rc := a.on(); rc != 0 {
+		t.Fatalf("claude on rc=%d", rc)
+	}
 	var out bytes.Buffer
-	if rc := a.mutatePickerConfig([]string{"enable"}, mutationOptions{JSON: true, OperationID: "no-aliases"}, &out); rc != 1 {
+	if rc := a.mutatePickerConfig([]string{"enable"}, mutationOptions{JSON: true, OperationID: "no-aliases"}, &out); rc != 0 {
 		t.Fatalf("enable rc=%d output=%s", rc, out.String())
 	}
-	if _, err := os.Stat(mutationJournalDir(env.cfgPath)); !os.IsNotExist(err) {
-		t.Fatalf("failed enable created mutation state: %v", err)
+	f, err := config.Load(env.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Clients[0].ModelPicker == nil || !f.Clients[0].ModelPicker.Enabled ||
+		len(f.Clients[0].ModelPicker.Models) != 0 {
+		t.Fatalf("enabled picker = %+v, want no models", f.Clients[0].ModelPicker)
 	}
 }
 
@@ -479,6 +589,7 @@ func TestPickerAddExplicitAliasSelectsOneOfSeveralRoutes(t *testing.T) {
 
 func TestPickerRemovalReceiptWarnsForSavedDefaultAndLegacyDiscovery(t *testing.T) {
 	env, a := prepareManagedPicker(t, true)
+	stubPickerVersion(t, "2.1.243")
 	t.Setenv("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "1")
 	root := readTree(t, env.settings)
 	root["model"] = "claude-baseten-glm-5-2"

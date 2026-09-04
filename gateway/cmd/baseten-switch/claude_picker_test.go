@@ -260,8 +260,20 @@ func TestPickerAddRejectsAbsentLiveKnownSubMinimumContextBeforeAnyWrite(t *testi
 	}
 }
 
-func TestPickerEnableRejectsLastKnownSubMinimumWhenLiveCatalogUnavailableBeforeAnyWrite(t *testing.T) {
+func TestPickerReenableRejectsLastKnownSubMinimumWhenLiveCatalogUnavailableBeforeAnyWrite(t *testing.T) {
 	env := newSubagentTestEnv(t, true)
+	if err := config.SetClientModelPicker(
+		env.cfgPath,
+		"claude-code",
+		&config.ModelPicker{
+			Enabled: false,
+			Models: []config.ModelPickerModel{{
+				Alias: "claude-baseten-glm-5-2",
+			}},
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
 	stubPickerCatalogResult(
 		t,
 		"error",

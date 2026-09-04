@@ -51,7 +51,7 @@ enum ClaudeModelPickerMutationKind: Equatable, Sendable {
 
     var progressLabel: String {
         switch self {
-        case .enable: return "Setting up model picker"
+        case .enable: return "Enabling model picker"
         case .add: return "Adding model"
         case .remove: return "Removing model"
         case .move: return "Saving model order"
@@ -287,10 +287,21 @@ struct PendingClaudeModelPickerMutation: Equatable, Sendable {
 }
 
 private enum ClaudeModelPickerConfirmation {
-    case enable(
-        ClaudeModelPickerEnablePreview,
-        convertReplacementMode: Bool)
+    case convertReplacementMode
     case chooseAlias(slug: String, choices: [ClaudeModelPickerRow])
+}
+
+enum ClaudeModelPickerEnableDecision: Equatable, Sendable {
+    case enableDirectly
+    case confirmReplacementModeConversion
+}
+
+func claudeModelPickerEnableDecision(
+    replacementMode: String?
+) -> ClaudeModelPickerEnableDecision {
+    replacementMode == "replace"
+        ? .confirmReplacementModeConversion
+        : .enableDirectly
 }
 
 struct ClaudeModelPickerEnablePreview: Equatable, Sendable {
@@ -493,6 +504,16 @@ func claudeModelPickerCanRetrySync(
         && hasConfiguredPicker
 }
 
+func claudeModelPickerCanAddModels(
+    canEditConfiguredRows: Bool,
+    modelCatalogAllowsMutation: Bool,
+    pickerEnabled: Bool
+) -> Bool {
+    canEditConfiguredRows
+        && modelCatalogAllowsMutation
+        && pickerEnabled
+}
+
 let claudeModelPickerRestartNotice =
     "Restart Claude Code to see additions or removals."
 
@@ -687,7 +708,7 @@ func claudeModelPickerSuccessMessage(
 ) -> String {
     switch kind {
     case .enable:
-        return "Saved. Reopen /model in Claude Code to verify the configured Baseten models."
+        return "Enabled. Choose a Baseten model to add to /model."
     case .add:
         return "Added to /model."
     case .remove:
@@ -706,10 +727,8 @@ struct ClaudeModelPickerSectionView: View {
 
     @State private var searchText = ""
     @State private var confirmation: ClaudeModelPickerConfirmation?
-    @State private var previewError: String?
     @State private var addPreviewError: String?
     @State private var previewingSlug: String?
-    @State private var previewingEnable = false
     @State private var fallbackTargetEditorDraft:
         ClaudeNativeFallbackEditorDraft?
     var body: some View {
@@ -759,14 +778,6 @@ struct ClaudeModelPickerSectionView: View {
                         .fixedSize(horizontal: false, vertical: true)
                         .accessibilityIdentifier("claude-picker-warning")
                 }
-                if let previewError {
-                    Label(
-                        previewError,
-                        systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
                 if let reason = state.claudeModelPickerMutationDisabledReason,
                    state.pendingClaudeModelPicker == nil,
                    !isPreview {
@@ -788,10 +799,8 @@ struct ClaudeModelPickerSectionView: View {
             confirmationActions
         } message: {
             switch confirmation {
-            case .enable(let preview, let convert):
-                Text(enableConfirmationMessage(
-                    preview: preview,
-                    convertsReplacementMode: convert))
+            case .convertReplacementMode:
+                Text("Claude Code currently replaces its built-in model list. Enabling the picker will keep those models available and append any Baseten models you add.")
             case .chooseAlias:
                 Text("More than one configured alias routes to this model. Choose the exact alias to add.")
             case nil:
@@ -1044,40 +1053,19 @@ struct ClaudeModelPickerSectionView: View {
         if client.modelPicker == nil {
             HStack(alignment: .center, spacing: 12) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Add your configured Baseten models to /model")
+                    Text("Enable the Claude Code model picker")
                         .font(.body.weight(.medium))
-                    Text("Setup previews and appends every configured alias. Claude's built-in models remain unchanged.")
+                    Text("Then choose which Baseten models to add. Claude's built-in models stay available.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Set Up Model Picker") {
-                    guard !isPreview else { return }
-                    previewError = nil
-                    previewingEnable = true
-                    Task {
-                        let preview = await state
-                            .previewClaudeModelPickerEnable()
-                        guard previewingEnable else { return }
-                        previewingEnable = false
-                        if let preview {
-                            confirmation = .enable(
-                                preview,
-                                convertReplacementMode:
-                                    replacementModeRequiresConversion)
-                        } else {
-                            previewError = "Switch could not generate an exact setup preview. No changes were made."
-                        }
-                    }
+                Button("Enable Model Picker") {
+                    enableModelPicker()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(!canEditConfiguredRows || previewingEnable)
+                .disabled(!canEditConfiguredRows)
                 .accessibilityIdentifier("claude-picker-enable")
-                if previewingEnable {
-                    ProgressView()
-                        .controlSize(.small)
-                        .accessibilityLabel("Previewing model picker setup")
-                }
             }
             .padding(12)
             .background(
@@ -1092,16 +1080,7 @@ struct ClaudeModelPickerSectionView: View {
                     .foregroundStyle(.orange)
                 Spacer()
                 Button("Enable") {
-                    guard !isPreview else { return }
-                    if replacementModeRequiresConversion {
-                        confirmation = .enable(
-                            ClaudeModelPickerEnablePreview(
-                                models: projection.configured),
-                            convertReplacementMode: true)
-                    } else {
-                        state.requestClaudeModelPicker(
-                            .enable(convertReplacementMode: false))
-                    }
+                    enableModelPicker()
                 }
                 .disabled(!canEditConfiguredRows)
                 .accessibilityIdentifier("claude-picker-enable")
@@ -1182,7 +1161,6 @@ struct ClaudeModelPickerSectionView: View {
             .accessibilityIdentifier("claude-picker-move-down-\(row.alias)")
 
             Button("Remove") {
-                previewError = nil
                 guard !isPreview else { return }
                 state.requestClaudeModelPicker(
                     claudeModelPickerRemoveMutation(alias: row.alias))
@@ -1198,6 +1176,11 @@ struct ClaudeModelPickerSectionView: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Available to add")
                 .font(.subheadline.weight(.semibold))
+            if client.modelPicker?.enabled != true {
+                Text("Enable the model picker before adding models.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             TextField("Search models", text: $searchText)
                 .textFieldStyle(.roundedBorder)
                 .accessibilityIdentifier("claude-picker-search")
@@ -1301,7 +1284,11 @@ struct ClaudeModelPickerSectionView: View {
     }
 
     private var canAddModels: Bool {
-        canEditConfiguredRows && state.modelCatalogAllowsMutation
+        claudeModelPickerCanAddModels(
+            canEditConfiguredRows: canEditConfiguredRows,
+            modelCatalogAllowsMutation:
+                state.modelCatalogAllowsMutation,
+            pickerEnabled: client.modelPicker?.enabled == true)
     }
 
     private var canRetryModelPickerSync: Bool {
@@ -1310,10 +1297,6 @@ struct ClaudeModelPickerSectionView: View {
                 state.claudeModelPickerDiagnostics?.userFileSync,
             canEditConfiguredRows: canEditConfiguredRows,
             hasConfiguredPicker: client.modelPicker != nil)
-    }
-
-    private var replacementModeRequiresConversion: Bool {
-        state.claudeModelPickerDiagnostics?.replacementMode == "replace"
     }
 
     private var configuredRowState: String {
@@ -1330,8 +1313,8 @@ struct ClaudeModelPickerSectionView: View {
 
     private var confirmationTitle: String {
         switch confirmation {
-        case .enable:
-            return "Set up the Claude Code model picker?"
+        case .convertReplacementMode:
+            return "Keep Claude's built-in models?"
         case .chooseAlias:
             return "Choose an alias"
         case nil:
@@ -1342,11 +1325,11 @@ struct ClaudeModelPickerSectionView: View {
     @ViewBuilder
     private var confirmationActions: some View {
         switch confirmation {
-        case .enable(_, let convert):
-            Button(convert ? "Convert and Set Up" : "Set Up Model Picker") {
+        case .convertReplacementMode:
+            Button("Convert and Enable") {
                 guard !isPreview else { return }
                 state.requestClaudeModelPicker(
-                    .enable(convertReplacementMode: convert))
+                    .enable(convertReplacementMode: true))
                 confirmation = nil
             }
         case .chooseAlias(let slug, let choices):
@@ -1362,20 +1345,22 @@ struct ClaudeModelPickerSectionView: View {
         Button("Cancel", role: .cancel) { confirmation = nil }
     }
 
-    private func enableConfirmationMessage(
-        preview: ClaudeModelPickerEnablePreview,
-        convertsReplacementMode: Bool
-    ) -> String {
-        var message = "Switch will append these aliases in this order and leave Claude's built-in models unchanged:\n\(preview.models.map(\.alias).joined(separator: "\n"))"
-        if convertsReplacementMode {
-            message += "\n\nClaude Code currently replaces its built-in model list. This will explicitly convert it to append mode."
+    private func enableModelPicker() {
+        guard !isPreview else { return }
+        switch claudeModelPickerEnableDecision(
+            replacementMode:
+                state.claudeModelPickerDiagnostics?.replacementMode
+        ) {
+        case .enableDirectly:
+            state.requestClaudeModelPicker(
+                .enable(convertReplacementMode: false))
+        case .confirmReplacementModeConversion:
+            confirmation = .convertReplacementMode
         }
-        return message
     }
 
     private func beginAddPreview(slug: String, alias: String?) {
         guard !isPreview else { return }
-        previewError = nil
         addPreviewError = nil
         previewingSlug = slug
         Task {

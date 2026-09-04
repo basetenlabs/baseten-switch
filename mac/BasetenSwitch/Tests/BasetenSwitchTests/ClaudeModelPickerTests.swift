@@ -563,6 +563,47 @@ final class ClaudeModelPickerTests: XCTestCase {
             hasConfiguredPicker: false))
     }
 
+    func testEnableConfirmsOnlyWhenReplacementModeMustBeConverted() {
+        XCTAssertEqual(
+            claudeModelPickerEnableDecision(replacementMode: nil),
+            .enableDirectly)
+        XCTAssertEqual(
+            claudeModelPickerEnableDecision(replacementMode: "append"),
+            .enableDirectly)
+        XCTAssertEqual(
+            claudeModelPickerEnableDecision(replacementMode: "blocked"),
+            .enableDirectly)
+        XCTAssertEqual(
+            claudeModelPickerEnableDecision(replacementMode: "replace"),
+            .confirmReplacementModeConversion)
+    }
+
+    func testEnableSuccessCopyDoesNotClaimModelsWereAdded() {
+        XCTAssertEqual(
+            claudeModelPickerSuccessMessage(
+                .enable(convertReplacementMode: false)),
+            "Enabled. Choose a Baseten model to add to /model.")
+    }
+
+    func testAddRequiresAnEnabledPickerAndMutableCatalog() {
+        XCTAssertTrue(claudeModelPickerCanAddModels(
+            canEditConfiguredRows: true,
+            modelCatalogAllowsMutation: true,
+            pickerEnabled: true))
+        XCTAssertFalse(claudeModelPickerCanAddModels(
+            canEditConfiguredRows: true,
+            modelCatalogAllowsMutation: true,
+            pickerEnabled: false))
+        XCTAssertFalse(claudeModelPickerCanAddModels(
+            canEditConfiguredRows: false,
+            modelCatalogAllowsMutation: true,
+            pickerEnabled: true))
+        XCTAssertFalse(claudeModelPickerCanAddModels(
+            canEditConfiguredRows: true,
+            modelCatalogAllowsMutation: false,
+            pickerEnabled: true))
+    }
+
     func testMalformedPickerProjectionFailsClosedWithoutDroppingRows() throws {
         let client = try XCTUnwrap(ClientStatus(dict: [
             "name": "claude-code",

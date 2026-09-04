@@ -564,7 +564,8 @@ func installModelPickerWithOptions(root map[string]any, desired []any, prior *cl
 			}
 		}
 	}
-	updated := append([]any(nil), rows[:anchor]...)
+	updated := make([]any, 0, len(rows)+len(desired))
+	updated = append(updated, rows[:anchor]...)
 	updated = append(updated, desired...)
 	updated = append(updated, rows[anchor:]...)
 	rows = updated
@@ -1121,7 +1122,6 @@ func (a *claudeAdapter) mutatePickerConfig(args []string, opts mutationOptions, 
 		return 1
 	}
 	picker := a.modelPicker
-	pickerWasAbsent := picker == nil
 	if picker == nil {
 		picker = &config.ModelPicker{}
 	}
@@ -1145,14 +1145,6 @@ func (a *claudeAdapter) mutatePickerConfig(args []string, opts mutationOptions, 
 		}
 		proposed := p
 		proposed.Enabled = true
-		if pickerWasAbsent {
-			for _, alias := range sortedAliasIDs(a.modelAliases) {
-				proposed.Models = append(
-					proposed.Models,
-					config.ModelPickerModel{Alias: alias},
-				)
-			}
-		}
 		if err := a.preflightPickerContext(
 			&proposed,
 			copyPickerAliases(a.modelAliases),
@@ -1168,9 +1160,12 @@ func (a *claudeAdapter) mutatePickerConfig(args []string, opts mutationOptions, 
 			}, code, err.Error(), false, 1)
 		}
 		preview := claudePickerEnablePreview{Models: []claudePickerPreview{}}
-		for _, alias := range sortedAliasIDs(a.modelAliases) {
-			slug := a.modelAliases[alias]
-			preview.Models = append(preview.Models, pickerPreview(alias, slug))
+		for _, model := range proposed.Models {
+			slug := a.modelAliases[model.Alias]
+			preview.Models = append(
+				preview.Models,
+				pickerPreview(model.Alias, slug),
+			)
 		}
 		_ = json.NewEncoder(stdout).Encode(preview)
 		return 0
@@ -1234,20 +1229,6 @@ func (a *claudeAdapter) mutatePickerConfig(args []string, opts mutationOptions, 
 			return pickerUsage(a.out)
 		}
 		p.Enabled = true
-		if pickerWasAbsent {
-			if len(a.modelAliases) == 0 {
-				fmt.Fprintln(a.out, "claude picker enable: no model_aliases are configured")
-				return 1
-			}
-			aliases := make([]string, 0, len(a.modelAliases))
-			for alias := range a.modelAliases {
-				aliases = append(aliases, alias)
-			}
-			sort.Strings(aliases)
-			for _, alias := range aliases {
-				p.Models = append(p.Models, config.ModelPickerModel{Alias: alias})
-			}
-		}
 	case "disable":
 		if len(args) != 1 {
 			return pickerUsage(a.out)

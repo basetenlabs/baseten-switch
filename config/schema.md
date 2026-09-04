@@ -191,8 +191,12 @@ row into Claude settings.
 
 The checked-in new-install template enables the picker and includes every
 default alias. Existing configs without `model_picker` are not changed merely
-by loading them. Typed picker edits preserve bytes outside this subtree and
-validate the complete resulting config before replacement.
+by loading them. For an existing config where this block is absent,
+`claude picker enable` creates an enabled picker with an empty `models` list.
+Add each desired row explicitly with `claude picker add`; enabling alone does
+not copy `model_aliases` into the picker. Typed picker edits preserve bytes
+outside this subtree and validate the complete resulting config before
+replacement.
 
 ### `responses_compatibility`
 
