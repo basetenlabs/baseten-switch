@@ -562,6 +562,47 @@ final class ClaudeModelPickerTests: XCTestCase {
             hasConfiguredPicker: false))
     }
 
+    func testPickerDiagnosticsAreHiddenWhenHealthy() {
+        XCTAssertFalse(claudeModelPickerHasDiagnosticIssues(
+            userFileSync: "synced",
+            allowlistPolicy: "no_known_conflict"))
+        XCTAssertFalse(claudeModelPickerShowsSyncDiagnostic(
+            userFileSync: "synced"))
+        XCTAssertFalse(claudeModelPickerShowsAllowlistDiagnostic(
+            allowlistPolicy: "no_known_conflict"))
+    }
+
+    func testPickerDiagnosticsOnlyExposeUnhealthyAxes() {
+        XCTAssertTrue(claudeModelPickerHasDiagnosticIssues(
+            userFileSync: "out_of_sync",
+            allowlistPolicy: "no_known_conflict"))
+        XCTAssertTrue(claudeModelPickerShowsSyncDiagnostic(
+            userFileSync: "out_of_sync"))
+        XCTAssertFalse(claudeModelPickerShowsAllowlistDiagnostic(
+            allowlistPolicy: "no_known_conflict"))
+
+        XCTAssertTrue(claudeModelPickerHasDiagnosticIssues(
+            userFileSync: "synced",
+            allowlistPolicy: "possible_conflict"))
+        XCTAssertFalse(claudeModelPickerShowsSyncDiagnostic(
+            userFileSync: "synced"))
+        XCTAssertTrue(claudeModelPickerShowsAllowlistDiagnostic(
+            allowlistPolicy: "possible_conflict"))
+
+        XCTAssertTrue(claudeModelPickerHasDiagnosticIssues(
+            userFileSync: "synced",
+            allowlistPolicy: "no_known_conflict",
+            hasMessage: true))
+        XCTAssertTrue(claudeModelPickerHasDiagnosticIssues(
+            userFileSync: "synced",
+            allowlistPolicy: "no_known_conflict",
+            savedModelUnconfigured: true))
+        XCTAssertTrue(claudeModelPickerHasDiagnosticIssues(
+            userFileSync: "synced",
+            allowlistPolicy: "no_known_conflict",
+            savedModelContextMismatch: true))
+    }
+
     func testEnableConfirmsOnlyWhenReplacementModeMustBeConverted() {
         XCTAssertEqual(
             claudeModelPickerEnableDecision(replacementMode: nil),

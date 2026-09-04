@@ -504,6 +504,33 @@ func claudeModelPickerCanRetrySync(
         && hasConfiguredPicker
 }
 
+func claudeModelPickerShowsSyncDiagnostic(
+    userFileSync: String
+) -> Bool {
+    userFileSync != "synced"
+}
+
+func claudeModelPickerShowsAllowlistDiagnostic(
+    allowlistPolicy: String
+) -> Bool {
+    allowlistPolicy != "no_known_conflict"
+}
+
+func claudeModelPickerHasDiagnosticIssues(
+    userFileSync: String,
+    allowlistPolicy: String,
+    hasMessage: Bool = false,
+    savedModelUnconfigured: Bool = false,
+    savedModelContextMismatch: Bool = false
+) -> Bool {
+    claudeModelPickerShowsSyncDiagnostic(userFileSync: userFileSync)
+        || claudeModelPickerShowsAllowlistDiagnostic(
+            allowlistPolicy: allowlistPolicy)
+        || hasMessage
+        || savedModelUnconfigured
+        || savedModelContextMismatch
+}
+
 func claudeModelPickerCanAddModels(
     canEditConfiguredRows: Bool,
     modelCatalogAllowsMutation: Bool,
@@ -951,84 +978,78 @@ struct ClaudeModelPickerSectionView: View {
                     .foregroundStyle(.secondary)
             }
         } else if let diagnostics = state.claudeModelPickerDiagnostics {
-            VStack(alignment: .leading, spacing: 6) {
-                diagnosticRow(
-                    "Configuration",
-                    claudeModelPickerDiagnosticLabel(
-                        key: "configuration",
-                        value: diagnostics.configuration))
-                diagnosticRow(
-                    "Claude settings",
-                    claudeModelPickerDiagnosticLabel(
-                        key: "sync",
-                        value: diagnostics.userFileSync))
-                diagnosticRow(
-                    "Overall policy",
-                    claudeModelPickerDiagnosticLabel(
-                        key: "policy",
-                        value: diagnostics.knownPolicy))
-                diagnosticRow(
-                    "Allowlist policy",
-                    claudeModelPickerDiagnosticLabel(
-                        key: "policy",
-                        value: diagnostics.allowlistPolicy))
-                diagnosticRow(
-                    "Managed policy",
-                    claudeModelPickerDiagnosticLabel(
-                        key: "policy",
-                        value: diagnostics.managedPolicy))
-                diagnosticRow(
-                    "Picker mode",
-                    claudeModelPickerDiagnosticLabel(
-                        key: "replacement",
-                        value: diagnostics.replacementMode))
-                diagnosticRow(
-                    "Runtime visibility",
-                    claudeModelPickerDiagnosticLabel(
-                        key: "runtime",
-                        value: diagnostics.runtimeVerification))
-                if !diagnostics.message.isEmpty {
-                    Label(
-                        diagnostics.message,
-                        systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if diagnostics.savedModelUnconfigured,
-                   let savedModel = diagnostics.savedModel {
-                    Label(
-                        "Claude Code's saved default, \(savedModel), is not in the curated picker list.",
-                        systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if diagnostics.savedModelContextMismatch,
-                   let savedModel = diagnostics.savedModel {
-                    Label(
-                        "Claude Code's saved default, \(savedModel), still requests 1M context. Its configured picker row now uses the 200K context bucket.",
-                        systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if canRetryModelPickerSync {
-                    HStack {
-                        Spacer()
-                        Button("Retry sync") {
-                            state.requestClaudeModelPicker(
-                                .sync(convertReplacementMode: false))
+            if claudeModelPickerHasDiagnosticIssues(
+                userFileSync: diagnostics.userFileSync,
+                allowlistPolicy: diagnostics.allowlistPolicy,
+                hasMessage: !diagnostics.message.isEmpty,
+                savedModelUnconfigured:
+                    diagnostics.savedModelUnconfigured,
+                savedModelContextMismatch:
+                    diagnostics.savedModelContextMismatch
+            ) {
+                VStack(alignment: .leading, spacing: 6) {
+                    if claudeModelPickerShowsSyncDiagnostic(
+                        userFileSync: diagnostics.userFileSync
+                    ) {
+                        diagnosticRow(
+                            "Claude settings",
+                            claudeModelPickerDiagnosticLabel(
+                                key: "sync",
+                                value: diagnostics.userFileSync))
+                    }
+                    if claudeModelPickerShowsAllowlistDiagnostic(
+                        allowlistPolicy: diagnostics.allowlistPolicy
+                    ) {
+                        diagnosticRow(
+                            "Allowlist policy",
+                            claudeModelPickerDiagnosticLabel(
+                                key: "policy",
+                                value: diagnostics.allowlistPolicy))
+                    }
+                    if !diagnostics.message.isEmpty {
+                        Label(
+                            diagnostics.message,
+                            systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if diagnostics.savedModelUnconfigured,
+                       let savedModel = diagnostics.savedModel {
+                        Label(
+                            "Claude Code's saved default, \(savedModel), is not in the curated picker list.",
+                            systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if diagnostics.savedModelContextMismatch,
+                       let savedModel = diagnostics.savedModel {
+                        Label(
+                            "Claude Code's saved default, \(savedModel), still requests 1M context. Its configured picker row now uses the 200K context bucket.",
+                            systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if canRetryModelPickerSync {
+                        HStack {
+                            Spacer()
+                            Button("Retry sync") {
+                                state.requestClaudeModelPicker(
+                                    .sync(convertReplacementMode: false))
+                            }
+                            .accessibilityIdentifier(
+                                "claude-picker-retry-sync")
                         }
-                        .accessibilityIdentifier("claude-picker-retry-sync")
                     }
                 }
+                .padding(10)
+                .background(
+                    Color.secondary.opacity(0.06),
+                    in: RoundedRectangle(cornerRadius: 8))
+                .accessibilityIdentifier("claude-picker-diagnostics")
             }
-            .padding(10)
-            .background(
-                Color.secondary.opacity(0.06),
-                in: RoundedRectangle(cornerRadius: 8))
-            .accessibilityIdentifier("claude-picker-diagnostics")
         } else if let error = state.claudeModelPickerDiagnosticsError {
             Label(error, systemImage: "exclamationmark.triangle.fill")
                 .font(.caption)
