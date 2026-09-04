@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/basetenlabs/baseten-switch/gateway/internal/config"
+	"github.com/basetenlabs/baseten-switch/gateway/internal/modelmeta"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/pidfile"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/pricing"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/telemetry"
@@ -273,6 +274,50 @@ type modelCatalogEntry struct {
 	Available     bool   `json:"available"`
 }
 
+type modelPickerStatus struct {
+	Enabled bool                     `json:"enabled"`
+	Models  []modelPickerStatusModel `json:"models"`
+}
+
+type modelPickerStatusModel struct {
+	Alias         string `json:"alias"`
+	Slug          string `json:"slug"`
+	Label         string `json:"label"`
+	Description   string `json:"description,omitempty"`
+	ContextTokens int64  `json:"context_tokens"`
+}
+
+// computeModelPickerStatus projects the desired config in its saved order.
+// It intentionally does not read Claude settings or infer whether policy has
+// filtered a row; the Claude adapter owns those file and runtime status axes.
+func computeModelPickerStatus(
+	c config.Client,
+	catalog *pricing.Snapshot,
+) *modelPickerStatus {
+	if c.ModelPicker == nil {
+		return nil
+	}
+	status := &modelPickerStatus{
+		Enabled: c.ModelPicker.Enabled,
+		Models:  make([]modelPickerStatusModel, 0, len(c.ModelPicker.Models)),
+	}
+	for _, model := range c.ModelPicker.Models {
+		slug := c.ModelAliases[model.Alias]
+		var contextTokens int64
+		if record, ok := catalog.Model(pricing.ProviderBaseten, slug); ok {
+			contextTokens = record.ContextTokens
+		}
+		status.Models = append(status.Models, modelPickerStatusModel{
+			Alias:         model.Alias,
+			Slug:          slug,
+			Label:         modelmeta.ResolveBaseten(slug).DisplayName + " via Baseten",
+			Description:   "Served by Baseten.",
+			ContextTokens: contextTokens,
+		})
+	}
+	return status
+}
+
 // computeModelCatalog builds display metadata for one client's configured
 // Baseten targets: one entry per model_aliases entry, the default model when
 // not covered by an alias, and raw slugs saved in model_routes or
@@ -371,10 +416,10 @@ func (g *Gateway) activeRoutingState() activeRoutingState {
 }
 
 func fallbackStatus(g *Gateway, rc resolvedClientConfig) map[string]any {
-	deadline, active := g.fallbackDeadline(rc.Name)
+	state, active := g.policyAwareFallbackCooldown(rc)
 	var retryAfter any
 	if active {
-		retryAfter = deadline.UTC().Format(time.RFC3339Nano)
+		retryAfter = state.Until.UTC().Format(time.RFC3339Nano)
 	}
 	cause := ""
 	served := ""
@@ -386,6 +431,237 @@ func fallbackStatus(g *Gateway, rc resolvedClientConfig) map[string]any {
 		"active": active, "served_route": served, "cause": cause,
 		"since": nil, "retry_after": retryAfter,
 	}
+}
+
+func (g *Gateway) policyAwareFallbackCooldown(rc resolvedClientConfig) (fallbackCooldownState, bool) {
+	state, active := g.activeFallbackCooldown(rc.Name)
+	return state, active && cooldownEligible(rc.resolvedFallbackPolicy(), fallbackAllowLegacy, state)
+}
+
+func basetenModelFallbackStatus(
+	rc resolvedClientConfig,
+	desiredActiveMismatch bool,
+	catalog *pricing.Snapshot,
+) map[string]any {
+	model := rc.NativeFallbackModel
+	providerReady := nativeFallbackProviderReady(rc)
+	ready := model != "" && providerReady && config.IsProtocolNativeModel(rc.ProtocolShape, model)
+	var reason any
+	switch {
+	case desiredActiveMismatch:
+		reason = "desired_active_mismatch"
+		ready = false
+	case model == "":
+		reason = "not_configured"
+	case !providerReady:
+		reason = "provider_auth_unavailable"
+	case !ready:
+		reason = "not_configured"
+	}
+	return map[string]any{
+		"configured_model": model,
+		"resolved_model":   model,
+		"display_name":     nativeFallbackCatalogDisplayName(catalog, model),
+		"provider_ready":   providerReady,
+		"ready":            ready,
+		"reason":           reason,
+		"available_models": nativeFallbackAvailableModels(rc, catalog),
+	}
+}
+
+func nativeFallbackAvailableModels(
+	rc resolvedClientConfig,
+	catalog *pricing.Snapshot,
+) []map[string]any {
+	records := catalog.Models(pricing.ProviderAnthropic)
+	byFamily := make(map[string]nativeFallbackOption, len(modelFamilySet))
+	for _, record := range records {
+		model := record.CanonicalModelID
+		if !config.IsProtocolNativeModel(rc.ProtocolShape, model) {
+			continue
+		}
+		if !nativeFallbackFamilyAllowed(record.Family) {
+			continue
+		}
+		candidate := nativeFallbackOption{
+			model:       model,
+			displayName: normalizeNativeFallbackDisplayName(record.DisplayName),
+			family:      record.Family,
+			releaseDate: record.ReleaseDate,
+			version:     nativeFallbackVersion(model, record.Family),
+		}
+		if existing, duplicate := byFamily[candidate.family]; !duplicate ||
+			preferNativeFallbackOption(candidate, existing) {
+			byFamily[candidate.family] = candidate
+		}
+	}
+
+	models := make([]map[string]any, 0, len(byFamily))
+	for _, family := range modelFamilySet {
+		option, ok := byFamily[family]
+		if !ok {
+			continue
+		}
+		models = append(models, map[string]any{
+			"model": option.model, "display_name": option.displayName,
+		})
+	}
+	return models
+}
+
+type nativeFallbackOption struct {
+	model       string
+	displayName string
+	family      string
+	releaseDate string
+	version     []uint64
+}
+
+func preferNativeFallbackOption(
+	candidate nativeFallbackOption,
+	existing nativeFallbackOption,
+) bool {
+	if candidate.releaseDate != existing.releaseDate {
+		if comparison := compareNativeFallbackReleaseDates(
+			candidate.releaseDate,
+			existing.releaseDate,
+		); comparison != 0 {
+			return comparison > 0
+		}
+	}
+	if comparison := compareNativeFallbackVersions(
+		candidate.version,
+		existing.version,
+	); comparison != 0 {
+		return comparison > 0
+	}
+	if len(candidate.model) != len(existing.model) {
+		return len(candidate.model) < len(existing.model)
+	}
+	return candidate.model < existing.model
+}
+
+// Canonical YYYY-MM and YYYY-MM-DD values sort chronologically as strings.
+// Within the same month, the documented day precision sorts after month-only
+// precision, providing a stable preference when the catalog mixes both forms.
+func compareNativeFallbackReleaseDates(left, right string) int {
+	if left == right {
+		return 0
+	}
+	if left == "" {
+		return -1
+	}
+	if right == "" {
+		return 1
+	}
+	if left < right {
+		return -1
+	}
+	return 1
+}
+
+func nativeFallbackFamilyAllowed(family string) bool {
+	for _, allowed := range modelFamilySet {
+		if family == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+// nativeFallbackVersion provides a deterministic fallback for provider cache
+// records written before release_date was retained. Anthropic has used both
+// claude-FAMILY-MAJOR-MINOR and claude-MAJOR-MINOR-FAMILY identifiers.
+func nativeFallbackVersion(model, family string) []uint64 {
+	parts := strings.Split(strings.TrimPrefix(model, "claude-"), "-")
+	familyIndex := -1
+	for index, part := range parts {
+		if part == family {
+			familyIndex = index
+			break
+		}
+	}
+	if familyIndex < 0 {
+		return nil
+	}
+	var versionParts []string
+	if familyIndex == 0 {
+		versionParts = parts[1:]
+	} else {
+		versionParts = parts[:familyIndex]
+	}
+	version := make([]uint64, 0, len(versionParts))
+	for _, part := range versionParts {
+		if part == "" || strings.IndexFunc(part, func(r rune) bool {
+			return r < '0' || r > '9'
+		}) >= 0 {
+			break
+		}
+		value, err := strconv.ParseUint(part, 10, 64)
+		if err != nil {
+			break
+		}
+		version = append(version, value)
+	}
+	if familyIndex == 0 && len(version) > 1 {
+		lastRaw := versionParts[len(version)-1]
+		if len(lastRaw) == 8 {
+			version = version[:len(version)-1]
+		}
+	}
+	if len(version) == 0 {
+		return nil
+	}
+	return version
+}
+
+func compareNativeFallbackVersions(left, right []uint64) int {
+	limit := min(len(left), len(right))
+	for index := 0; index < limit; index++ {
+		if left[index] < right[index] {
+			return -1
+		}
+		if left[index] > right[index] {
+			return 1
+		}
+	}
+	if len(left) < len(right) {
+		return -1
+	}
+	if len(left) > len(right) {
+		return 1
+	}
+	return 0
+}
+
+func normalizeNativeFallbackDisplayName(displayName string) string {
+	return strings.TrimSuffix(displayName, " (latest)")
+}
+
+func nativeFallbackCatalogDisplayName(catalog *pricing.Snapshot, model string) string {
+	if displayName, ok := catalog.DisplayName(pricing.ProviderAnthropic, model); ok {
+		return normalizeNativeFallbackDisplayName(displayName)
+	}
+	return normalizeNativeFallbackDisplayName(nativeFallbackDisplayName(model))
+}
+
+func nativeFallbackProviderReady(rc resolvedClientConfig) bool {
+	// Native attempts preserve per-request harness authentication. Readiness
+	// here therefore means the active client has a shape-compatible native
+	// route; process-level API-key environment is not authoritative.
+	return rc.FallbackRoute != "" && rc.FallbackRoute == config.NativeRoute(rc.ProtocolShape)
+}
+
+func nativeFallbackDisplayName(model string) string {
+	lower := strings.ToLower(model)
+	for _, family := range []struct{ token, label string }{
+		{"opus", "Opus"}, {"sonnet", "Sonnet"}, {"haiku", "Haiku"}, {"fable", "Fable"},
+	} {
+		if strings.Contains(lower, family.token) {
+			return family.label
+		}
+	}
+	return model
 }
 
 func providerDisplayName(provider string) string {
@@ -456,8 +732,11 @@ func resolvedStatusClient(f *config.File, c config.Client) resolvedClientConfig 
 		DefaultModel:         c.DefaultModel,
 		ModelAliases:         c.ModelAliases, SubagentModel: c.SubagentModel,
 		SubagentRouting: c.SubagentRouting, ModelRoutes: c.ModelRoutes,
-		ModelOptions:  cloneModelOptions(c.ModelOptions),
-		FallbackRoute: c.FallbackRoute, UpstreamShape: c.UpstreamShape,
+		ModelOptions:      cloneModelOptions(c.ModelOptions),
+		FallbackRoute:     c.FallbackRoute,
+		FallbackPolicy:    config.ResolveFallbackPolicy(f.Global.FallbackPolicy),
+		HasFallbackPolicy: true, NativeFallbackModel: c.NativeFallbackModel,
+		UpstreamShape: c.UpstreamShape,
 	}
 }
 
@@ -472,6 +751,11 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 	runtimeCfg := g.runtimeConfig()
 	g.routingMu.RUnlock()
 	catalogSnapshot := g.pricing.Capture()
+	desiredHash := ""
+	if raw, err := os.ReadFile(g.activeConfigPath()); err == nil {
+		desiredHash = exactConfigHash(raw)
+	}
+	desiredActiveMismatch := desiredHash != "" && state.activeHash != "" && desiredHash != state.activeHash
 	runtimeByName := map[string]resolvedClientConfig{}
 	boundByName := map[string]bool{}
 	for _, cl := range runtimeClients {
@@ -504,7 +788,7 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 			if configuredTarget != "" {
 				configuredTargetJSON = configuredTarget
 			}
-			clients = append(clients, map[string]any{
+			clientStatus := map[string]any{
 				"name":               c.Name,
 				"enabled":            c.Enabled,
 				"bind_addr":          c.BindAddr,
@@ -522,6 +806,7 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 				"model_routes":       rcEff.ModelRoutes,
 				"families":           families,
 				"model_catalog":      computeModelCatalog(rcEff, catalogSnapshot),
+				"model_picker":       computeModelPickerStatus(c, catalogSnapshot),
 				"model_options":      computeClientModelOptions(rcEff, catalogSnapshot),
 				"unmatched_native_model": map[string]any{
 					"configured_target": configuredTargetJSON,
@@ -529,7 +814,15 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 					"effective_model":   unmatched.model,
 					"effective_source":  unmatched.source,
 				},
-			})
+			}
+			if c.Enabled && rcEff.ProtocolShape == "anthropic" {
+				clientStatus["baseten_model_fallback"] = basetenModelFallbackStatus(
+					rcEff,
+					desiredActiveMismatch,
+					catalogSnapshot,
+				)
+			}
+			clients = append(clients, clientStatus)
 		}
 	} else {
 		// Embedders that construct New without a backing config still get
@@ -546,7 +839,7 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 			if subagentEffective == "" || cl.cfg.SubagentRouting == "off" {
 				subagentEffective = "inherit"
 			}
-			clients = append(clients, map[string]any{
+			clientStatus := map[string]any{
 				"name":               cl.cfg.Name,
 				"bind_addr":          cl.Addr().String(),
 				"protocol_shape":     cl.cfg.ProtocolShape,
@@ -563,6 +856,7 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 				"model_routes":       cl.cfg.ModelRoutes,
 				"families":           families,
 				"model_catalog":      computeModelCatalog(cl.cfg, catalogSnapshot),
+				"model_picker":       nil,
 				"model_options":      computeClientModelOptions(cl.cfg, catalogSnapshot),
 				"unmatched_native_model": map[string]any{
 					"configured_target": configuredTargetJSON,
@@ -570,12 +864,16 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 					"effective_model":   unmatched.model,
 					"effective_source":  unmatched.source,
 				},
-			})
+			}
+			if cl.cfg.ProtocolShape == "anthropic" {
+				clientStatus["baseten_model_fallback"] = basetenModelFallbackStatus(
+					cl.cfg,
+					desiredActiveMismatch,
+					catalogSnapshot,
+				)
+			}
+			clients = append(clients, clientStatus)
 		}
-	}
-	desiredHash := ""
-	if raw, err := os.ReadFile(g.activeConfigPath()); err == nil {
-		desiredHash = exactConfigHash(raw)
 	}
 	reloadState := "applied"
 	reloadErr := state.reloadErr
@@ -585,11 +883,13 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 		reloadState = "pending"
 	}
 	globalEnabled := false
-	capabilities := []string{"global_routing"}
+	capabilities := []string{"global_routing", "fallback_policy"}
+	fallbackPolicy := config.ResolveFallbackPolicy(nil)
 	if state.file != nil {
 		if state.file.Global.RoutingEnabled != nil {
 			globalEnabled = *state.file.Global.RoutingEnabled
 		}
+		fallbackPolicy = config.ResolveFallbackPolicy(state.file.Global.FallbackPolicy)
 	}
 	signedIn, authType, fallbackInUse := g.authState()
 	ah := g.authHealth()
@@ -607,6 +907,7 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 			"error": reloadErr,
 		},
 		"global_routing_enabled": globalEnabled,
+		"fallback_policy":        fallbackPolicy,
 		"uptime_seconds":         g.uptimeSeconds(),
 		"version":                version.Version,
 		// Mutation clients must target the exact file this process has

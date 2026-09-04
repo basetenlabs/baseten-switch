@@ -101,6 +101,11 @@ points new sessions at Baseten Switch, enables deferred tool loading, and
 omits Claude Code's attribution block to improve gateway prompt-cache hit
 rates. Restart Claude Code after enabling or disabling the integration.
 
+New installations also append the configured Baseten rows to Claude Code's
+`/model` picker. Claude continues to own and update its native model choices.
+The picker rows use stable aliases from `model_aliases`, so selection and
+routing refer to the same model identity.
+
 Useful controls:
 
 ```sh
@@ -111,12 +116,25 @@ baseten-switch claude route
 baseten-switch claude route sonnet zai-org/GLM-5.2
 baseten-switch claude route sonnet native
 baseten-switch claude subagents zai-org/GLM-5.2
+baseten-switch claude picker status
+baseten-switch claude picker enable
+baseten-switch claude picker add <baseten-model-slug> --dry-run --json
+baseten-switch claude picker add <baseten-model-slug> --alias <alias>
+baseten-switch claude picker remove <alias>
+baseten-switch claude picker sync
 ```
 
 `on` and `off` change one global routing switch. Saved model mappings remain
 editable while routing is off. A Claude family can map to `native`, a
 configured alias, or a Baseten model slug. Run
 `baseten-switch claude route <family> default` to remove a family override.
+On an existing installation without picker configuration,
+`claude picker enable` enables an empty picker. Add each Baseten model you
+want to expose with `claude picker add`; enabling the picker does not add
+routing aliases as picker rows.
+Picker add, remove, and reorder operations do not delete routing aliases or
+change a running Claude Code session. Reopen `/model` after a change, and
+restart Claude Code if the picker has not refreshed.
 
 To restore the Claude Code setting that existed before setup:
 

@@ -121,7 +121,7 @@ func TestGlobalRoutingAbsoluteOffBypassesEveryBasetenPolicy(t *testing.T) {
 	}
 }
 
-func TestAnthropicShapeCodexSentinelRetainsNativeFallback(t *testing.T) {
+func TestAnthropicShapeCodexSentinelNeverFallsBackNatively(t *testing.T) {
 	baseten := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "retry natively", http.StatusInternalServerError)
 	}))
@@ -135,11 +135,14 @@ func TestAnthropicShapeCodexSentinelRetainsNativeFallback(t *testing.T) {
 	defer stop()
 
 	resp, body := postModelMessages(t, g, CodexCompatibilityModel, "")
-	if resp.StatusCode != http.StatusOK || !strings.Contains(body, "NATIVE") {
-		t.Fatalf("anthropic sentinel fallback status=%d body=%s", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusInternalServerError ||
+		!strings.Contains(body, "retry natively") {
+		t.Fatalf("anthropic sentinel status=%d body=%s", resp.StatusCode, body)
 	}
-	if got := <-gotNativeModel; got != CodexCompatibilityModel {
-		t.Fatalf("native fallback model = %q, want %q", got, CodexCompatibilityModel)
+	select {
+	case got := <-gotNativeModel:
+		t.Fatalf("compatibility sentinel reached native provider as %q", got)
+	default:
 	}
 }
 
@@ -198,7 +201,7 @@ func TestGlobalRoutingStatusUsesActiveResolverAndExactByteHashes(t *testing.T) {
 		t.Fatalf("hashes active=%v desired=%v", status["active_config_hash"], status["desired_config_hash"])
 	}
 	caps := status["capabilities"].([]any)
-	if len(caps) != 1 || caps[0] != "global_routing" {
+	if len(caps) != 2 || caps[0] != "global_routing" || caps[1] != "fallback_policy" {
 		t.Fatalf("capabilities = %v", caps)
 	}
 	client := status["clients"].([]any)[0].(map[string]any)

@@ -148,7 +148,7 @@ func (g *Gateway) adminStats(w http.ResponseWriter, r *http.Request) {
 
 	fallback := map[string]bool{}
 	for _, cl := range g.snapshotClients() {
-		fallback[cl.cfg.Name] = g.fallbackActive(cl.cfg.Name)
+		_, fallback[cl.cfg.Name] = g.policyAwareFallbackCooldown(cl.cfg)
 	}
 
 	tail := rows

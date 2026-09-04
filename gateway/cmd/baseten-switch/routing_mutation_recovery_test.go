@@ -1128,6 +1128,38 @@ func TestTerminalReaderRejectsTrailingAndInconsistentJSON(t *testing.T) {
 	}
 }
 
+func TestTerminalPickerToggleOperationShapeRequiresNoTargetHash(t *testing.T) {
+	installRoutingMutationSeams(t)
+	for _, operation := range []string{"enable_claude_picker", "disable_claude_picker"} {
+		t.Run(operation, func(t *testing.T) {
+			path := writeSwitchFixture(t, globalRoutingFixtureYAML)
+			journal := legacyJournalForTest(t, path, operation+"-terminal-shape")
+			journal.Operation = operation
+			journal.Surface = mutationSurfaceClaude
+			journal.Client = "claude-code"
+			journal.Key = "model_picker"
+			journal.RequestedTarget = ""
+			journal.RequestFingerprint = domainHash("request", operation)
+			record := terminalFromJournal(
+				journal,
+				mutationOutcomeUnchanged,
+				routingAdminStatus{},
+				"",
+				false,
+			)
+			record.DesiredConfigHash = record.PreviousConfigHash
+			record.PreviousActiveToken = ""
+			if err := validateTerminalRecord(record, path, journal.OperationID); err != nil {
+				t.Fatalf("valid picker toggle terminal rejected: %v", err)
+			}
+			record.RequestedTargetHash = domainHash("requested-target-v1", "unexpected")
+			if err := validateTerminalRecord(record, path, journal.OperationID); err == nil {
+				t.Fatal("picker toggle terminal with a target hash was accepted")
+			}
+		})
+	}
+}
+
 func TestMutationWritersEnforceReaderBoundsBeforeCommit(t *testing.T) {
 	installRoutingMutationSeams(t)
 	t.Run("journal", func(t *testing.T) {

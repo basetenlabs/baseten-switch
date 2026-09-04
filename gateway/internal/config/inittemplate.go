@@ -6,7 +6,8 @@ import _ "embed"
 // config init': the single-port door topology (front door on
 // 127.0.0.1:45271 forwarding to the shared router listener on
 // 127.0.0.1:45272, one global routing gate, Claude Code defaulting
-// every model family to GLM-5.2, and a native fallback).
+// every model family to GLM-5.2, an enabled Claude Code model picker, and a
+// native fallback).
 //
 // The embedded file is a byte-for-byte copy of the repo-level
 // config/gateway.example.yaml. go:embed cannot reference files outside

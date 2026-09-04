@@ -178,7 +178,7 @@ func TestOpenAIHTTPFallbackRecordsPrimary(t *testing.T) {
 	}
 }
 
-func TestNonstandardServerErrorFallbackRetainsPrimaryTelemetry(t *testing.T) {
+func TestNonstandardServerErrorIsOutsideFallbackPolicy(t *testing.T) {
 	baseten := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(600)
 	}))
@@ -198,16 +198,11 @@ func TestNonstandardServerErrorFallbackRetainsPrimaryTelemetry(t *testing.T) {
 	defer stop()
 
 	resp, body := ttftPost(t, g, `{"model":"claude-opus-4-8","messages":[{"role":"user","content":"ping"}]}`)
-	if resp.StatusCode != http.StatusOK || !strings.Contains(body, "FALLBACK") {
+	if resp.StatusCode != 600 || strings.Contains(body, "FALLBACK") {
 		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
 	}
 	row := waitForRows(t, cfg.TelemetryDir, 1, 2*time.Second)[0]
-	if row.Primary == nil ||
-		row.Primary.Provider != "baseten" ||
-		row.Primary.Model != "zai-org/GLM-5.2" ||
-		!row.Primary.Attempted ||
-		row.Primary.Outcome != telemetry.PrimaryOutcomeHTTPError ||
-		row.Primary.Status == nil || *row.Primary.Status != 600 {
-		t.Fatalf("primary = %+v, want Baseten zai-org/GLM-5.2 HTTP 600", row.Primary)
+	if row.Primary != nil || row.Fallback.Attempted || row.Fallback.Trigger != nil {
+		t.Fatalf("primary/fallback = %+v/%+v, want terminal status 600", row.Primary, row.Fallback)
 	}
 }

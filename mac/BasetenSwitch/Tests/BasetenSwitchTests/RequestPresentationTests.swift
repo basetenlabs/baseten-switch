@@ -27,6 +27,48 @@ final class RequestPresentationTests: XCTestCase {
             "Image input unsupported")
     }
 
+    func testSuppressedFallbackUsesSettingAndTargetCopy() {
+        let disabled429 = RequestFallback(
+            attempted: false,
+            suppressedReason: "policy_disabled_http_429")
+        XCTAssertEqual(
+            requestFallbackReason(disabled429),
+            "Disabled by setting")
+        XCTAssertEqual(
+            requestFallbackHelp(disabled429),
+            "Automatic fallback for HTTP 429 is disabled by setting.")
+
+        let disabled5xx = RequestFallback(
+            attempted: false,
+            suppressedReason: "policy_disabled_http_5xx")
+        XCTAssertEqual(
+            requestFallbackReason(disabled5xx),
+            "Disabled by setting")
+        XCTAssertEqual(
+            requestFallbackHelp(disabled5xx),
+            "Automatic fallback for HTTP 5xx is disabled by setting.")
+
+        let missingTarget = RequestFallback(
+            attempted: false,
+            suppressedReason: "native_target_unconfigured")
+        XCTAssertEqual(
+            requestFallbackReason(missingTarget),
+            "Fallback target not configured")
+        XCTAssertFalse(RequestItem(
+            eventID: "suppressed",
+            completedAt: Date(),
+            client: "claude-code",
+            configuredRoute: "baseten",
+            effectiveProvider: "baseten",
+            requestedModel: "claude-baseten-glm",
+            servedModel: "zai-org/GLM",
+            status: 429,
+            durationMs: 1,
+            terminationReason: "completed",
+            subagent: false,
+            fallback: disabled429).isFallback)
+    }
+
     func testRouteAndModelLabelsShowRequestedToServedPath() throws {
         let item = requestItem()
         let primary = try XCTUnwrap(item.primary)

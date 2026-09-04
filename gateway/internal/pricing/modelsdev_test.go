@@ -16,6 +16,7 @@ const modelsDevFixture = `{
         "id": "claude-opus-5",
         "name": "Claude Opus 5",
         "family": "claude-opus",
+        "release_date": "2026-07-24",
         "limit": {"context": 1000000, "output": 128000},
         "cost": {"input": 5, "output": 25, "cache_read": 0.5, "cache_write": 6.25},
         "experimental": {
@@ -34,6 +35,7 @@ const modelsDevFixture = `{
         "id": "claude-sonnet-5",
         "name": "Claude Sonnet 5",
         "family": "claude-sonnet",
+        "release_date": "2026-06-29",
         "limit": {"context": 1000000, "output": 128000},
         "cost": {"input": 2, "output": 10, "cache_read": 0.2, "cache_write": 2.5}
       }
@@ -162,7 +164,8 @@ func TestReplaceModelsDevPublishesProviderScopedProfiles(t *testing.T) {
 	if !ok {
 		t.Fatal("Opus record missing")
 	}
-	if record.Family != "opus" || record.ContextTokens != 1_000_000 ||
+	if record.Family != "opus" || record.ReleaseDate != "2026-07-24" ||
+		record.ContextTokens != 1_000_000 ||
 		record.MaxOutputTokens != 128_000 {
 		t.Fatalf("Opus metadata = %+v", record)
 	}
@@ -1013,6 +1016,42 @@ func TestModelsDevInvalidCandidateRetainsLastKnownGood(t *testing.T) {
 	}
 }
 
+func TestModelsDevRejectsInvalidReleaseDate(t *testing.T) {
+	bad := strings.Replace(
+		modelsDevFixture,
+		`"release_date": "2026-07-24"`,
+		`"release_date": "2026-7-24"`,
+		1,
+	)
+	if err := New().ReplaceModelsDev(
+		[]byte(bad), time.Now().UTC(), "",
+	); err == nil || !strings.Contains(err.Error(), "release_date") {
+		t.Fatalf("invalid release date error = %v", err)
+	}
+}
+
+func TestModelsDevAcceptsMonthReleaseDate(t *testing.T) {
+	fixture := strings.Replace(
+		modelsDevFixture,
+		`"release_date": "2026-07-24"`,
+		`"release_date": "2026-07"`,
+		1,
+	)
+	catalog := New()
+	if err := catalog.ReplaceModelsDev(
+		[]byte(fixture), time.Now().UTC(), "",
+	); err != nil {
+		t.Fatal(err)
+	}
+	record, ok := catalog.Capture().Model(
+		ProviderAnthropic,
+		"claude-opus-5",
+	)
+	if !ok || record.ReleaseDate != "2026-07" {
+		t.Fatalf("month-precision release date = %q, found=%t", record.ReleaseDate, ok)
+	}
+}
+
 func TestModelsDevAnthropicFamilyNormalizationAdaptsToNewFamilies(t *testing.T) {
 	tests := []struct {
 		family string
@@ -1124,7 +1163,8 @@ func TestProviderCacheRoundTripAndLivePrecedence(t *testing.T) {
 		t.Fatalf("restored account availability = %+v, found=%t", record, ok)
 	}
 	if record.ContextTokens != 900_000 ||
-		record.DisplayName != "Account Opus" {
+		record.DisplayName != "Account Opus" ||
+		record.ReleaseDate != "2026-07-24" {
 		t.Fatalf("restored provider metadata authority = %+v", record)
 	}
 	if err := restored.ReplaceProviderAvailability(

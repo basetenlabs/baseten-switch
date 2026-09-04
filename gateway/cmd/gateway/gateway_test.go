@@ -2010,11 +2010,11 @@ func TestPostMessagesSanitizeHistory(t *testing.T) {
 	}
 }
 
-// TestAnthropic429RelaysWithoutFallbackOrCooldown verifies that a rate
-// limit is a terminal response for an Anthropic-shape request. The
-// original retry contract reaches the harness, and a later request
-// rechecks the configured primary instead of inheriting a cooldown.
-func TestAnthropic429RelaysWithoutFallbackOrCooldown(t *testing.T) {
+// TestAnthropic429RelaysWithoutFallbackOrCooldownWhenPolicyOff verifies that
+// the disabled 429 policy relays the original retry contract to the harness.
+// A later request rechecks the configured primary instead of inheriting a
+// cooldown.
+func TestAnthropic429RelaysWithoutFallbackOrCooldownWhenPolicyOff(t *testing.T) {
 	const rateLimitBody = `{"type":"error","error":{"type":"rate_limit_error","message":"try again later"}}`
 	var primaryHits atomic.Int32
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -2037,6 +2037,11 @@ func TestAnthropic429RelaysWithoutFallbackOrCooldown(t *testing.T) {
 	cfg := testConfig(t, primary.URL, fallback.URL)
 	rc := resolvedAnthropicBaseten(t)
 	rc.FallbackRoute = "anthropic"
+	rc.HasFallbackPolicy = true
+	rc.FallbackPolicy = config.ResolvedFallbackPolicy{
+		OnBaseten429: false,
+		OnBaseten5xx: true,
+	}
 	g, adminL, _ := newGateway(t, cfg, rc)
 	defer adminL.Close()
 	stop := start(t, g)
@@ -2106,14 +2111,17 @@ func TestAnthropic429RelaysWithoutFallbackOrCooldown(t *testing.T) {
 			row.Fallback.Trigger != nil {
 			t.Fatalf("row %d fallback = %+v, want no fallback", i, row.Fallback)
 		}
+		if valueOrZero(row.Fallback.SuppressedReason) != "policy_disabled_http_429" {
+			t.Fatalf("row %d suppressed_reason = %q, want policy_disabled_http_429", i, valueOrZero(row.Fallback.SuppressedReason))
+		}
 	}
 }
 
-// TestTranslatedAnthropic429PreservesRetryAfter verifies the terminal
-// rate-limit policy also applies when an Anthropic listener translates
-// its Baseten request through the OpenAI wire shape. The error envelope
-// keeps the existing translation behavior while response control
-// headers survive that body rewrite.
+// TestTranslatedAnthropic429PreservesRetryAfter verifies that the disabled
+// 429 policy also applies when an Anthropic listener translates its Baseten
+// request through the OpenAI wire shape. The error envelope keeps the existing
+// translation behavior while response control headers survive that body
+// rewrite.
 func TestTranslatedAnthropic429PreservesRetryAfter(t *testing.T) {
 	var primaryHits atomic.Int32
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -2142,6 +2150,11 @@ func TestTranslatedAnthropic429PreservesRetryAfter(t *testing.T) {
 	rc.DefaultModel = reasoningNeutralBasetenModel
 	rc.UpstreamShape = "openai"
 	rc.FallbackRoute = "anthropic"
+	rc.HasFallbackPolicy = true
+	rc.FallbackPolicy = config.ResolvedFallbackPolicy{
+		OnBaseten429: false,
+		OnBaseten5xx: true,
+	}
 	g, adminL, _ := newGateway(t, cfg, rc)
 	defer adminL.Close()
 	stop := start(t, g)
@@ -2207,7 +2220,8 @@ func TestTranslatedAnthropic429PreservesRetryAfter(t *testing.T) {
 		row.StatusCode() != http.StatusTooManyRequests ||
 		!row.IsHTTPError() ||
 		row.Fallback.Attempted ||
-		row.Fallback.Trigger != nil {
+		row.Fallback.Trigger != nil ||
+		valueOrZero(row.Fallback.SuppressedReason) != "policy_disabled_http_429" {
 		t.Fatalf(
 			"provider/status/error/fallback = %q/%d/%v/%+v, want baseten/429/true/none",
 			row.EffectiveProvider,

@@ -328,15 +328,10 @@ func TestSubagentPassthroughByteIdentical(t *testing.T) {
 	}
 }
 
-// TestSubagentAliasNoSilentFallback extends TestAliasRequestNoSilentFallback:
-// an alias-target subagent rewrite is a single baseten attempt. It never
-// falls back to the configured fallback_route, and it bypasses an active
-// fallback cooldown. The cooldown is established between the two alias
-// requests by a native-model request (no agent-id header) that gets the
-// 503 from the primary and falls back, tripping the cooldown; the second
-// alias request then still goes to the primary (resolveAttemptsLadder
-// returns the explicit alias attempt before the fallbackActive check).
-func TestSubagentAliasNoSilentFallback(t *testing.T) {
+// TestSubagentNativeOriginAliasTargetFallback preserves request ingress
+// provenance: the alias target selects Baseten, while a status fallback and
+// later cooldown bypass replay the original native request model.
+func TestSubagentNativeOriginAliasTargetFallback(t *testing.T) {
 	var primaryHits, fbHits int32
 	basSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&primaryHits, 1)
@@ -358,35 +353,31 @@ func TestSubagentAliasNoSilentFallback(t *testing.T) {
 	stop := start(t, g)
 	defer stop()
 
-	// Subagent alias request: 503 relayed, no fallback.
-	resp, _ := postMessagesWithAgent(t, g, "claude-opus-4-8", "agent-1")
-	if resp.StatusCode != 503 {
-		t.Fatalf("subagent alias request got %d, want the relayed 503", resp.StatusCode)
+	// Subagent alias request: Baseten 503 falls back with the original model.
+	resp, rb := postMessagesWithAgent(t, g, "claude-opus-4-8", "agent-1")
+	if resp.StatusCode != 200 || !strings.Contains(rb, "FALLBACK") {
+		t.Fatalf("subagent alias request got %d: %s, want fallback 200", resp.StatusCode, rb)
 	}
-	if n := atomic.LoadInt32(&fbHits); n != 0 {
-		t.Fatalf("subagent alias request must not fall back; fallback hits = %d", n)
+	if n := atomic.LoadInt32(&fbHits); n != 1 {
+		t.Fatalf("subagent alias fallback hits = %d, want 1", n)
 	}
-	// Native model request (no agent-id header) keeps the fallback path
-	// and trips the cooldown: primary 503 -> fallback 200.
-	resp, rb := postMessagesWithAgent(t, g, "claude-opus-4-8", "")
+	// The status cooldown resolves the next native request independently.
+	resp, rb = postMessagesWithAgent(t, g, "claude-opus-4-8", "")
 	if resp.StatusCode != 200 || !strings.Contains(rb, "FALLBACK") {
 		t.Fatalf("native request got %d: %s, want fallback 200", resp.StatusCode, rb)
 	}
-	if n := atomic.LoadInt32(&fbHits); n != 1 {
-		t.Fatalf("native request should have fallen back once, got %d", n)
+	if n := atomic.LoadInt32(&fbHits); n != 2 {
+		t.Fatalf("fallback hits after native cooldown request = %d, want 2", n)
 	}
-	// Subagent alias request during the now-active cooldown still goes to
-	// baseten: the explicit alias attempt returns before the fallbackActive
-	// check in resolveAttemptsLadder, so the cooldown is bypassed.
-	resp, _ = postMessagesWithAgent(t, g, "claude-opus-4-8", "agent-1")
-	if resp.StatusCode != 503 {
-		t.Fatalf("subagent alias request during cooldown got %d, want 503", resp.StatusCode)
+	resp, rb = postMessagesWithAgent(t, g, "claude-opus-4-8", "agent-1")
+	if resp.StatusCode != 200 || !strings.Contains(rb, "FALLBACK") {
+		t.Fatalf("subagent alias cooldown request got %d: %s, want fallback 200", resp.StatusCode, rb)
 	}
-	if n := atomic.LoadInt32(&fbHits); n != 1 {
-		t.Fatalf("subagent alias during cooldown must not fall back; fallback hits = %d", n)
+	if n := atomic.LoadInt32(&fbHits); n != 3 {
+		t.Fatalf("fallback hits after subagent cooldown request = %d, want 3", n)
 	}
-	if n := atomic.LoadInt32(&primaryHits); n != 3 {
-		t.Fatalf("primary hits = %d, want 3 (two subagent alias + one native)", n)
+	if n := atomic.LoadInt32(&primaryHits); n != 1 {
+		t.Fatalf("primary hits = %d, want 1 before status cooldown", n)
 	}
 }
 

@@ -31,6 +31,7 @@ type modelsDevModel struct {
 	ID               string          `json:"id"`
 	Name             string          `json:"name"`
 	Family           string          `json:"family"`
+	ReleaseDate      string          `json:"release_date"`
 	Status           string          `json:"status"`
 	Reasoning        json.RawMessage `json:"reasoning"`
 	ReasoningOptions json.RawMessage `json:"reasoning_options"`
@@ -122,8 +123,11 @@ func withoutCachedModelsDev(catalog providerCatalog) (providerCatalog, bool) {
 			record.Modalities = nil
 		}
 		// Family currently has record-level rather than field-level provenance.
-		// models.dev is the only runtime-cache source that supplies it.
+		// Family and release date currently have record-level rather than
+		// field-level provenance. models.dev is the only runtime-cache source
+		// that supplies them.
 		record.Family = ""
+		record.ReleaseDate = ""
 		catalog.models[id] = record
 	}
 	if len(catalog.models) == 0 {
@@ -364,6 +368,7 @@ func parseModelsDevModel(
 	record := ModelRecord{
 		Provider: provider, CanonicalModelID: id, DisplayName: name,
 		Family:        normalizeModelsDevFamily(provider, source.Family, id),
+		ReleaseDate:   strings.TrimSpace(source.ReleaseDate),
 		ContextTokens: source.Limit.Context, MaxOutputTokens: source.Limit.Output,
 		Availability: ModelAvailability{
 			Public: &AvailabilityEvidence{

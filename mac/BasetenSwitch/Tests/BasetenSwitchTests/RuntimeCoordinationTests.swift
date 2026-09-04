@@ -1568,7 +1568,7 @@ final class RuntimeCoordinationTests: XCTestCase {
         XCTAssertEqual(environment["HOME"], "/Users/test")
         XCTAssertEqual(
             environment["PATH"],
-            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/test/.local/bin")
         XCTAssertFalse(environment["PATH"]?.contains("/attacker") ?? true)
         XCTAssertEqual(
             environment["BASETEN_SWITCH_CONFIG_PATH"],
@@ -1578,6 +1578,21 @@ final class RuntimeCoordinationTests: XCTestCase {
         XCTAssertNil(environment["ANTHROPIC_AUTH_TOKEN"])
         XCTAssertNil(environment["UNRELATED"])
         XCTAssertNil(environment["SSH_AUTH_SOCK"])
+    }
+
+    func testCLIEnvironmentDoesNotAddRelativeOrEmptyHomeToPath() {
+        let systemPath =
+            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        let relative = allowlistedCLIEnvironment(
+            ambient: ["HOME": "relative/home"],
+            overrides: [:])
+        let empty = allowlistedCLIEnvironment(
+            ambient: ["HOME": ""],
+            overrides: [:])
+
+        XCTAssertEqual(relative["PATH"], systemPath)
+        XCTAssertEqual(empty["PATH"], systemPath)
+        XCTAssertFalse(relative["PATH"]?.contains("relative") ?? true)
     }
 
     func testPreviewRuntimeFilesystemAcceptsPrivateRegularTree() throws {

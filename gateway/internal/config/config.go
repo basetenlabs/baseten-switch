@@ -106,8 +106,9 @@ type Client struct {
 	ProtocolShape string     `yaml:"protocol_shape,omitempty" json:"protocol_shape,omitempty"`
 	AuthToken     *AuthToken `yaml:"auth_token,omitempty" json:"auth_token,omitempty"`
 	DefaultModel  string     `yaml:"default_model,omitempty" json:"default_model,omitempty"`
-	// ModelAliases maps picker-visible model ids to Baseten slugs for
-	// Claude Code's gateway model discovery (the model-discovery contract).
+	// ModelAliases maps stable picker and request model ids to Baseten slugs.
+	// The gateway also publishes them through Claude Code gateway discovery for
+	// compatibility with older clients (the model-discovery contract).
 	// Anthropic-shape clients only. Alias ids must begin with "claude"
 	// or "anthropic" (the picker drops everything else before caching)
 	// and must not shadow real Anthropic model names;
@@ -115,6 +116,12 @@ type Client struct {
 	// request naming an alias is an explicit Baseten choice. While Off,
 	// the request fails locally without consulting Baseten.
 	ModelAliases map[string]string `yaml:"model_aliases,omitempty" json:"model_aliases,omitempty"`
+	// ModelPicker is the ordered set of configured aliases that Switch projects
+	// into Claude Code's user-level modelPicker setting. It is presentation
+	// state only: model_aliases remains the routing contract. A nil pointer means
+	// the integration has not been configured; a present disabled or empty block
+	// remains explicit saved intent.
+	ModelPicker *ModelPicker `yaml:"model_picker,omitempty" json:"model_picker,omitempty"`
 	// SubagentModel is the rewrite target for Claude Code sidechain
 	// (subagent) requests on an anthropic-shape client: a gateway alias
 	// (must exist in this client's model_aliases), a raw Baseten slug
@@ -139,11 +146,15 @@ type Client struct {
 	// (strip empty text blocks, normalize tool_use ids). Default true;
 	// tri-state so an absent key is distinguishable from explicit false.
 	SanitizeHistory *bool `yaml:"sanitize_history,omitempty" json:"sanitize_history,omitempty"`
-	// FallbackRoute is tried when the primary route's upstream is
-	// unreachable, returns 5xx, or returns 429 for openai-shape traffic.
-	// Anthropic-shape 429 responses relay without fallback. The fallback
-	// must be the native route for protocol_shape.
+	// FallbackRoute is the optional protocol-native target for an eligible
+	// fallback attempt after Baseten. It must be the native route for
+	// protocol_shape.
 	FallbackRoute string `yaml:"fallback_route,omitempty" json:"fallback_route,omitempty"`
+	// NativeFallbackModel is the protocol-native model used only when an
+	// Anthropic-shape request starts with a Baseten-specific identity that the
+	// native provider cannot accept. Native-origin requests preserve their
+	// exact ingress model instead. Empty means no catch-all native target.
+	NativeFallbackModel string `yaml:"native_fallback_model,omitempty" json:"native_fallback_model,omitempty"`
 	// UpstreamShape overrides the wire shape used toward the upstream on
 	// the baseten route. Setting "openai" on an anthropic listener makes
 	// the gateway translate /v1/messages traffic to /v1/chat/completions
@@ -166,6 +177,18 @@ type Client struct {
 	// Empty inherits the global value; "0" disables the deadline even
 	// when a global one is set.
 	TTFTTimeout string `yaml:"ttft_timeout,omitempty" json:"ttft_timeout,omitempty"`
+}
+
+// ModelPicker is the Switch-owned desired projection for Claude Code's
+// modelPicker setting.
+type ModelPicker struct {
+	Enabled bool               `yaml:"enabled" json:"enabled"`
+	Models  []ModelPickerModel `yaml:"models" json:"models"`
+}
+
+// ModelPickerModel identifies one picker row by its stable model_aliases key.
+type ModelPickerModel struct {
+	Alias string `yaml:"alias" json:"alias"`
 }
 
 // DoorPort is one harness-facing front-door port. The door forwards to
@@ -215,7 +238,10 @@ type ModelOptions map[string]map[string]ModelOption
 type Global struct {
 	// RoutingEnabled is intentionally a pointer so validation can
 	// distinguish an explicit false from an omitted required field.
-	RoutingEnabled *bool             `yaml:"routing_enabled,omitempty" json:"routing_enabled,omitempty"`
+	RoutingEnabled *bool `yaml:"routing_enabled,omitempty" json:"routing_enabled,omitempty"`
+	// FallbackPolicy independently controls Baseten HTTP 429 and HTTP 5xx
+	// transitions to a protocol-native fallback. Omitted fields default on.
+	FallbackPolicy *FallbackPolicy   `yaml:"fallback_policy,omitempty" json:"fallback_policy,omitempty"`
 	Auth           map[string]string `yaml:"auth" json:"auth"`
 	TelemetryDir   string            `yaml:"telemetry_dir" json:"telemetry_dir"`
 	// TelemetryEnabled is a pointer so an omitted value retains the
@@ -439,6 +465,9 @@ func ValidateRoutingPolicy(f *File) error {
 		); err != nil {
 			return err
 		}
+		if err := validateModelPicker(c); err != nil {
+			return err
+		}
 		if c.ResponsesCompatibility != nil && c.ProtocolShape != "openai" {
 			return fmt.Errorf("client %q: responses_compatibility requires protocol_shape openai (got %q)", c.Name, c.ProtocolShape)
 		}
@@ -453,6 +482,9 @@ func ValidateRoutingPolicy(f *File) error {
 		if c.FallbackRoute != "" && c.FallbackRoute != NativeRoute(c.ProtocolShape) {
 			return fmt.Errorf("routing policy: client %q fallback_route %q must be its native route %q", c.Name, c.FallbackRoute, NativeRoute(c.ProtocolShape))
 		}
+		if err := ValidateNativeFallbackModel(c); err != nil {
+			return err
+		}
 		if !c.Enabled {
 			continue
 		}
@@ -460,6 +492,54 @@ func ValidateRoutingPolicy(f *File) error {
 		if target == "" || !strings.Contains(target, "/") {
 			return fmt.Errorf("routing policy: enabled client %q requires a Baseten default_model target", c.Name)
 		}
+	}
+	return nil
+}
+
+func validateModelPicker(c Client) error {
+	if c.ModelPicker == nil {
+		return nil
+	}
+	if c.ProtocolShape != "anthropic" {
+		return fmt.Errorf(
+			"client %q: model_picker requires protocol_shape anthropic (got %q)",
+			c.Name,
+			c.ProtocolShape,
+		)
+	}
+	seen := make(map[string]struct{}, len(c.ModelPicker.Models))
+	for i, model := range c.ModelPicker.Models {
+		alias := strings.TrimSpace(model.Alias)
+		if alias == "" {
+			return fmt.Errorf(
+				"client %q: model_picker.models[%d].alias must not be empty",
+				c.Name,
+				i,
+			)
+		}
+		if alias != model.Alias {
+			return fmt.Errorf(
+				"client %q: model_picker.models[%d].alias %q must not contain surrounding whitespace",
+				c.Name,
+				i,
+				model.Alias,
+			)
+		}
+		if _, ok := c.ModelAliases[alias]; !ok {
+			return fmt.Errorf(
+				"client %q: model_picker alias %q is missing from model_aliases",
+				c.Name,
+				alias,
+			)
+		}
+		if _, duplicate := seen[alias]; duplicate {
+			return fmt.Errorf(
+				"client %q: model_picker alias %q is duplicated",
+				c.Name,
+				alias,
+			)
+		}
+		seen[alias] = struct{}{}
 	}
 	return nil
 }
@@ -584,6 +664,14 @@ func Load(path string) (*File, error) {
 // UnmarshalStrict decodes one YAML document and rejects unknown struct
 // fields. This keeps removed schema fields from becoming silent no-ops.
 func UnmarshalStrict(data []byte, out any) error {
+	if _, ok := out.(*File); ok {
+		if err := validateRawModelPickerNodes(data); err != nil {
+			return err
+		}
+		if err := validateRawFallbackPolicyNodes(data); err != nil {
+			return err
+		}
+	}
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(out); err != nil {
@@ -595,6 +683,100 @@ func UnmarshalStrict(data []byte, out any) error {
 			return fmt.Errorf("multiple YAML documents are not supported")
 		}
 		return err
+	}
+	return nil
+}
+
+// validateRawFallbackPolicyNodes preserves omission versus explicit null for
+// the optional block and its pointer-boolean children. yaml.v3 otherwise
+// decodes both states to nil, which would silently turn malformed saved intent
+// into the default-on policy.
+func validateRawFallbackPolicyNodes(data []byte) error {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return err
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) != 1 {
+		return nil
+	}
+	if err := validateRawNativeFallbackModelNodes(doc.Content[0]); err != nil {
+		return err
+	}
+	_, global := mappingEntry(doc.Content[0], "global")
+	if global == nil || global.Kind != yaml.MappingNode {
+		return nil
+	}
+	_, policy := mappingEntry(global, "fallback_policy")
+	if policy == nil {
+		return nil
+	}
+	if policy.Kind == yaml.ScalarNode && policy.Tag == "!!null" {
+		return fmt.Errorf("global.fallback_policy must be an object, not null")
+	}
+	if policy.Kind != yaml.MappingNode {
+		return nil
+	}
+	for _, key := range []string{"on_baseten_429", "on_baseten_5xx"} {
+		_, value := mappingEntry(policy, key)
+		if value != nil && value.Kind == yaml.ScalarNode && value.Tag == "!!null" {
+			return fmt.Errorf("global.fallback_policy.%s must be true or false, not null", key)
+		}
+	}
+	return nil
+}
+
+func validateRawNativeFallbackModelNodes(root *yaml.Node) error {
+	_, clients := mappingEntry(root, "clients")
+	if clients == nil || clients.Kind != yaml.SequenceNode {
+		return nil
+	}
+	for _, client := range clients.Content {
+		if client.Kind != yaml.MappingNode {
+			continue
+		}
+		_, nameNode := mappingEntry(client, "name")
+		name := "<unnamed>"
+		if nameNode != nil && nameNode.Kind == yaml.ScalarNode {
+			name = nameNode.Value
+		}
+		_, value := mappingEntry(client, "native_fallback_model")
+		if value == nil {
+			continue
+		}
+		if value.Kind == yaml.ScalarNode && value.Tag == "!!null" {
+			return fmt.Errorf("client %q native_fallback_model must be a full native model ID, not null", name)
+		}
+		if value.Kind == yaml.ScalarNode && strings.TrimSpace(value.Value) == "" {
+			return fmt.Errorf("client %q native_fallback_model must be a full native model ID, not empty", name)
+		}
+	}
+	return nil
+}
+
+// validateRawModelPickerNodes preserves the distinction between an absent
+// model_picker and an explicitly null value. yaml.v3 otherwise decodes both
+// into a nil *ModelPicker, which would turn malformed saved intent into a
+// silent no-op.
+func validateRawModelPickerNodes(data []byte) error {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return err
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) != 1 {
+		return nil
+	}
+	_, clients := mappingEntry(doc.Content[0], "clients")
+	if clients == nil || clients.Kind != yaml.SequenceNode {
+		return nil
+	}
+	for i, client := range clients.Content {
+		_, picker := mappingEntry(client, "model_picker")
+		if picker == nil {
+			continue
+		}
+		if picker.Kind == yaml.ScalarNode && picker.Tag == "!!null" {
+			return fmt.Errorf("clients[%d].model_picker must be an object, not null", i)
+		}
 	}
 	return nil
 }

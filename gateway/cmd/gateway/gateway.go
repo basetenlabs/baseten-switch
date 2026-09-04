@@ -187,7 +187,15 @@ type resolvedClientConfig struct {
 	ModelOptions    config.ModelOptions
 	SanitizeHistory bool
 	FallbackRoute   string // "" = no fallback
-	UpstreamShape   string // baseten route only; "" = listener shape
+	// FallbackPolicy is the resolved global status policy captured in this
+	// immutable listener generation. Missing config values resolve On.
+	FallbackPolicy    config.ResolvedFallbackPolicy
+	HasFallbackPolicy bool
+	// NativeFallbackModel is the client-level native target used only when an
+	// Anthropic-shape request enters with a configured alias or raw Baseten
+	// slug. Native-origin requests always preserve their ingress model.
+	NativeFallbackModel string
+	UpstreamShape       string // baseten route only; "" = listener shape
 	// ResponsesStripToolTypes lists tools[] entry types stripped from
 	// /v1/responses bodies on baseten-route attempts. Openai shape
 	// only; nil/empty = no strip. Config order from gateway.yaml is
@@ -235,6 +243,10 @@ func (r resolvedClientConfig) hash() string {
 	fmt.Fprintln(h, r.GlobalRoutingEnabled)
 	fmt.Fprintln(h, r.SanitizeHistory)
 	fmt.Fprintln(h, r.FallbackRoute)
+	fmt.Fprintln(h, r.FallbackPolicy.OnBaseten429)
+	fmt.Fprintln(h, r.FallbackPolicy.OnBaseten5xx)
+	fmt.Fprintln(h, r.HasFallbackPolicy)
+	fmt.Fprintln(h, r.NativeFallbackModel)
 	fmt.Fprintln(h, r.UpstreamShape)
 	fmt.Fprintln(h, r.TTFTTimeout)
 	fmt.Fprintln(h, r.DefaultModel)
@@ -597,11 +609,11 @@ type Gateway struct {
 	emailCached    string
 	emailFetchedAt time.Time
 
-	// Fallback cooldown state, keyed by listener name: until this
-	// deadline, requests go straight to the fallback route without
-	// re-trying the tripped primary.
+	// Fallback cooldown state, keyed by listener name. Trigger provenance is
+	// retained so a newly disabled status class stops bypassing Baseten
+	// immediately while unrelated cooldowns remain active.
 	fallbackMu    sync.Mutex
-	fallbackUntil map[string]time.Time
+	fallbackUntil map[string]fallbackCooldownState
 
 	// authUnavailableFallbackCount and its last-occurrence fields make the
 	// otherwise successful auth_unavailable fallback visible in admin status.
@@ -2126,6 +2138,21 @@ type upstreamAttempt struct {
 	// an earlier attempt failure, an active cooldown, or unavailable primary
 	// credentials. It flows into telemetry as fallback_trigger.
 	fallbackTrigger string
+	// fallbackAllowed is set on a native candidate and controls which failure
+	// classes on the immediately preceding Baseten attempt may advance to it.
+	// Explicit Claude aliases and raw slugs are status-only candidates.
+	fallbackAllowed fallbackTriggerMask
+	// fallbackModelSource distinguishes exact native-origin replay from a
+	// configured target substituted for a Baseten-specific ingress identity.
+	fallbackModelSource string
+	// fallbackSuppressedReason is set on the terminal Baseten attempt when an
+	// otherwise relevant status fallback was disabled or lacked a target.
+	fallbackSuppressedReason string
+	// statusFallbackPossible marks a Baseten primary that has a configured
+	// native route. It includes the missing-target case so policy suppression
+	// telemetry remains deterministic.
+	statusFallbackPossible      bool
+	statusFallbackMissingTarget bool
 	// primary retains the bounded primary-route outcome on the fallback that
 	// ultimately serves. It is nil for requests that never select fallback.
 	primary *telemetry.PrimaryV1
@@ -2180,12 +2207,83 @@ func (at upstreamAttempt) telStrippedToolTypes() string {
 // 429, or 5xx), so a dead upstream doesn't add per-request latency.
 const fallbackCooldown = 30 * time.Second
 
-func fallbackTriggerStatus(protocolShape string, code int) bool {
-	if protocolShape == "anthropic" &&
-		code == http.StatusTooManyRequests {
+type fallbackTriggerMask uint16
+
+const (
+	fallbackAllowHTTP429 fallbackTriggerMask = 1 << iota
+	fallbackAllowHTTP5xx
+	fallbackAllowTransport
+	fallbackAllowTTFT
+	fallbackAllowRequestBuild
+	fallbackAllowImage
+	fallbackAllowReasoning
+	fallbackAllowAuthUnavailable
+)
+
+const (
+	fallbackAllowStatus = fallbackAllowHTTP429 | fallbackAllowHTTP5xx
+	fallbackAllowLegacy = fallbackAllowStatus |
+		fallbackAllowTransport |
+		fallbackAllowTTFT |
+		fallbackAllowRequestBuild |
+		fallbackAllowImage |
+		fallbackAllowReasoning |
+		fallbackAllowAuthUnavailable
+)
+
+const (
+	fallbackCooldownHTTP429 = "http_429"
+	fallbackCooldownHTTP5xx = "http_5xx"
+)
+
+type fallbackCooldownState struct {
+	Until   time.Time
+	Trigger string
+}
+
+func fallbackStatusMask(code int) fallbackTriggerMask {
+	switch {
+	case code == http.StatusTooManyRequests:
+		return fallbackAllowHTTP429
+	case code >= 500 && code <= 599:
+		return fallbackAllowHTTP5xx
+	default:
+		return 0
+	}
+}
+
+func statusFallbackEnabled(policy config.ResolvedFallbackPolicy, code int) bool {
+	switch fallbackStatusMask(code) {
+	case fallbackAllowHTTP429:
+		return policy.OnBaseten429
+	case fallbackAllowHTTP5xx:
+		return policy.OnBaseten5xx
+	default:
 		return false
 	}
-	return code == 429 || code >= 500
+}
+
+func (r resolvedClientConfig) resolvedFallbackPolicy() config.ResolvedFallbackPolicy {
+	if r.HasFallbackPolicy {
+		return r.FallbackPolicy
+	}
+	// Direct in-process embedders and older focused tests construct resolved
+	// clients without a raw config. Preserve the product default in that path.
+	return config.ResolvedFallbackPolicy{
+		OnBaseten429: true,
+		OnBaseten5xx: true,
+	}
+}
+
+func statusSuppressedReason(code int) string {
+	switch fallbackStatusMask(code) {
+	case fallbackAllowHTTP429:
+		return "policy_disabled_http_429"
+	case fallbackAllowHTTP5xx:
+		return "policy_disabled_http_5xx"
+	default:
+		return ""
+	}
 }
 
 // fallbackTriggerTTFT is the telemetry fallback_trigger value for an
@@ -2257,25 +2355,85 @@ func awaitFirstByte(body io.Reader, deadline <-chan time.Time, cancel context.Ca
 }
 
 func (g *Gateway) fallbackActive(name string) bool {
-	g.fallbackMu.Lock()
-	defer g.fallbackMu.Unlock()
-	return time.Now().Before(g.fallbackUntil[name])
+	_, active := g.fallbackDeadline(name)
+	return active
 }
 
 func (g *Gateway) fallbackDeadline(name string) (time.Time, bool) {
-	g.fallbackMu.Lock()
-	defer g.fallbackMu.Unlock()
-	deadline := g.fallbackUntil[name]
-	return deadline, time.Now().Before(deadline)
+	state, active := g.activeFallbackCooldown(name)
+	if !active {
+		return state.Until, false
+	}
+	mask := cooldownTriggerMask(state.Trigger)
+	if mask != fallbackAllowHTTP429 && mask != fallbackAllowHTTP5xx {
+		return state.Until, true
+	}
+	g.mu.Lock()
+	cl := g.clients[name]
+	g.mu.Unlock()
+	if cl == nil || !cooldownEligible(
+		cl.cfg.resolvedFallbackPolicy(),
+		fallbackAllowStatus,
+		state,
+	) {
+		return state.Until, false
+	}
+	return state.Until, true
 }
 
-func (g *Gateway) tripFallback(name string) {
+func (g *Gateway) activeFallbackCooldown(name string) (fallbackCooldownState, bool) {
+	g.fallbackMu.Lock()
+	defer g.fallbackMu.Unlock()
+	state := g.fallbackUntil[name]
+	return state, time.Now().Before(state.Until)
+}
+
+func cooldownTriggerMask(trigger string) fallbackTriggerMask {
+	switch trigger {
+	case fallbackCooldownHTTP429:
+		return fallbackAllowHTTP429
+	case fallbackCooldownHTTP5xx:
+		return fallbackAllowHTTP5xx
+	case "transport_error":
+		return fallbackAllowTransport
+	case fallbackTriggerTTFT:
+		return fallbackAllowTTFT
+	case fallbackTriggerRequestBuild:
+		return fallbackAllowRequestBuild
+	default:
+		return 0
+	}
+}
+
+func cooldownEligible(
+	policy config.ResolvedFallbackPolicy,
+	allowed fallbackTriggerMask,
+	state fallbackCooldownState,
+) bool {
+	mask := cooldownTriggerMask(state.Trigger)
+	if allowed&mask == 0 {
+		return false
+	}
+	switch mask {
+	case fallbackAllowHTTP429:
+		return policy.OnBaseten429
+	case fallbackAllowHTTP5xx:
+		return policy.OnBaseten5xx
+	default:
+		return true
+	}
+}
+
+func (g *Gateway) tripFallback(name string, trigger string) {
 	g.fallbackMu.Lock()
 	defer g.fallbackMu.Unlock()
 	if g.fallbackUntil == nil {
-		g.fallbackUntil = map[string]time.Time{}
+		g.fallbackUntil = map[string]fallbackCooldownState{}
 	}
-	g.fallbackUntil[name] = time.Now().Add(fallbackCooldown)
+	g.fallbackUntil[name] = fallbackCooldownState{
+		Until:   time.Now().Add(fallbackCooldown),
+		Trigger: trigger,
+	}
 }
 
 const authUnavailableFallbackHeader = "X-Baseten-Switch-Fallback"
@@ -2362,6 +2520,7 @@ func (g *Gateway) buildAttempt(cl *clientListener, r *http.Request, body []byte,
 		kind,
 		"",
 		false,
+		false,
 	)
 }
 
@@ -2381,6 +2540,7 @@ func (g *Gateway) buildAttemptTarget(cl *clientListener, r *http.Request, body [
 		kind,
 		forcedModel,
 		forced,
+		false,
 	)
 }
 
@@ -2405,6 +2565,7 @@ func (g *Gateway) buildAttemptWithSnapshot(
 		kind,
 		"",
 		false,
+		false,
 	)
 }
 
@@ -2419,10 +2580,11 @@ func (g *Gateway) buildAttemptTargetWithSnapshot(
 	kind string,
 	forcedModel string,
 	forced bool,
+	preserveIngressBody bool,
 ) (upstreamAttempt, error) {
 	upShape := upstreamShapeFor(cl.cfg, rt)
 	needsTranslate := kind == "messages" && upShape == "openai"
-	if kind == "messages" {
+	if kind == "messages" && !preserveIngressBody {
 		profile := requestprofile.Inspect(body)
 		if profile.RawModel != "" && profile.CanonicalModel != profile.RawModel {
 			body = proxy.RewriteModelInBody(body, profile.CanonicalModel).NewBody
@@ -2593,11 +2755,119 @@ func unknownAliasError(rc resolvedClientConfig, id string) error {
 	return fmt.Errorf("unknown gateway model %q: configured model_aliases for client %q are [%s]. Fix: %s", id, rc.Name, strings.Join(sortedKeys(ids), ", "), fix)
 }
 
+const (
+	fallbackModelSourceOriginal   = "original_request"
+	fallbackModelSourceConfigured = "configured_target"
+)
+
+// fallbackPlan is immutable request-ingress provenance. It is resolved before
+// any subagent, family, default, alias, or provider-shape rewrite so later
+// primary selection cannot change which native model fallback is allowed to
+// send.
+type fallbackPlan struct {
+	nativeRoute   string
+	nativeBody    []byte
+	nativeModel   string
+	modelSource   string
+	allowed       fallbackTriggerMask
+	missingTarget bool
+}
+
+func resolveFallbackPlan(cl *clientListener, body []byte) fallbackPlan {
+	if cl == nil || cl.cfg.globalRoutingOff() || cl.cfg.FallbackRoute == "" {
+		return fallbackPlan{}
+	}
+	requested := proxy.RewriteModelInBody(body, "").RequestedModel
+	if requested == "" {
+		return fallbackPlan{}
+	}
+	canonicalRequested := normalizeModelID(requested)
+	_, configuredAlias := cl.cfg.ModelAliases[canonicalRequested]
+	isRawSlug := strings.Contains(requested, "/")
+	if configuredAlias || isRawSlug {
+		// V1 defines a catch-all native target only for Claude-compatible
+		// Baseten identities. OpenAI raw slugs and the managed Codex sentinel
+		// remain terminal.
+		if cl.cfg.ProtocolShape != "anthropic" {
+			return fallbackPlan{}
+		}
+		plan := fallbackPlan{
+			nativeRoute: cl.cfg.FallbackRoute,
+			allowed:     fallbackAllowStatus,
+		}
+		if cl.cfg.NativeFallbackModel == "" {
+			plan.missingTarget = true
+			return plan
+		}
+		rewritten := proxy.RewriteModelInBody(body, cl.cfg.NativeFallbackModel)
+		if !rewritten.Parsed || rewritten.UpstreamModel == requested {
+			return fallbackPlan{}
+		}
+		plan.nativeBody = append([]byte(nil), rewritten.NewBody...)
+		plan.nativeModel = cl.cfg.NativeFallbackModel
+		plan.modelSource = fallbackModelSourceConfigured
+		return plan
+	}
+	if InAliasNamespace(canonicalRequested) ||
+		(cl.cfg.ProtocolShape == "openai" && requested == CodexCompatibilityModel) {
+		return fallbackPlan{}
+	}
+	if !config.IsProtocolNativeModel(cl.cfg.ProtocolShape, normalizeModelID(requested)) {
+		return fallbackPlan{}
+	}
+	return fallbackPlan{
+		nativeRoute: cl.cfg.FallbackRoute,
+		nativeBody:  append([]byte(nil), body...),
+		nativeModel: requested,
+		modelSource: fallbackModelSourceOriginal,
+		allowed:     fallbackAllowLegacy,
+	}
+}
+
+func (plan fallbackPlan) configured() bool {
+	return plan.nativeRoute != "" && len(plan.nativeBody) > 0 &&
+		plan.nativeModel != "" && plan.allowed != 0
+}
+
+func (g *Gateway) buildFallbackAttemptWithSnapshot(
+	snapshot *pricing.Snapshot,
+	requestedReasoning reasoning.RequestedReasoning,
+	requestedObserved bool,
+	cl *clientListener,
+	r *http.Request,
+	kind string,
+	plan fallbackPlan,
+) (upstreamAttempt, error) {
+	if !plan.configured() {
+		return upstreamAttempt{}, errors.New("fallback plan is not configured")
+	}
+	at, err := g.buildAttemptTargetWithSnapshot(
+		snapshot,
+		requestedReasoning,
+		requestedObserved,
+		cl,
+		r,
+		plan.nativeBody,
+		plan.nativeRoute,
+		kind,
+		"",
+		false,
+		plan.modelSource == fallbackModelSourceOriginal,
+	)
+	if err != nil {
+		return upstreamAttempt{}, err
+	}
+	at.fallbackAllowed = plan.allowed
+	at.fallbackModelSource = plan.modelSource
+	return at, nil
+}
+
 // resolveExplicitModelAttempt implements explicit-choice-wins routing
 // (the model-discovery contract): configured aliases remain an Anthropic-shape
 // feature, while a raw Baseten slug (contains "/") is explicit on every
-// request shape. Both are single attempts with no fallback_route: silently
-// substituting a native provider would violate the user's model selection.
+// request shape. The explicit Baseten attempt is primary. Anthropic-shape
+// identities may carry a separate status-only native candidate when the
+// client has native_fallback_model; every non-status trigger remains terminal.
 // On Anthropic-shape listeners, an unrecognized
 // claude-baseten-*/anthropic-baseten-* id is a loud 400, never a default-model route.
 func (g *Gateway) resolveExplicitModelAttempt(cl *clientListener, r *http.Request, body []byte, kind string) (upstreamAttempt, bool, error) {
@@ -2626,14 +2896,15 @@ func (g *Gateway) resolveExplicitModelAttemptWithSnapshot(
 	if requested == "" {
 		return upstreamAttempt{}, false, nil
 	}
+	canonicalRequested := normalizeModelID(requested)
 	target := ""
 	if strings.Contains(requested, "/") {
-		target = requested
+		target = canonicalRequested
 	} else if cl.cfg.ProtocolShape != "anthropic" {
 		return upstreamAttempt{}, false, nil
-	} else if slug, ok := cl.cfg.ModelAliases[requested]; ok {
+	} else if slug, ok := cl.cfg.ModelAliases[canonicalRequested]; ok {
 		target = slug
-	} else if InAliasNamespace(requested) {
+	} else if InAliasNamespace(canonicalRequested) {
 		return upstreamAttempt{}, false, unknownAliasError(cl.cfg, requested)
 	} else {
 		return upstreamAttempt{}, false, nil
@@ -2649,6 +2920,7 @@ func (g *Gateway) resolveExplicitModelAttemptWithSnapshot(
 		kind,
 		target,
 		true,
+		false,
 	)
 	if err != nil {
 		return upstreamAttempt{}, false, err
@@ -2665,7 +2937,7 @@ func (g *Gateway) resolveExplicitModelAttemptWithSnapshot(
 // building the primary (e.g. untranslatable content) is returned to the
 // caller; fallback build errors just drop the fallback. Explicitly
 // chosen Baseten models (alias or raw slug) preempt all of this with a
-// single baseten attempt.
+// Baseten attempt with an optional status-only native candidate.
 //
 // Subagent gate (the subagent-routing contract): on an anthropic-shape
 // listener with subagent routing enabled, a request carrying a
@@ -2720,6 +2992,7 @@ func (g *Gateway) resolveAttemptsWithRequestedReasoning(
 		at.requestClassification = classification
 		return []upstreamAttempt{at}, nil
 	}
+	plan := resolveFallbackPlan(cl, body)
 	isSubagent := false
 	origRequested := ""
 	subagentModel := ""
@@ -2733,7 +3006,7 @@ func (g *Gateway) resolveAttemptsWithRequestedReasoning(
 			}
 		}
 	}
-	attempts, err := g.resolveAttemptsLadderWithSnapshot(
+	attempts, err := g.resolveAttemptsLadderWithPlan(
 		snapshot,
 		requested,
 		requestedObserved,
@@ -2741,6 +3014,7 @@ func (g *Gateway) resolveAttemptsWithRequestedReasoning(
 		r,
 		body,
 		kind,
+		plan,
 	)
 	if err != nil {
 		return nil, err
@@ -2784,14 +3058,37 @@ func (g *Gateway) resolveAttemptsLadderWithSnapshot(
 	body []byte,
 	kind string,
 ) ([]upstreamAttempt, error) {
+	return g.resolveAttemptsLadderWithPlan(
+		snapshot,
+		requestedReasoning,
+		requestedObserved,
+		cl,
+		r,
+		body,
+		kind,
+		resolveFallbackPlan(cl, body),
+	)
+}
+
+func (g *Gateway) resolveAttemptsLadderWithPlan(
+	snapshot *pricing.Snapshot,
+	requestedReasoning reasoning.RequestedReasoning,
+	requestedObserved bool,
+	cl *clientListener,
+	r *http.Request,
+	body []byte,
+	kind string,
+	plan fallbackPlan,
+) ([]upstreamAttempt, error) {
 	requested := proxy.RewriteModelInBody(body, "").RequestedModel
+	canonicalRequested := normalizeModelID(requested)
 	if cl.cfg.globalRoutingOff() {
 		// The global routing gate is terminal. Inspect the requested model only
 		// to reject explicit Baseten choices clearly; otherwise build one
 		// protocol-native attempt. Do not consult aliases, pins, subagent
 		// policy, fallback, cooldown, or Baseten credentials.
-		if _, alias := cl.cfg.ModelAliases[requested]; alias ||
-			InAliasNamespace(requested) ||
+		if _, alias := cl.cfg.ModelAliases[canonicalRequested]; alias ||
+			InAliasNamespace(canonicalRequested) ||
 			strings.Contains(requested, "/") ||
 			(cl.cfg.ProtocolShape == "openai" &&
 				requested == CodexCompatibilityModel) {
@@ -2824,7 +3121,40 @@ func (g *Gateway) resolveAttemptsLadderWithSnapshot(
 	); err != nil {
 		return nil, err
 	} else if ok {
-		return []upstreamAttempt{at}, nil
+		at.statusFallbackPossible = plan.nativeRoute != ""
+		at.statusFallbackMissingTarget = plan.missingTarget
+		attempts := []upstreamAttempt{at}
+		if plan.configured() && at.route == pricing.ProviderBaseten &&
+			plan.nativeRoute != at.route {
+			if fba, ferr := g.buildFallbackAttemptWithSnapshot(
+				snapshot,
+				requestedReasoning,
+				requestedObserved,
+				cl,
+				r,
+				kind,
+				plan,
+			); ferr == nil {
+				if cooldown, active := g.activeFallbackCooldown(cl.cfg.Name); active && cooldownEligible(
+					cl.cfg.resolvedFallbackPolicy(),
+					fba.fallbackAllowed,
+					cooldown,
+				) {
+					fba.fallbackCount = 1
+					fba.fallbackTrigger = fallbackTriggerCooldown
+					fba.primary = primarySummary(
+						at,
+						false,
+						telemetry.PrimaryOutcomeCooldown,
+						nil,
+					)
+					attempts = []upstreamAttempt{fba}
+				} else {
+					attempts = append(attempts, fba)
+				}
+			}
+		}
+		return attempts, nil
 	}
 	// Model-route pin (config/schema.md): family entry for native
 	// claude-*/anthropic-* ids. When
@@ -2848,6 +3178,8 @@ func (g *Gateway) resolveAttemptsLadderWithSnapshot(
 	}
 	var attempts []upstreamAttempt
 	if perr == nil {
+		primary.statusFallbackPossible = plan.nativeRoute != ""
+		primary.statusFallbackMissingTarget = plan.missingTarget
 		attempts = append(attempts, primary)
 	}
 	// The managed Codex profile's compatibility model is an instruction to
@@ -2861,48 +3193,61 @@ func (g *Gateway) resolveAttemptsLadderWithSnapshot(
 		}
 		return nil, perr
 	}
-	if fb := cl.cfg.FallbackRoute; fb != "" {
+	if fb := cl.cfg.FallbackRoute; fb != "" && plan.configured() {
 		// Fallback inertness is decided here, per request, against the
 		// primary attempt's EFFECTIVE route rather than the configured
 		// route, because a model_routes pin can move the primary
 		// (config/schema.md, model route fallback semantics). A fallback
 		// equal to the effective primary is dormant for this request:
 		// no duplicate same-route retry, no spurious cooldown trip.
-		// When they differ the waterfall is live. A primary that failed to build
-		// (errNeedsLogin) keeps the fallback regardless.
+		// When they differ the waterfall is live. Pre-attempt failures advance
+		// only when the candidate allows that trigger class; alias and raw-slug
+		// candidates are status-only.
 		if perr == nil && fb == primary.route {
 			return attempts, nil
 		}
-		if fba, ferr := g.buildAttemptWithSnapshot(
+		if fba, ferr := g.buildFallbackAttemptWithSnapshot(
 			snapshot,
 			requestedReasoning,
 			requestedObserved,
 			cl,
 			r,
-			body,
-			fb,
 			kind,
+			plan,
 		); ferr == nil {
-			if perr == nil && g.fallbackActive(cl.cfg.Name) {
+			if cooldown, active := g.activeFallbackCooldown(cl.cfg.Name); perr == nil && active && cooldownEligible(
+				cl.cfg.resolvedFallbackPolicy(),
+				fba.fallbackAllowed,
+				cooldown,
+			) {
 				fba.fallbackCount = 1
 				fba.fallbackTrigger = fallbackTriggerCooldown
 				fba.primary = primarySummary(primary, false, telemetry.PrimaryOutcomeCooldown, nil)
 				attempts = []upstreamAttempt{fba}
 			} else {
-				if errors.Is(perr, errNeedsLogin) {
+				appendFallback := perr == nil
+				if errors.Is(perr, errNeedsLogin) &&
+					fba.fallbackAllowed&fallbackAllowAuthUnavailable != 0 {
 					fba.fallbackCount = 1
 					fba.fallbackTrigger = fallbackTriggerAuthUnavailable
 					fba.primary = primarySummary(primary, false, telemetry.PrimaryOutcomeAuthUnavailable, nil)
-				} else if allowsImageTranslationFallback(perr) {
+					appendFallback = true
+				} else if allowsImageTranslationFallback(perr) &&
+					fba.fallbackAllowed&fallbackAllowImage != 0 {
 					fba.fallbackCount = 1
 					fba.fallbackTrigger = fallbackTriggerImageUnsupported
 					fba.primary = primarySummary(primary, false, telemetry.PrimaryOutcomeImageInputUnsupported, nil)
-				} else if reasoning.AllowsFallback(perr) {
+					appendFallback = true
+				} else if reasoning.AllowsFallback(perr) &&
+					fba.fallbackAllowed&fallbackAllowReasoning != 0 {
 					fba.fallbackCount = 1
 					fba.fallbackTrigger = "reasoning_policy_error"
 					fba.primary = primarySummary(primary, false, telemetry.PrimaryOutcomeReasoningPolicyError, nil)
+					appendFallback = true
 				}
-				attempts = append(attempts, fba)
+				if appendFallback {
+					attempts = append(attempts, fba)
+				}
 			}
 		}
 	}
@@ -3106,6 +3451,7 @@ func (g *Gateway) resolveModelRoutePrimaryWithSnapshot(
 			kind,
 			decision.model,
 			true,
+			false,
 		)
 		if err != nil && planned.modelForCost != "" {
 			return planned, err
@@ -3190,12 +3536,12 @@ func ExpectedPrimaryRoute(c config.Client, globalRoutingEnabled bool, requestedI
 // response to the client (streaming or not), parses usage and writes
 // one telemetry row tagged with the listener name. A later attempt is
 // tried (and the fallback cooldown tripped) when an earlier one fails
-// to connect, returns an eligible 429 or 5xx, or exceeds the
+// to connect, returns a policy-enabled 429 or exact 500-599 status, or exceeds the
 // ttft_timeout first-byte deadline; nothing has been written to the
-// client at that point, so the retry is invisible. Anthropic-shape 429
-// responses are terminal and relay without fallback or cooldown. A
+// client at that point, so the retry is invisible. Disabled status classes
+// relay without fallback or cooldown. A
 // TTFT expiry on the final attempt (or on an explicit alias/slug
-// choice, which has no fallback) surfaces as a 504 naming the model
+// choice, which has no non-status fallback) surfaces as a 504 naming the model
 // and the deadline. Once the first response byte has arrived the
 // deadline is inert: a live stream is never truncated.
 func (g *Gateway) streamForward(
@@ -3352,32 +3698,41 @@ attemptLoop:
 				break
 			}
 
-			if !last &&
-				fallbackTriggerStatus(
-					cl.cfg.ProtocolShape,
-					resp.StatusCode,
-				) {
-				watch.stop()
-				fmt.Fprintf(os.Stderr,
-					"[gateway] fallback client=%s route=%s status=%d -> trying %s\n",
-					cl.cfg.Name, at.route, resp.StatusCode, attempts[i+1].route)
-				g.tripFallback(cl.cfg.Name)
-				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-				resp.Body.Close()
-				watch.cancel()
-				if at.hasActiveResponsesCompatibility() {
-					attempts[i+1].responsesCompatibility =
-						at.responsesCompatibility
+			statusMask := fallbackStatusMask(resp.StatusCode)
+			if at.route == pricing.ProviderBaseten &&
+				statusMask != 0 && at.statusFallbackPossible {
+				policy := cl.cfg.resolvedFallbackPolicy()
+				if !statusFallbackEnabled(policy, resp.StatusCode) {
+					at.fallbackSuppressedReason = statusSuppressedReason(resp.StatusCode)
+				} else if at.statusFallbackMissingTarget {
+					at.fallbackSuppressedReason = "native_target_unconfigured"
+				} else if !last && attempts[i+1].fallbackAllowed&statusMask != 0 {
+					watch.stop()
+					fmt.Fprintf(os.Stderr,
+						"[gateway] fallback client=%s route=%s status=%d -> trying %s\n",
+						cl.cfg.Name, at.route, resp.StatusCode, attempts[i+1].route)
+					cooldownTrigger := fallbackCooldownHTTP5xx
+					if statusMask == fallbackAllowHTTP429 {
+						cooldownTrigger = fallbackCooldownHTTP429
+					}
+					g.tripFallback(cl.cfg.Name, cooldownTrigger)
+					_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+					resp.Body.Close()
+					watch.cancel()
+					if at.hasActiveResponsesCompatibility() {
+						attempts[i+1].responsesCompatibility =
+							at.responsesCompatibility
+					}
+					attempts[i+1].fallbackTrigger =
+						fmt.Sprintf("http_%d", resp.StatusCode)
+					attempts[i+1].primary = primarySummary(
+						at,
+						true,
+						telemetry.PrimaryOutcomeHTTPError,
+						&resp.StatusCode,
+					)
+					continue attemptLoop
 				}
-				attempts[i+1].fallbackTrigger =
-					fmt.Sprintf("http_%d", resp.StatusCode)
-				attempts[i+1].primary = primarySummary(
-					at,
-					true,
-					telemetry.PrimaryOutcomeHTTPError,
-					&resp.StatusCode,
-				)
-				continue attemptLoop
 			}
 
 			// Headers arrived but the harness only unfreezes on the first
@@ -3406,6 +3761,7 @@ attemptLoop:
 			// Cancel it only after relay completes.
 			defer watch.cancel()
 			if !last &&
+				attempts[i+1].fallbackAllowed&fallbackAllowImage != 0 &&
 				reactiveImageFallbackEligible(
 					cl,
 					at,
@@ -3487,17 +3843,19 @@ attemptLoop:
 			fmt.Fprintf(os.Stderr,
 				"[gateway] upstream err client=%s route=%s upstream=%s status=0 code=%d is_stream=%t dur=%s err=%v\n",
 				cl.cfg.Name, at.route, res.UpstreamModel, code, isStream, time.Since(start), err)
-			if !last {
-				g.tripFallback(cl.cfg.Name)
+			fallbackMask := fallbackAllowTransport
+			fallbackTrigger := "transport_error"
+			primaryOutcome := telemetry.PrimaryOutcomeTransportError
+			if !attemptDispatched {
+				fallbackMask = fallbackAllowRequestBuild
+				fallbackTrigger = fallbackTriggerRequestBuild
+				primaryOutcome = telemetry.PrimaryOutcomeRequestBuildError
+			}
+			if !last && attempts[i+1].fallbackAllowed&fallbackMask != 0 {
+				g.tripFallback(cl.cfg.Name, fallbackTrigger)
 				if at.hasActiveResponsesCompatibility() {
 					attempts[i+1].responsesCompatibility =
 						at.responsesCompatibility
-				}
-				fallbackTrigger := "transport_error"
-				primaryOutcome := telemetry.PrimaryOutcomeTransportError
-				if !attemptDispatched {
-					fallbackTrigger = fallbackTriggerRequestBuild
-					primaryOutcome = telemetry.PrimaryOutcomeRequestBuildError
 				}
 				attempts[i+1].fallbackTrigger = fallbackTrigger
 				attempts[i+1].primary = primarySummary(
@@ -3518,11 +3876,11 @@ attemptLoop:
 			return
 		}
 		if ttftExpired {
-			if !last {
+			if !last && attempts[i+1].fallbackAllowed&fallbackAllowTTFT != 0 {
 				fmt.Fprintf(os.Stderr,
 					"[gateway] fallback client=%s route=%s ttft_timeout=%s no first byte -> trying %s\n",
 					cl.cfg.Name, at.route, cl.cfg.TTFTTimeout, attempts[i+1].route)
-				g.tripFallback(cl.cfg.Name)
+				g.tripFallback(cl.cfg.Name, fallbackTriggerTTFT)
 				if at.hasActiveResponsesCompatibility() {
 					attempts[i+1].responsesCompatibility =
 						at.responsesCompatibility
@@ -4343,6 +4701,7 @@ func resolveFromFile(f *config.File) ([]resolvedClientConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	fallbackPolicy := config.ResolveFallbackPolicy(f.Global.FallbackPolicy)
 	out := make([]resolvedClientConfig, 0, len(f.Clients))
 	claimed := map[string]string{} // bind_addr + shape -> owning client
 	for _, c := range f.Clients {
@@ -4435,6 +4794,9 @@ func resolveFromFile(f *config.File) ([]resolvedClientConfig, error) {
 			ModelOptions:            cloneModelOptions(c.ModelOptions),
 			SanitizeHistory:         sanitize,
 			FallbackRoute:           fb,
+			FallbackPolicy:          fallbackPolicy,
+			HasFallbackPolicy:       true,
+			NativeFallbackModel:     c.NativeFallbackModel,
 			UpstreamShape:           us,
 			ResponsesStripToolTypes: c.ResponsesStripToolTypes,
 			ResponsesCompatibility:  responsesCompatibility,
@@ -4457,18 +4819,19 @@ func discoveryPrefixOK(id string) bool {
 // are deliberately not pin families yet.
 var modelFamilySet = []string{"fable", "opus", "sonnet", "haiku"}
 
-// bracketSuffixRe matches one trailing harness context selection like [1m].
-// Claude Code normally removes this decoration before provider inference. If
-// it reaches the gateway, Baseten captures it separately and strips it from the
-// canonical provider model.
-var bracketSuffixRe = regexp.MustCompile(`\[[^\]]*\]$`)
+const oneMillionContextModelSuffix = "[1m]"
 
-// normalizeModelID strips one trailing bracketed suffix (for example
-// [1m]) from a model id. The suffix is not part of the provider model
-// identity, so routing, catalog lookup, and upstream inference use the
-// normalized form.
+// normalizeModelID strips only Claude Code's documented [1m] context
+// decoration, matched case-insensitively. Other bracketed suffixes are part of
+// the requested identifier and must not be generalized into routing syntax.
 func normalizeModelID(id string) string {
-	return bracketSuffixRe.ReplaceAllString(id, "")
+	if len(id) >= len(oneMillionContextModelSuffix) && strings.EqualFold(
+		id[len(id)-len(oneMillionContextModelSuffix):],
+		oneMillionContextModelSuffix,
+	) {
+		return id[:len(id)-len(oneMillionContextModelSuffix)]
+	}
+	return id
 }
 
 // familyOf returns the first family token from modelFamilySet contained

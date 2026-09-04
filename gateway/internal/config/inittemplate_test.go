@@ -37,6 +37,11 @@ func TestInitTemplateLoads(t *testing.T) {
 	if f.Global.RoutingEnabled == nil || !*f.Global.RoutingEnabled {
 		t.Errorf("global.routing_enabled = %v, want explicit true", f.Global.RoutingEnabled)
 	}
+	if f.Global.FallbackPolicy == nil ||
+		f.Global.FallbackPolicy.OnBaseten429 == nil || !*f.Global.FallbackPolicy.OnBaseten429 ||
+		f.Global.FallbackPolicy.OnBaseten5xx == nil || !*f.Global.FallbackPolicy.OnBaseten5xx {
+		t.Errorf("global.fallback_policy = %+v, want both triggers explicitly true", f.Global.FallbackPolicy)
+	}
 	if f.Global.Auth["baseten"] != "${BASETEN_API_KEY}" {
 		t.Errorf("global.auth.baseten = %q, want ${BASETEN_API_KEY} reference", f.Global.Auth["baseten"])
 	}
@@ -60,6 +65,9 @@ func TestInitTemplateLoads(t *testing.T) {
 	if cc.FallbackRoute != "anthropic" {
 		t.Errorf("fallback route %q, want anthropic", cc.FallbackRoute)
 	}
+	if cc.NativeFallbackModel != DefaultClaudeNativeFallbackModel {
+		t.Errorf("native_fallback_model %q, want %q", cc.NativeFallbackModel, DefaultClaudeNativeFallbackModel)
+	}
 	if !cc.Enabled {
 		t.Errorf("enabled %t, want true", cc.Enabled)
 	}
@@ -81,6 +89,9 @@ func TestInitTemplateLoads(t *testing.T) {
 	}
 	if cx.FallbackRoute != "openai" {
 		t.Errorf("codex fallback route %q, want openai", cx.FallbackRoute)
+	}
+	if cx.NativeFallbackModel != "" {
+		t.Errorf("codex native_fallback_model %q, want empty", cx.NativeFallbackModel)
 	}
 	if cx.DefaultModel != "zai-org/GLM-5.2" {
 		t.Errorf("codex default_model = %q, want zai-org/GLM-5.2", cx.DefaultModel)
@@ -107,8 +118,8 @@ func TestInitTemplateLoads(t *testing.T) {
 			t.Errorf("CollectPlaceholders includes CODEX_AUTH_TOKEN from the parked codex client; disabled clients must be exempt from the scan")
 		}
 	}
-	// The canonical configuration keeps the supported gateway-discovery
-	// aliases live.
+	// The canonical configuration keeps stable routing aliases live for the
+	// picker and compatibility discovery paths.
 	wantAliases := map[string]string{
 		"claude-baseten-glm-5-2":   "zai-org/GLM-5.2",
 		"claude-baseten-kimi-k2-7": "moonshotai/Kimi-K2.7-Code",
@@ -120,6 +131,25 @@ func TestInitTemplateLoads(t *testing.T) {
 	for alias, slug := range wantAliases {
 		if cc.ModelAliases[alias] != slug {
 			t.Errorf("model_aliases[%s] = %q, want %q", alias, cc.ModelAliases[alias], slug)
+		}
+	}
+	if cc.ModelPicker == nil || !cc.ModelPicker.Enabled {
+		t.Fatalf("claude-code model_picker = %#v, want explicit enabled picker", cc.ModelPicker)
+	}
+	wantPicker := []ModelPickerModel{
+		{Alias: "claude-baseten-glm-5-2"},
+		{Alias: "claude-baseten-kimi-k2-7"},
+		{Alias: "claude-baseten-nemotron"},
+	}
+	if len(cc.ModelPicker.Models) != len(wantPicker) {
+		t.Fatalf("model_picker.models = %#v, want %#v", cc.ModelPicker.Models, wantPicker)
+	}
+	for i := range wantPicker {
+		if cc.ModelPicker.Models[i] != wantPicker[i] {
+			t.Errorf("model_picker.models[%d] = %#v, want %#v", i, cc.ModelPicker.Models[i], wantPicker[i])
+		}
+		if _, ok := cc.ModelAliases[cc.ModelPicker.Models[i].Alias]; !ok {
+			t.Errorf("model_picker.models[%d].alias %q is absent from model_aliases", i, cc.ModelPicker.Models[i].Alias)
 		}
 	}
 	// subagent_model/subagent_routing ship commented out next to

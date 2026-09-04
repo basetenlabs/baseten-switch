@@ -180,7 +180,7 @@ struct PopupPreviewFixture: Identifiable {
                                nativeRoute: String = "anthropic",
                                effectiveModel: String = "zai-org/GLM-5.2",
                                fallbackActive: Bool = false) -> ClientStatus {
-        ClientStatus(dict: [
+        var dict: [String: Any] = [
             "name": name,
             "enabled": true,
             "bind_addr": "127.0.0.1:45272",
@@ -196,6 +196,27 @@ struct PopupPreviewFixture: Identifiable {
                 "active": fallbackActive,
                 "served_route": fallbackActive ? nativeRoute : "",
                 "cause": fallbackActive ? "http_429" : "",
+            ],
+            "baseten_model_fallback": [
+                "configured_model": "claude-opus-5",
+                "resolved_model": "claude-opus-5",
+                "display_name": "Opus",
+                "provider_ready": true,
+                "ready": true,
+                "available_models": [
+                    [
+                        "model": "claude-opus-5",
+                        "display_name": "Opus",
+                    ],
+                    [
+                        "model": "claude-sonnet-5",
+                        "display_name": "Sonnet",
+                    ],
+                    [
+                        "model": "claude-haiku-4-5",
+                        "display_name": "Haiku",
+                    ],
+                ],
             ],
             "subagent_model": "",
             "subagent_routing": "off",
@@ -238,7 +259,27 @@ struct PopupPreviewFixture: Identifiable {
                     ],
                 ],
             ],
-        ])!
+        ]
+        if name == "claude-code" {
+            dict["model_picker"] = [
+                "enabled": true,
+                "models": [
+                    [
+                        "alias": "claude-baseten-glm-5-2",
+                        "slug": "zai-org/GLM-5.2",
+                        "label": "GLM 5.2 via Baseten",
+                        "description": "Baseten primary route.",
+                    ],
+                    [
+                        "alias": "claude-baseten-kimi-k2-7-code",
+                        "slug": "moonshotai/Kimi-K2.7-Code",
+                        "label": "Kimi K2.7 Code via Baseten",
+                        "description": "Baseten primary route.",
+                    ],
+                ],
+            ]
+        }
+        return ClientStatus(dict: dict)!
     }
 
     private static func family(_ family: String,

@@ -361,6 +361,10 @@ func upRouter(lc *lifecycleConfig) int {
 			portOwner(lc.adminAddr), lc.adminAddr)
 		return 1
 	}
+	if err := migrateFallbackPolicyBeforeStart(lc.path, os.Stderr); err != nil {
+		fmt.Fprintf(os.Stderr, "router: fallback policy config migration failed: %v\n", err)
+		return 1
+	}
 	// An installed LaunchAgent means launchd owns this component:
 	// re-bootstrap a booted-out job instead of spawning an unmanaged
 	// process next to the plist.

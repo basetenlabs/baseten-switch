@@ -60,6 +60,7 @@ const publicCatalogGatewayFixture = `{
         "name": "GLM Test",
         "reasoning": true,
         "reasoning_options": [{"type": "toggle"}],
+		"limit": {"context": 1048576, "output": 65536},
         "cost": {"input": 0.3, "output": 0.75}
       }
     }

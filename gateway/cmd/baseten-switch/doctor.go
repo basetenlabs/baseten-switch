@@ -1083,7 +1083,7 @@ func doctorClaudeChecks(add addCheck, f *config.File, telPath string) {
 	a, err := newClaudeAdapterFromEnv()
 	if err != nil {
 		reason := fmt.Sprintf("cannot resolve the claude door port: %v", err)
-		for _, name := range []string{"settings", "base_url", "attribution_header", "tool_search", "shell_env", "subagents", "model_routes", "model_env", "backup"} {
+		for _, name := range []string{"settings", "base_url", "attribution_header", "tool_search", "shell_env", "subagents", "model_routes", "model_env", "model_picker", "backup"} {
 			add("claude", name, docSkip, reason, "")
 		}
 		return
@@ -1195,6 +1195,7 @@ func doctorClaudeChecks(add addCheck, f *config.File, telPath string) {
 	// the all-families-pinned warn, and the harness env-slot warn. All
 	// manual, no fixArgv.
 	doctorModelRoutesCheck(add, a, f, root, existed)
+	doctorModelPickerCheck(add, a)
 
 	if !(curSet && a.isGatewayURL(cur)) {
 		add("claude", "backup", docSkip, "not gateway-managed; no backup expected", "")

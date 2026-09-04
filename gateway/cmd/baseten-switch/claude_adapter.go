@@ -90,7 +90,7 @@ var (
 
 func cmdClaude(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: baseten-switch claude on|off|status|subagents [<model>|on|inherit]|route [<family> <target|default>]|reasoning baseten <model> off|follow-harness|effort <value>|default  (start/stop are aliases for on/off)")
+		fmt.Fprintln(os.Stderr, "usage: baseten-switch claude on|off|status|picker <status|enable|list|add|remove|move|sync|disable>|subagents [<model>|on|inherit]|route [<family> <target|default>]|reasoning baseten <model> off|follow-harness|effort <value>|default  (start/stop are aliases for on/off)")
 		return 2
 	}
 	if replayed, rc := preflightClaudeTerminalReplay(args); replayed {
@@ -100,14 +100,20 @@ func cmdClaude(args []string) int {
 	if err != nil {
 		if args[0] == "route" ||
 			args[0] == "subagents" ||
-			args[0] == "reasoning" {
+			args[0] == "reasoning" ||
+			args[0] == "picker" {
 			opts, _, parseErr := parseMutationOptions(args[1:])
+			if args[0] == "picker" {
+				opts, _, parseErr = parsePickerOptions(args[1:])
+			}
 			if parseErr == nil && opts.JSON {
 				operation := "set_claude_route"
 				if args[0] == "subagents" {
 					operation = "set_claude_subagents"
 				} else if args[0] == "reasoning" {
 					operation = "set_model_reasoning"
+				} else if args[0] == "picker" {
+					operation = "set_claude_picker"
 				}
 				return failMutation(opts, os.Stdout, mutationResult{
 					Operation: operation,
@@ -121,11 +127,19 @@ func cmdClaude(args []string) int {
 	}
 	switch args[0] {
 	case "on", "start":
-		return a.on()
+		rc := a.on()
+		if rc == 0 && a.modelPickerEnabled() {
+			if err := a.syncModelPicker(true); err != nil {
+				fmt.Fprintf(a.out, "claude on: model picker pending: %v\n", err)
+			}
+		}
+		return rc
 	case "off", "stop":
 		return a.off()
 	case "status":
 		return a.status(os.Stdout)
+	case "picker":
+		return a.picker(args[1:], os.Stdout)
 	case "subagents":
 		return a.subagents(args[1:], os.Stdout)
 	case "route":
@@ -133,7 +147,7 @@ func cmdClaude(args []string) int {
 	case "reasoning":
 		return runClientReasoning(mutationSurfaceClaude, a.clientName, args[1:], os.Stdout)
 	default:
-		fmt.Fprintf(os.Stderr, "unknown claude subcommand: %s (use on|off|status|subagents|route|reasoning)\n", args[0])
+		fmt.Fprintf(os.Stderr, "unknown claude subcommand: %s (use on|off|status|picker|subagents|route|reasoning)\n", args[0])
 		return 2
 	}
 }
@@ -168,6 +182,12 @@ func preflightClaudeTerminalReplay(args []string) (bool, int) {
 			return false, 0
 		}
 		spec.Surface = mutationSurfaceClaude
+	case "picker":
+		opts, spec, err = pickerTerminalReplayRequest(args[1:])
+		if err != nil {
+			return false, 0
+		}
+		spec.Surface = mutationSurfaceClaude
 	default:
 		return false, 0
 	}
@@ -185,7 +205,8 @@ type claudeAdapter struct {
 	desiredPort  string            // door port the anthropic-shape claude-code client rides
 	gatewayPorts map[string]bool   // every local port we consider "ours" (door binds + router listeners)
 	modelAliases map[string]string // the target client's model_aliases (subagent alias validation)
-	out          io.Writer         // human-readable action/warning output
+	modelPicker  *config.ModelPicker
+	out          io.Writer // human-readable action/warning output
 }
 
 // claudeBeforeSettingsMutation is a test seam for changes after the adapter
@@ -248,6 +269,7 @@ func newClaudeAdapterFromEnv() (*claudeAdapter, error) {
 		desiredPort:  port,
 		gatewayPorts: ports,
 		modelAliases: aliases,
+		modelPicker:  claudeConfiguredModelPicker(f, clientName),
 		out:          os.Stderr,
 	}, nil
 }
@@ -545,16 +567,17 @@ func envString(env map[string]any, key string) (string, bool) {
 // `on`; a mismatch at `off` downgrades restore to strip-only-owned, while a
 // changed resolved target is refused.
 type claudeBackup struct {
-	ConfigPath      string             `json:"config_path"`
-	ResolvedPath    string             `json:"resolved_path,omitempty"`
-	WrittenIdentity *safefile.Identity `json:"written_identity,omitempty"`
-	Values          map[string]string  `json:"values"`
-	Missing         []string           `json:"missing"`
-	EnvExisted      bool               `json:"env_existed"`
-	Model           string             `json:"model,omitempty"`
-	ModelMissing    bool               `json:"model_missing"`
-	Existed         bool               `json:"existed"`
-	WrittenHash     string             `json:"written_hash"`
+	ConfigPath      string                   `json:"config_path"`
+	ResolvedPath    string                   `json:"resolved_path,omitempty"`
+	WrittenIdentity *safefile.Identity       `json:"written_identity,omitempty"`
+	Values          map[string]string        `json:"values"`
+	Missing         []string                 `json:"missing"`
+	EnvExisted      bool                     `json:"env_existed"`
+	Model           string                   `json:"model,omitempty"`
+	ModelMissing    bool                     `json:"model_missing"`
+	Existed         bool                     `json:"existed"`
+	WrittenHash     string                   `json:"written_hash"`
+	ModelPicker     *claudeModelPickerBackup `json:"model_picker,omitempty"`
 }
 
 // claudeBackupPath keys the backup file by sha256(settings path) so
@@ -640,6 +663,15 @@ func cloneClaudeBackup(bak *claudeBackup) *claudeBackup {
 	if bak.WrittenIdentity != nil {
 		identity := *bak.WrittenIdentity
 		cloned.WrittenIdentity = &identity
+	}
+	if bak.ModelPicker != nil {
+		picker := *bak.ModelPicker
+		picker.Original = append(json.RawMessage(nil), bak.ModelPicker.Original...)
+		picker.WrittenRows = make([]json.RawMessage, len(bak.ModelPicker.WrittenRows))
+		for i := range bak.ModelPicker.WrittenRows {
+			picker.WrittenRows[i] = append(json.RawMessage(nil), bak.ModelPicker.WrittenRows[i]...)
+		}
+		cloned.ModelPicker = &picker
 	}
 	return &cloned
 }
@@ -1028,8 +1060,11 @@ func (a *claudeAdapter) off() int {
 		}
 	}
 	a.fixModelAlias(root, bak)
+	_, pickerCleanupErr := cleanupModelPicker(root, bak.ModelPicker, true)
 
-	if !bak.Existed && len(root) == 0 {
+	var writtenRaw []byte
+	var committed *safefile.Snapshot
+	if !bak.Existed && len(root) == 0 && pickerCleanupErr == nil {
 		if snap.FinalLinked {
 			fmt.Fprintf(a.out, "claude off: refusing to remove linked settings target %s; backup retained\n", a.settingsPath)
 			return 1
@@ -1040,11 +1075,20 @@ func (a *claudeAdapter) off() int {
 		}
 		fmt.Fprintf(a.out, "claude: off (%s did not exist before 'on'; removed)\n", a.settingsPath)
 	} else {
-		if _, _, err := writeClaudeSettings(snap, root); err != nil {
+		writtenRaw, committed, err = writeClaudeSettings(snap, root)
+		if err != nil {
 			fmt.Fprintf(a.out, "claude off: %v\n", err)
 			return 1
 		}
 		fmt.Fprintf(a.out, "claude: off (restored %s from backup)\n", a.settingsPath)
+	}
+	if pickerCleanupErr != nil {
+		if err := retainPickerOnlyBackup(a.backupPath, bak, writtenRaw, committed); err != nil {
+			fmt.Fprintf(a.out, "claude off: base wiring was removed, but modelPicker needs manual resolution (%v) and its recovery backup could not be retained: %v\n", pickerCleanupErr, err)
+			return 1
+		}
+		fmt.Fprintf(a.out, "claude off: base wiring removed; modelPicker preserved for manual resolution: %v\n", pickerCleanupErr)
+		return 1
 	}
 	if err := os.Remove(a.backupPath); err != nil {
 		fmt.Fprintf(a.out, "claude off: remove backup: %v\n", err)
@@ -1104,8 +1148,20 @@ func (a *claudeAdapter) offStripOnly(root map[string]any, snap *safefile.Snapsho
 	if a.fixModelAlias(root, bak) {
 		changed = true
 	}
+	var pickerCleanupErr error
+	if bak != nil && bak.ModelPicker != nil {
+		pickerChanged, pickerErr := cleanupModelPicker(root, bak.ModelPicker, false)
+		if pickerErr != nil {
+			pickerCleanupErr = pickerErr
+		} else {
+			changed = changed || pickerChanged
+		}
+	}
+	var writtenRaw []byte
+	var committed *safefile.Snapshot
 	if changed {
-		if _, _, err := writeClaudeSettings(snap, root); err != nil {
+		writtenRaw, committed, err = writeClaudeSettings(snap, root)
+		if err != nil {
 			fmt.Fprintf(a.out, "claude off: %v\n", err)
 			return 1
 		}
@@ -1116,6 +1172,18 @@ func (a *claudeAdapter) offStripOnly(root map[string]any, snap *safefile.Snapsho
 				fmt.Fprintf(a.out, "claude off: settings changed before backup cleanup: %v\n", err)
 				return 1
 			}
+		}
+		if pickerCleanupErr != nil {
+			if !changed {
+				writtenRaw = snap.Data
+				committed = snap
+			}
+			if err := retainPickerOnlyBackup(a.backupPath, bak, writtenRaw, committed); err != nil {
+				fmt.Fprintf(a.out, "claude off: base wiring was removed, but modelPicker needs manual resolution (%v) and its recovery backup could not be retained: %v\n", pickerCleanupErr, err)
+				return 1
+			}
+			fmt.Fprintf(a.out, "claude off: base wiring removed; modelPicker preserved for manual resolution: %v\n", pickerCleanupErr)
+			return 1
 		}
 		if err := os.Remove(a.backupPath); err != nil {
 			fmt.Fprintf(a.out, "claude off: remove backup: %v\n", err)
@@ -1131,6 +1199,21 @@ func (a *claudeAdapter) offStripOnly(root map[string]any, snap *safefile.Snapsho
 		fmt.Fprintf(a.out, "claude: off (noop; %s is not gateway-managed)\n", a.settingsPath)
 	}
 	return 0
+}
+
+func retainPickerOnlyBackup(path string, bak *claudeBackup, raw []byte, snap *safefile.Snapshot) error {
+	if bak == nil || bak.ModelPicker == nil || snap == nil {
+		return fmt.Errorf("modelPicker recovery state is incomplete")
+	}
+	bak.Values = map[string]string{}
+	bak.Missing = nil
+	bak.EnvExisted = true
+	bak.Model = ""
+	bak.ModelMissing = false
+	bak.Existed = true
+	bak.WrittenHash = sha256Hex(raw)
+	recordClaudeBackupFile(bak, snap)
+	return saveClaudeBackup(path, bak)
 }
 
 // reportUnrestoredBackupValues explains values that the conservative
@@ -1154,14 +1237,14 @@ func (a *claudeAdapter) reportUnrestoredBackupValues(root map[string]any, bak *c
 // fixModelAlias handles the the model-discovery contract persisted-alias
 // trap: a model picked via the gateway's /v1/models aliases persists
 // in settings.json, and Anthropic rejects it once routing is off. If
-// the current model looks like ours (claude-baseten-*), reset it to the
-// backed-up value or delete it. Reports whether root changed.
+// the current model is in either gateway alias namespace, reset it to a
+// non-gateway backed-up value or delete it. Reports whether root changed.
 func (a *claudeAdapter) fixModelAlias(root map[string]any, bak *claudeBackup) bool {
 	m, ok := root["model"].(string)
-	if !ok || !strings.HasPrefix(m, claudeAliasPrefix) {
+	if !ok || !gateway.InAliasNamespace(m) {
 		return false
 	}
-	if bak != nil && bak.Model != "" && !strings.HasPrefix(bak.Model, claudeAliasPrefix) {
+	if bak != nil && bak.Model != "" && !gateway.InAliasNamespace(bak.Model) {
 		root["model"] = bak.Model
 		fmt.Fprintf(a.out, "note: persisted model %q is a gateway alias; reset to backed-up model %q\n", m, bak.Model)
 		return true

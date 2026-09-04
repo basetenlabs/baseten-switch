@@ -167,8 +167,8 @@ func TestVariantProfileFallbackPreservesFastForNativeAnthropic(t *testing.T) {
 	assertVariantBetaTokens(t, primaryGot.headers, false)
 
 	fallbackGot := receiveVariantRequest(t, fallbackRequests)
-	if model := fmtString(fallbackGot.body["model"]); model != "claude-opus-5" {
-		t.Fatalf("fallback model = %q, want canonical claude-opus-5", model)
+	if model := fmtString(fallbackGot.body["model"]); model != "claude-opus-5[1m]" {
+		t.Fatalf("fallback model = %q, want exact decorated ingress model", model)
 	}
 	if speed := fmtString(fallbackGot.body["speed"]); speed != "fast" {
 		t.Fatalf("fallback speed = %q, want fast", speed)

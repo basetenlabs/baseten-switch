@@ -13,6 +13,8 @@ func cmdConfig(args []string) int {
 	switch args[0] {
 	case "init":
 		return cmdConfigInit(args[1:])
+	case "fallback":
+		return cmdConfigFallback(args[1:])
 	case "reset":
 		return cmdConfigReset(args[1:])
 	case "preview-snapshot":
@@ -25,4 +27,4 @@ func cmdConfig(args []string) int {
 	}
 }
 
-const configUsage = "usage: baseten-switch config init [--force] | baseten-switch config reset --yes [--preview-root PATH --router-addr HOST:PORT --door-addr HOST:PORT]"
+const configUsage = "usage: baseten-switch config init [--force] | baseten-switch config reset --yes [--preview-root PATH --router-addr HOST:PORT --door-addr HOST:PORT] | baseten-switch config fallback ..."

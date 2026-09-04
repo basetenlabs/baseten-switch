@@ -100,24 +100,57 @@ func recordingStub(t *testing.T, gotModel chan string, marker string) *httptest.
 	}))
 }
 
-// TestNormalizeModelID exercises normalizeModelID: one trailing
-// bracketed suffix is stripped, anything else is left untouched.
+// TestNormalizeModelID exercises normalizeModelID: only the documented [1m]
+// suffix is stripped, case-insensitively. Other decorations are identifiers.
 func TestNormalizeModelID(t *testing.T) {
 	for _, tc := range []struct {
 		in, want string
 	}{
 		{"claude-opus-4-8", "claude-opus-4-8"},
 		{"claude-opus-4-8[1m]", "claude-opus-4-8"},
+		{"claude-opus-4-8[1M]", "claude-opus-4-8"},
 		{"claude-fable-5[1m]", "claude-fable-5"},
 		{"claude-sonnet-4-6[1m]", "claude-sonnet-4-6"},
 		{"claude-3-5-sonnet-20241022", "claude-3-5-sonnet-20241022"},
 		{"", ""},
 		{"[1m]", ""},
-		{"claude-opus-4-8[1m][extra]", "claude-opus-4-8[1m]"},
+		{"claude-opus-4-8[2m]", "claude-opus-4-8[2m]"},
+		{"claude-opus-4-8[extra]", "claude-opus-4-8[extra]"},
+		{"claude-opus-4-8[1m][extra]", "claude-opus-4-8[1m][extra]"},
 	} {
 		if got := normalizeModelID(tc.in); got != tc.want {
 			t.Errorf("normalizeModelID(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+func TestConfiguredAliasAcceptsOneMillionContextSuffix(t *testing.T) {
+	gotModel := make(chan string, 1)
+	basSrv := recordingStub(t, gotModel, "B")
+	defer basSrv.Close()
+	cfg := testConfig(t, basSrv.URL, basSrv.URL)
+	rc := modelRoutesClient(t, "baseten", nil)
+	g, adminL, _ := newGateway(t, cfg, rc)
+	defer adminL.Close()
+	stop := start(t, g)
+	defer stop()
+
+	resp, body := postModelMessages(
+		t,
+		g,
+		"claude-baseten-glm-5-2[1m]",
+		"",
+	)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d: %s", resp.StatusCode, body)
+	}
+	select {
+	case model := <-gotModel:
+		if model != "zai-org/GLM-5.2" {
+			t.Fatalf("upstream model = %q, want exact alias target", model)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream never received the request")
 	}
 }
 

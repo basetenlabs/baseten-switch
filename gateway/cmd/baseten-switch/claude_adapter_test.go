@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -510,6 +511,28 @@ func TestClaudeOffResetsPersistedModelAlias(t *testing.T) {
 			t.Errorf("expected alias note, got %q", out.String())
 		}
 	})
+}
+
+func TestClaudeOffCleansBothPersistedAliasNamespaces(t *testing.T) {
+	for _, alias := range []string{
+		"claude-baseten-glm-5-2",
+		"anthropic-baseten-glm-5-2",
+	} {
+		t.Run(alias, func(t *testing.T) {
+			a, out := testAdapter(t)
+			writeSettingsFile(t, a, fmt.Sprintf(`{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8081"},"model":%q}`, alias))
+			if code := a.off(); code != 0 {
+				t.Fatalf("off = %d", code)
+			}
+			after := readTree(t, a.settingsPath)
+			if _, ok := after["model"]; ok {
+				t.Fatalf("persisted alias was not removed: %v", after["model"])
+			}
+			if !strings.Contains(out.String(), "gateway alias") {
+				t.Fatalf("expected alias cleanup note, got %q", out.String())
+			}
+		})
+	}
 }
 
 func TestClaudeOnPreservesOtherSettingsContent(t *testing.T) {
