@@ -136,8 +136,26 @@ func initialClaudeNativeFallbackSelection(
     currentModel: String
 ) -> String {
     options.first(where: { $0.model == currentModel })?.model
-        ?? options.first?.model
         ?? ""
+}
+
+func claudeNativeFallbackSelectionDetail(
+    selectedModel: String,
+    currentModel: String
+) -> String? {
+    guard selectedModel.isEmpty else { return nil }
+    if currentModel.isEmpty {
+        return "No fallback model is configured. Select a model to continue."
+    }
+    return "Your configured fallback is not one of the current choices. Select a model to replace it."
+}
+
+func claudeNativeFallbackCatalogDetail(
+    options: [ClaudeNativeFallbackOption]
+) -> String? {
+    options.isEmpty
+        ? "Fallback model choices will appear when the model catalog is available."
+        : nil
 }
 
 struct ClaudeNativeFallbackEditorDraft: Equatable, Identifiable, Sendable {
@@ -152,7 +170,7 @@ struct ClaudeNativeFallbackEditorDraft: Equatable, Identifiable, Sendable {
         let selectedModel = initialClaudeNativeFallbackSelection(
             options: options,
             currentModel: currentModel)
-        guard !selectedModel.isEmpty else { return nil }
+        guard !options.isEmpty else { return nil }
         self.id = id
         self.selectedModel = selectedModel
     }
@@ -184,37 +202,55 @@ struct ClaudeNativeFallbackEditorView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Fallback for Baseten models")
-                .font(.headline)
-            Text("Choose a full Claude model ID accepted by Anthropic. Switch writes the concrete model ID, not a Baseten alias.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Picker("Model", selection: $selectedModel) {
-                ForEach(options, id: \.model) { option in
-                    VStack(alignment: .leading) {
-                        Text(option.label)
-                        Text(option.model)
-                    }
-                    .tag(option.model)
-                }
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Choose a fallback model")
+                    .font(.title3.weight(.semibold))
+                    .accessibilityAddTraits(.isHeader)
+                Text("Select the Claude model to use when requests fall back from Baseten.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
+
+            ScrollView {
+                Picker("Fallback model", selection: $selectedModel) {
+                    ForEach(options, id: \.model) { option in
+                        Text(option.label)
+                            .tag(option.model)
+                    }
+                }
                 .pickerStyle(.radioGroup)
+                .labelsHidden()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityLabel("Fallback model")
                 .accessibilityIdentifier("claude-fallback-target-model")
-            Label(
-                "Cross-provider fallback replays the current conversation. Provider-specific reasoning history may be rejected during tool-use continuation.",
-                systemImage: "exclamationmark.triangle.fill")
-                .font(.caption)
-                .foregroundStyle(.orange)
-                .fixedSize(horizontal: false, vertical: true)
-            HStack {
+            }
+            .frame(maxHeight: 220)
+            .padding(12)
+            .background(
+                Color.primary.opacity(0.045),
+                in: RoundedRectangle(cornerRadius: 8))
+
+            if let detail = claudeNativeFallbackSelectionDetail(
+                selectedModel: selectedModel,
+                currentModel: currentModel
+            ) {
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack(spacing: 8) {
                 Spacer()
                 Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
                 Button("Save") {
                     onSave(selectedModel)
                 }
                 .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
                 .disabled(
                     !isAcceptedClaudeNativeModelID(selectedModel)
                         || selectedModel == currentModel)
@@ -222,7 +258,9 @@ struct ClaudeNativeFallbackEditorView: View {
             }
         }
         .padding(20)
-        .frame(width: 500)
+        .frame(width: 440)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("claude-fallback-target-editor")
     }
 }
 
@@ -230,35 +268,16 @@ func claudeNativeFallbackOptions(
     client: ClientStatus
 ) -> [ClaudeNativeFallbackOption] {
     var options: [ClaudeNativeFallbackOption] = []
-    if let current = client.basetenModelFallback?.resolvedModel,
-       isAcceptedClaudeNativeModelID(current) {
-        let displayName = client.basetenModelFallback?.displayName ?? ""
-        options.append(ClaudeNativeFallbackOption(
-            label: displayName.isEmpty
-                ? claudeNativeModelLabel(current)
-                : displayName,
-            model: current))
-    }
     for available in client.basetenModelFallback?.availableModels ?? []
     where isAcceptedClaudeNativeModelID(available.model) {
         options.append(ClaudeNativeFallbackOption(
-            label: available.displayName.isEmpty
-                ? claudeNativeModelLabel(available.model)
-                : available.displayName,
+            label: available.displayName,
             model: available.model))
     }
     var seen = Set<String>()
     return options.filter { option in
         seen.insert(option.model).inserted
     }
-}
-
-func claudeNativeModelLabel(_ model: String) -> String {
-    for family in ["fable", "opus", "sonnet", "haiku"]
-    where model.contains("-" + family + "-") {
-        return family.prefix(1).uppercased() + family.dropFirst()
-    }
-    return model
 }
 
 struct PendingClaudeModelPickerMutation: Equatable, Sendable {
@@ -272,9 +291,6 @@ private enum ClaudeModelPickerConfirmation {
         ClaudeModelPickerEnablePreview,
         convertReplacementMode: Bool)
     case chooseAlias(slug: String, choices: [ClaudeModelPickerRow])
-    case add(ClaudeModelPickerAddPreview, explicitAlias: String?)
-    case remove(ClaudeModelPickerRow)
-    case syncReplacement
 }
 
 struct ClaudeModelPickerEnablePreview: Equatable, Sendable {
@@ -299,11 +315,35 @@ struct ClaudeModelPickerEnablePreview: Equatable, Sendable {
     }
 }
 
+struct ClaudeModelPickerContextMinimumFailure: Equatable, Sendable {
+    static let code = "context_window_below_claude_picker_minimum"
+
+    let message: String
+
+    init?(json: String, status: Int32) {
+        guard status != 0,
+              let data = json.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let dict = object as? [String: Any],
+              dict["ok"] as? Bool == false,
+              let error = dict["error"] as? [String: Any],
+              error["code"] as? String == Self.code,
+              error["retryable"] as? Bool == false,
+              let rawMessage = error["message"] as? String else {
+            return nil
+        }
+        let message = rawMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty else { return nil }
+        self.message = message
+    }
+}
+
 struct ClaudeModelPickerRow: Equatable, Identifiable, Sendable {
     let alias: String
     let slug: String
     let label: String
     let description: String
+    let contextTokens: Int64
 
     var id: String { alias }
 
@@ -322,6 +362,7 @@ struct ClaudeModelPickerRow: Equatable, Identifiable, Sendable {
         self.slug = slug
         self.label = label
         self.description = description
+        self.contextTokens = Int64(dict["context_tokens"] as? Int ?? 0)
     }
 }
 
@@ -355,6 +396,7 @@ struct ClaudeModelPickerDiagnostics: Equatable, Sendable {
     let legacyDiscoveryEnabled: Bool
     let savedModel: String?
     let savedModelUnconfigured: Bool
+    let savedModelContextMismatch: Bool
     let message: String
 
     init?(json: String) {
@@ -399,6 +441,8 @@ struct ClaudeModelPickerDiagnostics: Equatable, Sendable {
         savedModel = dict["saved_model"] as? String
         savedModelUnconfigured =
             dict["saved_model_unconfigured"] as? Bool ?? false
+        savedModelContextMismatch =
+            dict["saved_model_context_mismatch"] as? Bool ?? false
         message = dict["message"] as? String ?? ""
     }
 }
@@ -437,6 +481,25 @@ func claudeModelPickerConfiguredRowState(
         return "Possible allowlist conflict"
     }
     return "Runtime unverified"
+}
+
+func claudeModelPickerCanRetrySync(
+    userFileSync: String?,
+    canEditConfiguredRows: Bool,
+    hasConfiguredPicker: Bool
+) -> Bool {
+    userFileSync == "out_of_sync"
+        && canEditConfiguredRows
+        && hasConfiguredPicker
+}
+
+let claudeModelPickerRestartNotice =
+    "Restart Claude Code to see additions or removals."
+
+func claudeModelPickerRemoveMutation(
+    alias: String
+) -> ClaudeModelPickerMutationKind {
+    .remove(alias: alias)
 }
 
 struct ClaudeModelPickerProjection: Equatable {
@@ -502,6 +565,13 @@ struct ClaudeModelPickerAddPreview: Equatable, Sendable {
     }
 }
 
+func claudeModelPickerAddMutation(
+    preview: ClaudeModelPickerAddPreview,
+    explicitAlias: String?
+) -> ClaudeModelPickerMutationKind {
+    .add(slug: preview.slug, alias: explicitAlias)
+}
+
 enum ClaudeModelPickerAddPreviewOutcome: Equatable, Sendable {
     case preview(ClaudeModelPickerAddPreview, explicitAlias: String?)
     case aliasChoices(slug: String, choices: [ClaudeModelPickerRow])
@@ -534,6 +604,16 @@ enum ClaudeModelPickerAddPreviewOutcome: Equatable, Sendable {
         }
         self = .aliasChoices(slug: slug, choices: choices)
     }
+}
+
+func claudeModelPickerAddPreviewErrorMessage(
+    _ error: String?
+) -> String {
+    let message = error?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !message.isEmpty else {
+        return "Switch could not generate an exact preview for this model. No changes were made."
+    }
+    return message
 }
 
 func claudeModelPickerMoveUpCommand(
@@ -609,7 +689,7 @@ func claudeModelPickerSuccessMessage(
     case .enable:
         return "Saved. Reopen /model in Claude Code to verify the configured Baseten models."
     case .add:
-        return "Saved. Reopen /model in Claude Code. Restart Claude Code if the list has not refreshed."
+        return "Added to /model."
     case .remove:
         return "Saved. The routing alias remains available to existing sessions."
     case .move:
@@ -627,11 +707,11 @@ struct ClaudeModelPickerSectionView: View {
     @State private var searchText = ""
     @State private var confirmation: ClaudeModelPickerConfirmation?
     @State private var previewError: String?
+    @State private var addPreviewError: String?
     @State private var previewingSlug: String?
     @State private var previewingEnable = false
     @State private var fallbackTargetEditorDraft:
         ClaudeNativeFallbackEditorDraft?
-
     var body: some View {
         RoutingSectionCard {
             HStack {
@@ -643,18 +723,6 @@ struct ClaudeModelPickerSectionView: View {
                         .controlSize(.small)
                         .accessibilityLabel(pending.kind.progressLabel)
                 }
-                Button("Sync") {
-                    guard !isPreview else { return }
-                    if replacementModeRequiresConversion {
-                        confirmation = .syncReplacement
-                    } else {
-                        state.requestClaudeModelPicker(
-                            .sync(convertReplacementMode: false))
-                    }
-                }
-                .disabled(
-                    !canEditConfiguredRows || client.modelPicker == nil)
-                .accessibilityIdentifier("claude-picker-sync")
             }
         } content: {
             VStack(alignment: .leading, spacing: 16) {
@@ -726,12 +794,6 @@ struct ClaudeModelPickerSectionView: View {
                     convertsReplacementMode: convert))
             case .chooseAlias:
                 Text("More than one configured alias routes to this model. Choose the exact alias to add.")
-            case .add(let preview, _):
-                Text("Model: \(preview.slug)\nAlias: \(preview.alias)\nLabel: \(preview.label)\nDescription: \(preview.description)")
-            case .remove:
-                Text(removeConfirmationMessage)
-            case .syncReplacement:
-                Text("Claude Code currently replaces its built-in model list. Continue only if you want Switch to convert it to append mode and preserve Claude's built-in models.")
             case nil:
                 EmptyView()
             }
@@ -740,7 +802,7 @@ struct ClaudeModelPickerSectionView: View {
             ClaudeNativeFallbackEditorView(
                 options: fallbackTargetOptions,
                 presentedModel: draft.selectedModel,
-                currentModel: displayedFallbackTarget,
+                currentModel: fallbackProjection?.resolvedModel ?? "",
                 onCancel: {
                     fallbackTargetEditorDraft = nil
                 },
@@ -777,7 +839,8 @@ struct ClaudeModelPickerSectionView: View {
                     fallbackTargetEditorDraft =
                         ClaudeNativeFallbackEditorDraft(
                             options: fallbackTargetOptions,
-                            currentModel: displayedFallbackTarget)
+                            currentModel:
+                                fallbackProjection?.resolvedModel ?? "")
                 }
                 .disabled(!canEditFallbackTarget)
                 .accessibilityIdentifier("claude-fallback-target-change")
@@ -786,6 +849,16 @@ struct ClaudeModelPickerSectionView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            if let detail = claudeNativeFallbackCatalogDetail(
+                options: fallbackTargetOptions
+            ) {
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier(
+                        "claude-fallback-target-catalog-unavailable")
+            }
             Text(fallbackTargetStatusLine)
                 .font(.caption.weight(.medium))
                 .foregroundStyle(fallbackTargetStatusColor)
@@ -922,6 +995,25 @@ struct ClaudeModelPickerSectionView: View {
                         .foregroundStyle(.orange)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                if diagnostics.savedModelContextMismatch,
+                   let savedModel = diagnostics.savedModel {
+                    Label(
+                        "Claude Code's saved default, \(savedModel), still requests 1M context. Its configured picker row now uses the 200K context bucket.",
+                        systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if canRetryModelPickerSync {
+                    HStack {
+                        Spacer()
+                        Button("Retry sync") {
+                            state.requestClaudeModelPicker(
+                                .sync(convertReplacementMode: false))
+                        }
+                        .accessibilityIdentifier("claude-picker-retry-sync")
+                    }
+                }
             }
             .padding(10)
             .background(
@@ -1021,6 +1113,10 @@ struct ClaudeModelPickerSectionView: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Configured for /model")
                 .font(.subheadline.weight(.semibold))
+            Text(claudeModelPickerRestartNotice)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             if projection.configured.isEmpty {
                 Text("No Baseten models are configured for /model.")
                     .font(.caption)
@@ -1087,7 +1183,9 @@ struct ClaudeModelPickerSectionView: View {
 
             Button("Remove") {
                 previewError = nil
-                confirmation = .remove(row)
+                guard !isPreview else { return }
+                state.requestClaudeModelPicker(
+                    claudeModelPickerRemoveMutation(alias: row.alias))
             }
             .disabled(!canEditConfiguredRows)
             .accessibilityIdentifier("claude-picker-remove-\(row.alias)")
@@ -1103,6 +1201,17 @@ struct ClaudeModelPickerSectionView: View {
             TextField("Search models", text: $searchText)
                 .textFieldStyle(.roundedBorder)
                 .accessibilityIdentifier("claude-picker-search")
+
+            if let addPreviewError {
+                Label(
+                    addPreviewError,
+                    systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier(
+                        "claude-picker-add-preview-error")
+            }
 
             switch state.liveModelCatalogState {
             case .idle, .loading:
@@ -1195,6 +1304,14 @@ struct ClaudeModelPickerSectionView: View {
         canEditConfiguredRows && state.modelCatalogAllowsMutation
     }
 
+    private var canRetryModelPickerSync: Bool {
+        claudeModelPickerCanRetrySync(
+            userFileSync:
+                state.claudeModelPickerDiagnostics?.userFileSync,
+            canEditConfiguredRows: canEditConfiguredRows,
+            hasConfiguredPicker: client.modelPicker != nil)
+    }
+
     private var replacementModeRequiresConversion: Bool {
         state.claudeModelPickerDiagnostics?.replacementMode == "replace"
     }
@@ -1217,27 +1334,9 @@ struct ClaudeModelPickerSectionView: View {
             return "Set up the Claude Code model picker?"
         case .chooseAlias:
             return "Choose an alias"
-        case .add(let preview, _):
-            return "Add \(preview.label) to /model?"
-        case .remove(let row):
-            return "Remove \(rowDisplayLabel(row)) from /model?"
-        case .syncReplacement:
-            return "Convert Claude's model picker to append mode?"
         case nil:
             return "Confirm model picker change"
         }
-    }
-
-    private var removeConfirmationMessage: String {
-        var message = "The routing alias remains configured. Existing sessions may continue to use it."
-        if case .remove(let row) = confirmation,
-           state.claudeModelPickerDiagnostics?.savedModel == row.alias {
-            message += " This alias is Claude Code's saved default. Removing it from the curated list does not clear that saved default. Select a native default in /model before starting a new session."
-        }
-        if state.claudeModelPickerDiagnostics?.legacyDiscoveryEnabled == true {
-            message += " Legacy gateway model discovery is enabled, so the alias may still appear outside the curated picker list."
-        }
-        return message
     }
 
     @ViewBuilder
@@ -1256,27 +1355,6 @@ struct ClaudeModelPickerSectionView: View {
                     confirmation = nil
                     beginAddPreview(slug: slug, alias: choice.alias)
                 }
-            }
-        case .add(let preview, let explicitAlias):
-            Button("Add to /model") {
-                guard !isPreview else { return }
-                state.requestClaudeModelPicker(.add(
-                    slug: preview.slug,
-                    alias: explicitAlias))
-                confirmation = nil
-            }
-        case .remove(let row):
-            Button("Remove from /model", role: .destructive) {
-                guard !isPreview else { return }
-                state.requestClaudeModelPicker(.remove(alias: row.alias))
-                confirmation = nil
-            }
-        case .syncReplacement:
-            Button("Convert and Sync") {
-                guard !isPreview else { return }
-                state.requestClaudeModelPicker(
-                    .sync(convertReplacementMode: true))
-                confirmation = nil
             }
         case nil:
             EmptyView()
@@ -1298,6 +1376,7 @@ struct ClaudeModelPickerSectionView: View {
     private func beginAddPreview(slug: String, alias: String?) {
         guard !isPreview else { return }
         previewError = nil
+        addPreviewError = nil
         previewingSlug = slug
         Task {
             let outcome = await state.previewClaudeModelPickerAdd(
@@ -1307,15 +1386,17 @@ struct ClaudeModelPickerSectionView: View {
             previewingSlug = nil
             switch outcome {
             case .preview(let preview, let explicitAlias):
-                confirmation = .add(
-                    preview,
-                    explicitAlias: explicitAlias)
+                state.requestClaudeModelPicker(
+                    claudeModelPickerAddMutation(
+                        preview: preview,
+                        explicitAlias: explicitAlias))
             case .aliasChoices(let choiceSlug, let choices):
                 confirmation = .chooseAlias(
                     slug: choiceSlug,
                     choices: choices)
             case nil:
-                previewError = "Switch could not generate an exact preview for this model. No changes were made."
+                addPreviewError = claudeModelPickerAddPreviewErrorMessage(
+                    state.lastError)
             }
         }
     }

@@ -88,21 +88,21 @@ final class FallbackPolicyTests: XCTestCase {
             "baseten_model_fallback": [
                 "configured_model": "claude-opus-5",
                 "resolved_model": "claude-opus-5",
-                "display_name": "Opus",
+                "display_name": "Claude Opus 5",
                 "provider_ready": true,
                 "ready": true,
                 "available_models": [
                     [
                         "model": "claude-opus-5",
-                        "display_name": "Opus",
+                        "display_name": "Claude Opus 5",
                     ],
                     [
                         "model": "claude-sonnet-5",
-                        "display_name": "Sonnet",
+                        "display_name": "Claude Sonnet 5",
                     ],
                     [
                         "model": "claude-haiku-4-5",
-                        "display_name": "Haiku",
+                        "display_name": "Claude Haiku 4.5",
                     ],
                 ],
             ],
@@ -126,13 +126,13 @@ final class FallbackPolicyTests: XCTestCase {
             claudeNativeFallbackOptions(client: client),
             [
                 ClaudeNativeFallbackOption(
-                    label: "Opus",
+                    label: "Claude Opus 5",
                     model: "claude-opus-5"),
                 ClaudeNativeFallbackOption(
-                    label: "Sonnet",
+                    label: "Claude Sonnet 5",
                     model: "claude-sonnet-5"),
                 ClaudeNativeFallbackOption(
-                    label: "Haiku",
+                    label: "Claude Haiku 4.5",
                     model: "claude-haiku-4-5"),
             ])
         XCTAssertFalse(
@@ -150,6 +150,31 @@ final class FallbackPolicyTests: XCTestCase {
             isAcceptedClaudeNativeModelID("anthropic-baseten-kimi"))
         XCTAssertTrue(isAcceptedClaudeNativeModelID("claude-opus-5"))
         XCTAssertTrue(isAcceptedClaudeNativeModelID("claude-3-7-sonnet"))
+    }
+
+    func testNativeTargetSelectorPrefersAvailableVersionedDisplayName()
+        throws
+    {
+        let client = try XCTUnwrap(ClientStatus(dict: [
+            "name": "claude-code",
+            "baseten_model_fallback": [
+                "configured_model": "claude-opus-5",
+                "resolved_model": "claude-opus-5",
+                "display_name": "Opus",
+                "provider_ready": true,
+                "ready": true,
+                "available_models": [[
+                    "model": "claude-opus-5",
+                    "display_name": "Claude Opus 5",
+                ]],
+            ],
+        ]))
+
+        XCTAssertEqual(
+            claudeNativeFallbackOptions(client: client),
+            [ClaudeNativeFallbackOption(
+                label: "Claude Opus 5",
+                model: "claude-opus-5")])
     }
 
     func testFallbackTargetEditorPresentationStartsWithCurrentModel() throws {
@@ -186,6 +211,44 @@ final class FallbackPolicyTests: XCTestCase {
         XCTAssertNil(ClaudeNativeFallbackEditorDraft(
             options: [],
             currentModel: "claude-sonnet-5"))
+    }
+
+    func testFallbackTargetEditorRequiresExplicitReplacementForOlderCurrent() {
+        let draft = ClaudeNativeFallbackEditorDraft(
+            options: [ClaudeNativeFallbackOption(
+                label: "Claude Opus 5",
+                model: "claude-opus-5")],
+            currentModel: "claude-opus-4-8")
+
+        XCTAssertNotNil(draft)
+        XCTAssertEqual(draft?.selectedModel, "")
+        XCTAssertEqual(
+            claudeNativeFallbackSelectionDetail(
+                selectedModel: "",
+                currentModel: "claude-opus-4-8"),
+            "Your configured fallback is not one of the current choices. Select a model to replace it.")
+    }
+
+    func testFallbackTargetEditorCopyDistinguishesUnconfiguredClient() {
+        XCTAssertEqual(
+            claudeNativeFallbackSelectionDetail(
+                selectedModel: "",
+                currentModel: ""),
+            "No fallback model is configured. Select a model to continue.")
+        XCTAssertNil(claudeNativeFallbackSelectionDetail(
+            selectedModel: "claude-opus-5",
+            currentModel: ""))
+    }
+
+    func testFallbackCatalogUnavailableDetailOnlyAppearsWithoutChoices() {
+        XCTAssertEqual(
+            claudeNativeFallbackCatalogDetail(options: []),
+            "Fallback model choices will appear when the model catalog is available.")
+        XCTAssertNil(claudeNativeFallbackCatalogDetail(options: [
+            ClaudeNativeFallbackOption(
+                label: "Claude Opus 5",
+                model: "claude-opus-5"),
+        ]))
     }
 
     func testFallbackTargetEditorStateUsesPresentedModel() {
@@ -228,14 +291,12 @@ final class FallbackPolicyTests: XCTestCase {
         ]))
         XCTAssertEqual(
             claudeNativeFallbackOptions(client: client),
-            [ClaudeNativeFallbackOption(
-                label: "Opus",
-                model: "claude-opus-5")])
+            [])
         XCTAssertTrue(
             client.basetenModelFallback?.availableModels.isEmpty == true)
     }
 
-    func testOldRouterSelectorFallsBackOnlyToCurrentTarget() throws {
+    func testOldRouterSelectorHasNoValidatedChoices() throws {
         let client = try XCTUnwrap(ClientStatus(dict: [
             "name": "claude-code",
             "baseten_model_fallback": [
@@ -254,9 +315,7 @@ final class FallbackPolicyTests: XCTestCase {
         ]))
         XCTAssertEqual(
             claudeNativeFallbackOptions(client: client),
-            [ClaudeNativeFallbackOption(
-                label: "Opus",
-                model: "claude-opus-5")])
+            [])
     }
 
     func testFallbackTargetStatusKeepsReadinessIndependentFromPolicy() throws {
@@ -304,14 +363,14 @@ final class FallbackPolicyTests: XCTestCase {
         let receipt = try XCTUnwrap(GlobalMutationReceipt(json: """
         {
           "warnings": [
-            {"code": "cross_provider_history_may_be_incompatible"},
+            {"code": "capable_router_activation_required"},
             "legacy warning",
             {"message": "ignored without code"}
           ]
         }
         """))
         XCTAssertEqual(receipt.warnings, [
-            "cross_provider_history_may_be_incompatible",
+            "capable_router_activation_required",
             "legacy warning",
         ])
     }

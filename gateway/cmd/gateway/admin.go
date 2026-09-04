@@ -280,16 +280,20 @@ type modelPickerStatus struct {
 }
 
 type modelPickerStatusModel struct {
-	Alias       string `json:"alias"`
-	Slug        string `json:"slug"`
-	Label       string `json:"label"`
-	Description string `json:"description,omitempty"`
+	Alias         string `json:"alias"`
+	Slug          string `json:"slug"`
+	Label         string `json:"label"`
+	Description   string `json:"description,omitempty"`
+	ContextTokens int64  `json:"context_tokens"`
 }
 
 // computeModelPickerStatus projects the desired config in its saved order.
 // It intentionally does not read Claude settings or infer whether policy has
 // filtered a row; the Claude adapter owns those file and runtime status axes.
-func computeModelPickerStatus(c config.Client) *modelPickerStatus {
+func computeModelPickerStatus(
+	c config.Client,
+	catalog *pricing.Snapshot,
+) *modelPickerStatus {
 	if c.ModelPicker == nil {
 		return nil
 	}
@@ -299,11 +303,16 @@ func computeModelPickerStatus(c config.Client) *modelPickerStatus {
 	}
 	for _, model := range c.ModelPicker.Models {
 		slug := c.ModelAliases[model.Alias]
+		var contextTokens int64
+		if record, ok := catalog.Model(pricing.ProviderBaseten, slug); ok {
+			contextTokens = record.ContextTokens
+		}
 		status.Models = append(status.Models, modelPickerStatusModel{
-			Alias:       model.Alias,
-			Slug:        slug,
-			Label:       modelmeta.ResolveBaseten(slug).DisplayName + " via Baseten",
-			Description: "Served by Baseten.",
+			Alias:         model.Alias,
+			Slug:          slug,
+			Label:         modelmeta.ResolveBaseten(slug).DisplayName + " via Baseten",
+			Description:   "Served by Baseten.",
+			ContextTokens: contextTokens,
 		})
 	}
 	return status
@@ -429,7 +438,11 @@ func (g *Gateway) policyAwareFallbackCooldown(rc resolvedClientConfig) (fallback
 	return state, active && cooldownEligible(rc.resolvedFallbackPolicy(), fallbackAllowLegacy, state)
 }
 
-func basetenModelFallbackStatus(rc resolvedClientConfig, desiredActiveMismatch bool) map[string]any {
+func basetenModelFallbackStatus(
+	rc resolvedClientConfig,
+	desiredActiveMismatch bool,
+	catalog *pricing.Snapshot,
+) map[string]any {
 	model := rc.NativeFallbackModel
 	providerReady := nativeFallbackProviderReady(rc)
 	ready := model != "" && providerReady && config.IsProtocolNativeModel(rc.ProtocolShape, model)
@@ -448,41 +461,188 @@ func basetenModelFallbackStatus(rc resolvedClientConfig, desiredActiveMismatch b
 	return map[string]any{
 		"configured_model": model,
 		"resolved_model":   model,
-		"display_name":     nativeFallbackDisplayName(model),
+		"display_name":     nativeFallbackCatalogDisplayName(catalog, model),
 		"provider_ready":   providerReady,
 		"ready":            ready,
 		"reason":           reason,
-		"available_models": nativeFallbackAvailableModels(rc),
+		"available_models": nativeFallbackAvailableModels(rc, catalog),
 	}
 }
 
-func nativeFallbackAvailableModels(rc resolvedClientConfig) []map[string]any {
-	candidates := make([]string, 0, 2+len(modelFamilySet))
-	candidates = append(
-		candidates,
-		rc.NativeFallbackModel,
-		config.DefaultClaudeNativeFallbackModel,
-	)
-	for _, family := range modelFamilySet {
-		candidates = append(candidates, familyRepresentativeIDs[family])
-	}
-
-	seen := make(map[string]struct{}, len(candidates))
-	models := make([]map[string]any, 0, len(candidates))
-	for _, model := range candidates {
+func nativeFallbackAvailableModels(
+	rc resolvedClientConfig,
+	catalog *pricing.Snapshot,
+) []map[string]any {
+	records := catalog.Models(pricing.ProviderAnthropic)
+	byFamily := make(map[string]nativeFallbackOption, len(modelFamilySet))
+	for _, record := range records {
+		model := record.CanonicalModelID
 		if !config.IsProtocolNativeModel(rc.ProtocolShape, model) {
 			continue
 		}
-		if _, duplicate := seen[model]; duplicate {
+		if !nativeFallbackFamilyAllowed(record.Family) {
 			continue
 		}
-		seen[model] = struct{}{}
+		candidate := nativeFallbackOption{
+			model:       model,
+			displayName: normalizeNativeFallbackDisplayName(record.DisplayName),
+			family:      record.Family,
+			releaseDate: record.ReleaseDate,
+			version:     nativeFallbackVersion(model, record.Family),
+		}
+		if existing, duplicate := byFamily[candidate.family]; !duplicate ||
+			preferNativeFallbackOption(candidate, existing) {
+			byFamily[candidate.family] = candidate
+		}
+	}
+
+	models := make([]map[string]any, 0, len(byFamily))
+	for _, family := range modelFamilySet {
+		option, ok := byFamily[family]
+		if !ok {
+			continue
+		}
 		models = append(models, map[string]any{
-			"model":        model,
-			"display_name": nativeFallbackDisplayName(model),
+			"model": option.model, "display_name": option.displayName,
 		})
 	}
 	return models
+}
+
+type nativeFallbackOption struct {
+	model       string
+	displayName string
+	family      string
+	releaseDate string
+	version     []uint64
+}
+
+func preferNativeFallbackOption(
+	candidate nativeFallbackOption,
+	existing nativeFallbackOption,
+) bool {
+	if candidate.releaseDate != existing.releaseDate {
+		if comparison := compareNativeFallbackReleaseDates(
+			candidate.releaseDate,
+			existing.releaseDate,
+		); comparison != 0 {
+			return comparison > 0
+		}
+	}
+	if comparison := compareNativeFallbackVersions(
+		candidate.version,
+		existing.version,
+	); comparison != 0 {
+		return comparison > 0
+	}
+	if len(candidate.model) != len(existing.model) {
+		return len(candidate.model) < len(existing.model)
+	}
+	return candidate.model < existing.model
+}
+
+// Canonical YYYY-MM and YYYY-MM-DD values sort chronologically as strings.
+// Within the same month, the documented day precision sorts after month-only
+// precision, providing a stable preference when the catalog mixes both forms.
+func compareNativeFallbackReleaseDates(left, right string) int {
+	if left == right {
+		return 0
+	}
+	if left == "" {
+		return -1
+	}
+	if right == "" {
+		return 1
+	}
+	if left < right {
+		return -1
+	}
+	return 1
+}
+
+func nativeFallbackFamilyAllowed(family string) bool {
+	for _, allowed := range modelFamilySet {
+		if family == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+// nativeFallbackVersion provides a deterministic fallback for provider cache
+// records written before release_date was retained. Anthropic has used both
+// claude-FAMILY-MAJOR-MINOR and claude-MAJOR-MINOR-FAMILY identifiers.
+func nativeFallbackVersion(model, family string) []uint64 {
+	parts := strings.Split(strings.TrimPrefix(model, "claude-"), "-")
+	familyIndex := -1
+	for index, part := range parts {
+		if part == family {
+			familyIndex = index
+			break
+		}
+	}
+	if familyIndex < 0 {
+		return nil
+	}
+	var versionParts []string
+	if familyIndex == 0 {
+		versionParts = parts[1:]
+	} else {
+		versionParts = parts[:familyIndex]
+	}
+	version := make([]uint64, 0, len(versionParts))
+	for _, part := range versionParts {
+		if part == "" || strings.IndexFunc(part, func(r rune) bool {
+			return r < '0' || r > '9'
+		}) >= 0 {
+			break
+		}
+		value, err := strconv.ParseUint(part, 10, 64)
+		if err != nil {
+			break
+		}
+		version = append(version, value)
+	}
+	if familyIndex == 0 && len(version) > 1 {
+		lastRaw := versionParts[len(version)-1]
+		if len(lastRaw) == 8 {
+			version = version[:len(version)-1]
+		}
+	}
+	if len(version) == 0 {
+		return nil
+	}
+	return version
+}
+
+func compareNativeFallbackVersions(left, right []uint64) int {
+	limit := min(len(left), len(right))
+	for index := 0; index < limit; index++ {
+		if left[index] < right[index] {
+			return -1
+		}
+		if left[index] > right[index] {
+			return 1
+		}
+	}
+	if len(left) < len(right) {
+		return -1
+	}
+	if len(left) > len(right) {
+		return 1
+	}
+	return 0
+}
+
+func normalizeNativeFallbackDisplayName(displayName string) string {
+	return strings.TrimSuffix(displayName, " (latest)")
+}
+
+func nativeFallbackCatalogDisplayName(catalog *pricing.Snapshot, model string) string {
+	if displayName, ok := catalog.DisplayName(pricing.ProviderAnthropic, model); ok {
+		return normalizeNativeFallbackDisplayName(displayName)
+	}
+	return normalizeNativeFallbackDisplayName(nativeFallbackDisplayName(model))
 }
 
 func nativeFallbackProviderReady(rc resolvedClientConfig) bool {
@@ -646,7 +806,7 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 				"model_routes":       rcEff.ModelRoutes,
 				"families":           families,
 				"model_catalog":      computeModelCatalog(rcEff, catalogSnapshot),
-				"model_picker":       computeModelPickerStatus(c),
+				"model_picker":       computeModelPickerStatus(c, catalogSnapshot),
 				"model_options":      computeClientModelOptions(rcEff, catalogSnapshot),
 				"unmatched_native_model": map[string]any{
 					"configured_target": configuredTargetJSON,
@@ -656,7 +816,11 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 				},
 			}
 			if c.Enabled && rcEff.ProtocolShape == "anthropic" {
-				clientStatus["baseten_model_fallback"] = basetenModelFallbackStatus(rcEff, desiredActiveMismatch)
+				clientStatus["baseten_model_fallback"] = basetenModelFallbackStatus(
+					rcEff,
+					desiredActiveMismatch,
+					catalogSnapshot,
+				)
 			}
 			clients = append(clients, clientStatus)
 		}
@@ -702,7 +866,11 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 				},
 			}
 			if cl.cfg.ProtocolShape == "anthropic" {
-				clientStatus["baseten_model_fallback"] = basetenModelFallbackStatus(cl.cfg, desiredActiveMismatch)
+				clientStatus["baseten_model_fallback"] = basetenModelFallbackStatus(
+					cl.cfg,
+					desiredActiveMismatch,
+					catalogSnapshot,
+				)
 			}
 			clients = append(clients, clientStatus)
 		}

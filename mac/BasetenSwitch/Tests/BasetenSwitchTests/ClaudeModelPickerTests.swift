@@ -81,28 +81,201 @@ private actor PickerMutationRunner: CLIRunning {
         }
         let operationID = argumentValue("--operation-id", request.arguments)
             ?? ""
-        let slug = request.arguments.last ?? ""
+        let removing = request.arguments.contains("remove")
+        let target = request.arguments.last ?? ""
+        let configHash = removing
+            ? "sha256:picker-removed"
+            : "sha256:picker-updated"
         let object: [String: Any] = [
             "ok": true,
             "operation_id": operationID,
-            "operation": "add_claude_picker_model",
+            "operation": removing
+                ? "remove_claude_picker_model"
+                : "add_claude_picker_model",
             "client": "claude-code",
             "key": "model_picker",
-            "requested_target": slug,
-            "desired_config_hash": "sha256:picker-updated",
-            "active_config_hash": "sha256:picker-updated",
-            "active_token": "picker-boot:2",
+            "requested_target": target,
+            "desired_config_hash": configHash,
+            "active_config_hash": configHash,
+            "active_token": removing ? "picker-boot:3" : "picker-boot:2",
             "applied": true,
             "reconciliation_required": false,
             "outcome": "applied",
-            "warnings": [
-                "Claude Code may require reopening /model.",
-            ],
+            "warnings": removing
+                ? ["The saved default still references this alias."]
+                : [],
             "error": NSNull(),
         ]
         let data = try! JSONSerialization.data(withJSONObject: object)
         return CLIExecutionResult(
             status: 0,
+            standardOutput: String(decoding: data, as: UTF8.self),
+            standardError: "",
+            timedOut: false)
+    }
+
+    private func argumentValue(
+        _ flag: String,
+        _ arguments: [String]
+    ) -> String? {
+        guard let index = arguments.firstIndex(of: flag),
+              arguments.indices.contains(index + 1) else { return nil }
+        return arguments[index + 1]
+    }
+}
+
+private actor PickerAmbiguousAliasRunner: CLIRunning {
+    private(set) var requests: [CLIExecutionRequest] = []
+
+    func run(_ request: CLIExecutionRequest) async -> CLIExecutionResult {
+        requests.append(request)
+        if request.arguments.suffix(4).elementsEqual([
+            "claude", "picker", "status", "--json",
+        ]) {
+            return pickerDiagnosticsResult()
+        }
+        if request.arguments.contains("--dry-run") {
+            if let alias = argumentValue("--alias", request.arguments) {
+                return jsonResult(status: 0, object: [
+                    "alias": alias,
+                    "slug": "org/model",
+                    "label": "Model via Baseten",
+                    "description": "Served by Baseten.",
+                ])
+            }
+            return jsonResult(status: 1, object: [
+                "ok": false,
+                "slug": "org/model",
+                "alias_choices": [
+                    [
+                        "alias": "claude-baseten-a",
+                        "slug": "org/model",
+                        "label": "Model via Baseten",
+                        "description": "Served by Baseten.",
+                    ],
+                    [
+                        "alias": "claude-baseten-b",
+                        "slug": "org/model",
+                        "label": "Model via Baseten",
+                        "description": "Served by Baseten.",
+                    ],
+                ],
+                "error": [
+                    "code": "ambiguous_alias",
+                    "message": "select one",
+                    "retryable": false,
+                ],
+            ])
+        }
+
+        let operationID = argumentValue("--operation-id", request.arguments)
+            ?? ""
+        return jsonResult(status: 0, object: [
+            "ok": true,
+            "operation_id": operationID,
+            "operation": "add_claude_picker_model",
+            "client": "claude-code",
+            "key": "model_picker",
+            "requested_target":
+                "org/model via claude-baseten-b",
+            "desired_config_hash": "sha256:picker-ambiguous-updated",
+            "active_config_hash": "sha256:picker-ambiguous-updated",
+            "active_token": "picker-boot:2",
+            "applied": true,
+            "reconciliation_required": false,
+            "outcome": "applied",
+            "warnings": [],
+            "error": NSNull(),
+        ])
+    }
+
+    private func jsonResult(
+        status: Int32,
+        object: [String: Any]
+    ) -> CLIExecutionResult {
+        let data = try! JSONSerialization.data(withJSONObject: object)
+        return CLIExecutionResult(
+            status: status,
+            standardOutput: String(decoding: data, as: UTF8.self),
+            standardError: "",
+            timedOut: false)
+    }
+
+    private func argumentValue(
+        _ flag: String,
+        _ arguments: [String]
+    ) -> String? {
+        guard let index = arguments.firstIndex(of: flag),
+              arguments.indices.contains(index + 1) else { return nil }
+        return arguments[index + 1]
+    }
+}
+
+private actor PickerPreviewFailureRunner: CLIRunning {
+    private let malformed: Bool
+
+    init(malformed: Bool = false) {
+        self.malformed = malformed
+    }
+
+    func run(_ request: CLIExecutionRequest) async -> CLIExecutionResult {
+        guard request.arguments.contains("--dry-run") else {
+            return CLIExecutionResult(
+                status: 1,
+                standardOutput: "",
+                standardError: "unexpected command",
+                timedOut: false)
+        }
+        if malformed {
+            return CLIExecutionResult(
+                status: 1,
+                standardOutput: "not json",
+                standardError: "",
+                timedOut: false)
+        }
+        let data = try! JSONSerialization.data(withJSONObject: [
+            "ok": false,
+            "error": [
+                "code": ClaudeModelPickerContextMinimumFailure.code,
+                "message": "Choose a model with at least 200000 tokens.",
+                "retryable": false,
+            ],
+        ])
+        return CLIExecutionResult(
+            status: 1,
+            standardOutput: String(decoding: data, as: UTF8.self),
+            standardError: "",
+            timedOut: false)
+    }
+}
+
+private actor PickerMutationContextFailureRunner: CLIRunning {
+    func run(_ request: CLIExecutionRequest) async -> CLIExecutionResult {
+        if request.arguments.suffix(4).elementsEqual([
+            "claude", "picker", "status", "--json",
+        ]) {
+            return pickerDiagnosticsResult()
+        }
+        let operationID = argumentValue(
+            "--operation-id",
+            request.arguments) ?? ""
+        let data = try! JSONSerialization.data(withJSONObject: [
+            "ok": false,
+            "operation_id": operationID,
+            "operation": "add_claude_picker_model",
+            "client": "claude-code",
+            "key": "model_picker",
+            "requested_target": "org/b",
+            "applied": false,
+            "reconciliation_required": false,
+            "error": [
+                "code": ClaudeModelPickerContextMinimumFailure.code,
+                "message": "Choose a model with at least 200000 tokens.",
+                "retryable": false,
+            ],
+        ])
+        return CLIExecutionResult(
+            status: 1,
             standardOutput: String(decoding: data, as: UTF8.self),
             standardError: "",
             timedOut: false)
@@ -281,12 +454,14 @@ final class ClaudeModelPickerTests: XCTestCase {
                         "slug": "moonshotai/Kimi-K2.5",
                         "label": "Kimi K2.5 via Baseten",
                         "description": "Served by Baseten.",
+                        "context_tokens": 1_048_576,
                     ],
                     [
                         "alias": "claude-baseten-glm-5-2",
                         "slug": "zai-org/GLM-5.2",
                         "label": "GLM 5.2 via Baseten",
                         "description": "Served by Baseten.",
+                        "context_tokens": 200_000,
                     ],
                 ],
             ],
@@ -296,6 +471,10 @@ final class ClaudeModelPickerTests: XCTestCase {
         XCTAssertEqual(client.modelPicker?.models.map(\.alias), [
             "claude-baseten-kimi-k2-5",
             "claude-baseten-glm-5-2",
+        ])
+        XCTAssertEqual(client.modelPicker?.models.map(\.contextTokens), [
+            1_048_576,
+            200_000,
         ])
         XCTAssertEqual(
             client.modelPicker?.models.last?.label,
@@ -319,6 +498,7 @@ final class ClaudeModelPickerTests: XCTestCase {
           "legacy_discovery_enabled": true,
           "saved_model": "claude-baseten-old",
           "saved_model_unconfigured": true,
+          "saved_model_context_mismatch": true,
           "message": "Configured rows are not all installed."
         }
         """))
@@ -338,6 +518,7 @@ final class ClaudeModelPickerTests: XCTestCase {
         XCTAssertTrue(diagnostics.legacyDiscoveryEnabled)
         XCTAssertEqual(diagnostics.savedModel, "claude-baseten-old")
         XCTAssertTrue(diagnostics.savedModelUnconfigured)
+        XCTAssertTrue(diagnostics.savedModelContextMismatch)
         XCTAssertEqual(
             claudeModelPickerDiagnosticLabel(
                 key: "runtime",
@@ -357,6 +538,29 @@ final class ClaudeModelPickerTests: XCTestCase {
                 allowlistPolicy: "no_known_conflict",
                 knownPolicy: "no_known_conflict"),
             "Runtime unverified")
+    }
+
+    func testRetrySyncRequiresActionableOutOfSyncConfiguredPicker() {
+        XCTAssertTrue(claudeModelPickerCanRetrySync(
+            userFileSync: "out_of_sync",
+            canEditConfiguredRows: true,
+            hasConfiguredPicker: true))
+        XCTAssertFalse(claudeModelPickerCanRetrySync(
+            userFileSync: "synced",
+            canEditConfiguredRows: true,
+            hasConfiguredPicker: true))
+        XCTAssertFalse(claudeModelPickerCanRetrySync(
+            userFileSync: "blocked",
+            canEditConfiguredRows: true,
+            hasConfiguredPicker: true))
+        XCTAssertFalse(claudeModelPickerCanRetrySync(
+            userFileSync: "out_of_sync",
+            canEditConfiguredRows: false,
+            hasConfiguredPicker: true))
+        XCTAssertFalse(claudeModelPickerCanRetrySync(
+            userFileSync: "out_of_sync",
+            canEditConfiguredRows: true,
+            hasConfiguredPicker: false))
     }
 
     func testMalformedPickerProjectionFailsClosedWithoutDroppingRows() throws {
@@ -441,6 +645,34 @@ final class ClaudeModelPickerTests: XCTestCase {
         XCTAssertEqual(preview.description, "Served by Baseten.")
         XCTAssertNil(ClaudeModelPickerAddPreview(
             json: "{\"slug\":\"zai-org/GLM-5.2\"}"))
+    }
+
+    func testExactAddAndRemoveActionsMapDirectlyToMutations() throws {
+        let preview = try XCTUnwrap(ClaudeModelPickerAddPreview(json: """
+        {
+          "alias": "claude-baseten-choice",
+          "slug": "org/model",
+          "label": "Model via Baseten",
+          "description": "Served by Baseten."
+        }
+        """))
+
+        XCTAssertEqual(
+            claudeModelPickerAddMutation(
+                preview: preview,
+                explicitAlias: "claude-baseten-choice"),
+            .add(
+                slug: "org/model",
+                alias: "claude-baseten-choice"))
+        XCTAssertEqual(
+            claudeModelPickerRemoveMutation(alias: "claude-baseten-choice"),
+            .remove(alias: "claude-baseten-choice"))
+    }
+
+    func testRestartNoticeCopyIsExact() {
+        XCTAssertEqual(
+            claudeModelPickerRestartNotice,
+            "Restart Claude Code to see additions or removals.")
     }
 
     func testAddPreviewDecodesStructuredAmbiguousAliasChoices() throws {
@@ -653,7 +885,84 @@ final class ClaudeModelPickerTests: XCTestCase {
     }
 
     @MainActor
-    func testStateDispatchesCASMutationAndConfirmsFreshAdminProjection()
+    func testContextMinimumFailureUsesActionableMessageForAddAndEnablePreviews()
+        async throws {
+        let state = previewFailureState(runner: PickerPreviewFailureRunner())
+
+        await state.refresh()
+        state.ensureModelCatalogLoaded()
+        await state.waitForModelCatalogRefresh()
+
+        let addPreview = await state.previewClaudeModelPickerAdd(slug: "org/b")
+        XCTAssertNil(addPreview)
+        XCTAssertEqual(
+            state.lastError,
+            "Choose a model with at least 200000 tokens.")
+        XCTAssertEqual(
+            claudeModelPickerAddPreviewErrorMessage(state.lastError),
+            "Choose a model with at least 200000 tokens.")
+
+        let enablePreview = await state.previewClaudeModelPickerEnable()
+        XCTAssertNil(enablePreview)
+        XCTAssertEqual(
+            state.lastError,
+            "Choose a model with at least 200000 tokens.")
+        state.stop()
+    }
+
+    func testAddPreviewInlineErrorFallsBackWhenStateHasNoMessage() {
+        XCTAssertEqual(
+            claudeModelPickerAddPreviewErrorMessage(nil),
+            "Switch could not generate an exact preview for this model. No changes were made.")
+        XCTAssertEqual(
+            claudeModelPickerAddPreviewErrorMessage("  \n  "),
+            "Switch could not generate an exact preview for this model. No changes were made.")
+    }
+
+    @MainActor
+    func testMalformedPreviewFailureUsesGenericMessages() async throws {
+        let state = previewFailureState(
+            runner: PickerPreviewFailureRunner(malformed: true))
+
+        await state.refresh()
+        state.ensureModelCatalogLoaded()
+        await state.waitForModelCatalogRefresh()
+
+        let addPreview = await state.previewClaudeModelPickerAdd(slug: "org/b")
+        XCTAssertNil(addPreview)
+        XCTAssertEqual(
+            state.lastError,
+            "Switch could not generate a safe model picker preview.")
+
+        let enablePreview = await state.previewClaudeModelPickerEnable()
+        XCTAssertNil(enablePreview)
+        XCTAssertEqual(
+            state.lastError,
+            "Switch could not generate a safe model picker setup preview.")
+        state.stop()
+    }
+
+    @MainActor
+    func testMutationTimeContextMinimumFailureUsesActionableMessage()
+        async throws {
+        let state = previewFailureState(
+            runner: PickerMutationContextFailureRunner())
+
+        await state.refresh()
+        state.ensureModelCatalogLoaded()
+        await state.waitForModelCatalogRefresh()
+        await state.setClaudeModelPicker(.add(slug: "org/b", alias: nil))
+
+        XCTAssertEqual(
+            state.lastError,
+            "Choose a model with at least 200000 tokens.")
+        XCTAssertNil(state.claudeModelPickerNotice)
+        XCTAssertNil(state.pendingClaudeModelPicker)
+        state.stop()
+    }
+
+    @MainActor
+    func testExactPreviewDispatchesAddThenDirectRemovePreservesWarnings()
         async throws {
         let initial = adminStatus(
             generation: 1,
@@ -668,7 +977,13 @@ final class ClaudeModelPickerTests: XCTestCase {
                 pickerRow(alias: "a", slug: "org/a", label: "A"),
                 pickerRow(alias: "b", slug: "org/b", label: "B"),
             ])
-        let reader = PickerSequencedAdminReader([initial, updated])
+        let removed = adminStatus(
+            generation: 3,
+            hash: "sha256:picker-removed",
+            rows: [
+                pickerRow(alias: "a", slug: "org/a", label: "A"),
+            ])
+        let reader = PickerSequencedAdminReader([initial, updated, removed])
         let runner = PickerMutationRunner()
         let state = BasetenSwitchState(
             variant: AppVariant.resolve(
@@ -733,11 +1048,118 @@ final class ClaudeModelPickerTests: XCTestCase {
         XCTAssertEqual(
             state.clients.first?.modelPicker?.models.map(\.alias),
             ["a", "b"])
-        XCTAssertTrue(
-            state.claudeModelPickerNotice?.hasPrefix("Saved.") == true)
+        XCTAssertEqual(state.claudeModelPickerNotice, "Added to /model.")
+        XCTAssertTrue(state.claudeModelPickerWarnings.isEmpty)
+
+        await state.setClaudeModelPicker(.remove(alias: "b"))
+
+        let requestsAfterRemove = await runner.requests
+        XCTAssertEqual(requestsAfterRemove.count, 6)
+        XCTAssertTrue(requestsAfterRemove[4].arguments.suffix(4)
+            .elementsEqual([
+                "claude", "picker", "remove", "b",
+            ]))
+        XCTAssertTrue(requestsAfterRemove[5].arguments.suffix(4)
+            .elementsEqual([
+                "claude", "picker", "status", "--json",
+            ]))
+        XCTAssertEqual(
+            state.clients.first?.modelPicker?.models.map(\.alias),
+            ["a"])
+        XCTAssertEqual(
+            state.claudeModelPickerNotice,
+            "Saved. The routing alias remains available to existing sessions.")
         XCTAssertEqual(state.claudeModelPickerWarnings, [
-            "Claude Code may require reopening /model.",
+            "The saved default still references this alias.",
         ])
+        state.stop()
+    }
+
+    @MainActor
+    func testAmbiguousAliasSelectionRepeatsPreviewWithAliasThenAdds()
+        async throws {
+        let initial = adminStatus(
+            generation: 1,
+            hash: "sha256:picker-ambiguous-initial",
+            rows: [
+                pickerRow(alias: "existing", slug: "org/existing", label: "Existing"),
+            ])
+        let updated = adminStatus(
+            generation: 2,
+            hash: "sha256:picker-ambiguous-updated",
+            rows: [
+                pickerRow(alias: "existing", slug: "org/existing", label: "Existing"),
+                pickerRow(
+                    alias: "claude-baseten-b",
+                    slug: "org/model",
+                    label: "Model"),
+            ])
+        let reader = PickerSequencedAdminReader([initial, updated])
+        let runner = PickerAmbiguousAliasRunner()
+        let state = BasetenSwitchState(
+            variant: AppVariant.resolve(
+                infoDictionary: [:],
+                homeDirectory: "/tmp/baseten-switch-picker-alias-tests",
+                environment: [
+                    "BASETEN_SWITCH_GATEWAY_BIN": "/usr/bin/true",
+                    "BASETEN_SWITCH_CONFIG_PATH": "/tmp/picker-gateway.yaml",
+                ]),
+            reader: reader,
+            modelCatalogReader: PickerCatalogReader(),
+            cliRunner: runner,
+            loginItemService: PickerLoginItemService(),
+            startPolling: false)
+
+        await state.refresh()
+        state.ensureModelCatalogLoaded()
+        await state.waitForModelCatalogRefresh()
+
+        let ambiguous = await state.previewClaudeModelPickerAdd(
+            slug: "org/model")
+        guard case .aliasChoices(let slug, let choices) = ambiguous else {
+            return XCTFail("expected alias choices")
+        }
+        XCTAssertEqual(slug, "org/model")
+        XCTAssertEqual(choices.map(\.alias), [
+            "claude-baseten-a", "claude-baseten-b",
+        ])
+
+        let exact = await state.previewClaudeModelPickerAdd(
+            slug: slug,
+            alias: choices[1].alias)
+        guard case .preview(let preview, let explicitAlias) = exact else {
+            return XCTFail("expected exact preview after alias choice")
+        }
+        XCTAssertEqual(explicitAlias, "claude-baseten-b")
+        let mutation = claudeModelPickerAddMutation(
+            preview: preview,
+            explicitAlias: explicitAlias)
+        XCTAssertEqual(
+            mutation,
+            .add(slug: "org/model", alias: "claude-baseten-b"))
+
+        await state.setClaudeModelPicker(mutation)
+
+        let requests = await runner.requests
+        XCTAssertEqual(requests.count, 4)
+        XCTAssertEqual(requests[0].arguments.suffix(6), [
+            "claude", "picker", "add", "org/model", "--dry-run", "--json",
+        ])
+        XCTAssertEqual(requests[1].arguments.suffix(8), [
+            "claude", "picker", "add", "org/model", "--dry-run", "--json",
+            "--alias", "claude-baseten-b",
+        ])
+        XCTAssertEqual(requests[2].arguments.suffix(6), [
+            "claude", "picker", "add", "org/model", "--alias",
+            "claude-baseten-b",
+        ])
+        XCTAssertTrue(requests[3].arguments.suffix(4).elementsEqual([
+            "claude", "picker", "status", "--json",
+        ]))
+        XCTAssertEqual(
+            state.clients.first?.modelPicker?.models.map(\.alias),
+            ["existing", "claude-baseten-b"])
+        XCTAssertEqual(state.claudeModelPickerNotice, "Added to /model.")
         state.stop()
     }
 
@@ -795,8 +1217,7 @@ final class ClaudeModelPickerTests: XCTestCase {
         ]))
         XCTAssertFalse(requests.flatMap(\.arguments).contains("reconcile"))
         XCTAssertNil(state.lastError)
-        XCTAssertTrue(
-            state.claudeModelPickerNotice?.hasPrefix("Saved.") == true)
+        XCTAssertEqual(state.claudeModelPickerNotice, "Added to /model.")
         state.stop()
     }
 
@@ -877,6 +1298,31 @@ final class ClaudeModelPickerTests: XCTestCase {
                 ]
             },
         ]))
+    }
+
+    @MainActor
+    private func previewFailureState(
+        runner: any CLIRunning
+    ) -> BasetenSwitchState {
+        let initial = adminStatus(
+            generation: 1,
+            hash: "sha256:picker-preview-failure",
+            rows: [
+                pickerRow(alias: "a", slug: "org/a", label: "A"),
+            ])
+        return BasetenSwitchState(
+            variant: AppVariant.resolve(
+                infoDictionary: [:],
+                homeDirectory: "/tmp/baseten-switch-picker-preview-failure-tests",
+                environment: [
+                    "BASETEN_SWITCH_GATEWAY_BIN": "/usr/bin/true",
+                    "BASETEN_SWITCH_CONFIG_PATH": "/tmp/picker-gateway.yaml",
+                ]),
+            reader: PickerSequencedAdminReader([initial]),
+            modelCatalogReader: PickerCatalogReader(),
+            cliRunner: runner,
+            loginItemService: PickerLoginItemService(),
+            startPolling: false)
     }
 
     private func pickerRow(

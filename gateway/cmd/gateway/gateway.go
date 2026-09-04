@@ -2781,7 +2781,8 @@ func resolveFallbackPlan(cl *clientListener, body []byte) fallbackPlan {
 	if requested == "" {
 		return fallbackPlan{}
 	}
-	_, configuredAlias := cl.cfg.ModelAliases[requested]
+	canonicalRequested := normalizeModelID(requested)
+	_, configuredAlias := cl.cfg.ModelAliases[canonicalRequested]
 	isRawSlug := strings.Contains(requested, "/")
 	if configuredAlias || isRawSlug {
 		// V1 defines a catch-all native target only for Claude-compatible
@@ -2807,7 +2808,7 @@ func resolveFallbackPlan(cl *clientListener, body []byte) fallbackPlan {
 		plan.modelSource = fallbackModelSourceConfigured
 		return plan
 	}
-	if InAliasNamespace(requested) ||
+	if InAliasNamespace(canonicalRequested) ||
 		(cl.cfg.ProtocolShape == "openai" && requested == CodexCompatibilityModel) {
 		return fallbackPlan{}
 	}
@@ -2895,14 +2896,15 @@ func (g *Gateway) resolveExplicitModelAttemptWithSnapshot(
 	if requested == "" {
 		return upstreamAttempt{}, false, nil
 	}
+	canonicalRequested := normalizeModelID(requested)
 	target := ""
 	if strings.Contains(requested, "/") {
-		target = requested
+		target = canonicalRequested
 	} else if cl.cfg.ProtocolShape != "anthropic" {
 		return upstreamAttempt{}, false, nil
-	} else if slug, ok := cl.cfg.ModelAliases[requested]; ok {
+	} else if slug, ok := cl.cfg.ModelAliases[canonicalRequested]; ok {
 		target = slug
-	} else if InAliasNamespace(requested) {
+	} else if InAliasNamespace(canonicalRequested) {
 		return upstreamAttempt{}, false, unknownAliasError(cl.cfg, requested)
 	} else {
 		return upstreamAttempt{}, false, nil
@@ -3079,13 +3081,14 @@ func (g *Gateway) resolveAttemptsLadderWithPlan(
 	plan fallbackPlan,
 ) ([]upstreamAttempt, error) {
 	requested := proxy.RewriteModelInBody(body, "").RequestedModel
+	canonicalRequested := normalizeModelID(requested)
 	if cl.cfg.globalRoutingOff() {
 		// The global routing gate is terminal. Inspect the requested model only
 		// to reject explicit Baseten choices clearly; otherwise build one
 		// protocol-native attempt. Do not consult aliases, pins, subagent
 		// policy, fallback, cooldown, or Baseten credentials.
-		if _, alias := cl.cfg.ModelAliases[requested]; alias ||
-			InAliasNamespace(requested) ||
+		if _, alias := cl.cfg.ModelAliases[canonicalRequested]; alias ||
+			InAliasNamespace(canonicalRequested) ||
 			strings.Contains(requested, "/") ||
 			(cl.cfg.ProtocolShape == "openai" &&
 				requested == CodexCompatibilityModel) {
@@ -4816,18 +4819,19 @@ func discoveryPrefixOK(id string) bool {
 // are deliberately not pin families yet.
 var modelFamilySet = []string{"fable", "opus", "sonnet", "haiku"}
 
-// bracketSuffixRe matches one trailing harness context selection like [1m].
-// Claude Code normally removes this decoration before provider inference. If
-// it reaches the gateway, Baseten captures it separately and strips it from the
-// canonical provider model.
-var bracketSuffixRe = regexp.MustCompile(`\[[^\]]*\]$`)
+const oneMillionContextModelSuffix = "[1m]"
 
-// normalizeModelID strips one trailing bracketed suffix (for example
-// [1m]) from a model id. The suffix is not part of the provider model
-// identity, so routing, catalog lookup, and upstream inference use the
-// normalized form.
+// normalizeModelID strips only Claude Code's documented [1m] context
+// decoration, matched case-insensitively. Other bracketed suffixes are part of
+// the requested identifier and must not be generalized into routing syntax.
 func normalizeModelID(id string) string {
-	return bracketSuffixRe.ReplaceAllString(id, "")
+	if len(id) >= len(oneMillionContextModelSuffix) && strings.EqualFold(
+		id[len(id)-len(oneMillionContextModelSuffix):],
+		oneMillionContextModelSuffix,
+	) {
+		return id[:len(id)-len(oneMillionContextModelSuffix)]
+	}
+	return id
 }
 
 // familyOf returns the first family token from modelFamilySet contained

@@ -3,8 +3,10 @@ package gateway
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/basetenlabs/baseten-switch/gateway/internal/config"
+	"github.com/basetenlabs/baseten-switch/gateway/internal/pricing"
 )
 
 func TestModelPickerAdminStatusPreservesConfiguredOrder(t *testing.T) {
@@ -71,5 +73,44 @@ func TestModelPickerAdminStatusPreservesConfiguredOrder(t *testing.T) {
 		second["label"] != "GLM 5.2 via Baseten" ||
 		second["description"] != "Served by Baseten." {
 		t.Errorf("second picker row = %v", second)
+	}
+}
+
+func TestModelPickerAdminStatusProjectsExactBasetenContextTokens(t *testing.T) {
+	catalog := pricing.New()
+	if err := catalog.ReplaceModelsDev([]byte(`{
+		"anthropic":{"models":{"claude-test":{"id":"claude-test","name":"Claude Test","limit":{"context":200000,"output":1}}}},
+		"openai":{"models":{"gpt-test":{"id":"gpt-test","name":"GPT Test","limit":{"context":200000,"output":1}}}},
+		"baseten":{"models":{
+			"org/one-million":{"id":"org/one-million","name":"One Million","limit":{"context":1048576,"output":1}},
+			"org/two-hundred-thousand":{"id":"org/two-hundred-thousand","name":"Two Hundred Thousand","limit":{"context":200000,"output":1}}
+		}}
+	}`), time.Date(2026, time.September, 3, 0, 0, 0, 0, time.UTC), ""); err != nil {
+		t.Fatal(err)
+	}
+	client := config.Client{
+		ModelAliases: map[string]string{
+			"claude-baseten-million":  "org/one-million",
+			"claude-baseten-standard": "org/two-hundred-thousand",
+			"claude-baseten-unknown":  "org/not-in-models-dev",
+		},
+		ModelPicker: &config.ModelPicker{
+			Enabled: true,
+			Models: []config.ModelPickerModel{
+				{Alias: "claude-baseten-million"},
+				{Alias: "claude-baseten-standard"},
+				{Alias: "claude-baseten-unknown"},
+			},
+		},
+	}
+	status := computeModelPickerStatus(client, catalog.Capture())
+	if got := status.Models[0].ContextTokens; got != 1_048_576 {
+		t.Fatalf("one-million context_tokens = %d", got)
+	}
+	if got := status.Models[1].ContextTokens; got != 200_000 {
+		t.Fatalf("standard context_tokens = %d", got)
+	}
+	if got := status.Models[2].ContextTokens; got != 0 {
+		t.Fatalf("unknown context_tokens = %d, want 0", got)
 	}
 }

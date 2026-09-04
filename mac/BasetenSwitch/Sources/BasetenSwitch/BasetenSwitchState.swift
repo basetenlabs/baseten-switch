@@ -196,9 +196,6 @@ final class BasetenSwitchState: ObservableObject {
         }
         return confirmedFallbackPolicy?.onBaseten5xx ?? false
     }
-    var fallbackPolicyWarningVisible: Bool {
-        displayedFallback429 || displayedFallback5xx
-    }
     var fallbackPolicyUnavailableMessage: String? {
         automaticFallbackUnavailableMessage(
             supportsFallbackPolicy:
@@ -1621,9 +1618,15 @@ final class BasetenSwitchState: ObservableObject {
             json: result.standardOutput,
             status: result.status,
             explicitAlias: alias) else {
-            lastError = result.timedOut
-                ? "The model picker preview timed out."
-                : "Switch could not generate a safe model picker preview."
+            if result.timedOut {
+                lastError = "The model picker preview timed out."
+            } else if let failure = ClaudeModelPickerContextMinimumFailure(
+                json: result.standardOutput,
+                status: result.status) {
+                lastError = failure.message
+            } else {
+                lastError = "Switch could not generate a safe model picker preview."
+            }
             return nil
         }
         if case .preview(let preview, _) = outcome,
@@ -1650,9 +1653,15 @@ final class BasetenSwitchState: ObservableObject {
         guard result.succeeded,
               let preview = ClaudeModelPickerEnablePreview(
                 json: result.standardOutput) else {
-            lastError = result.timedOut
-                ? "The model picker setup preview timed out."
-                : "Switch could not generate a safe model picker setup preview."
+            if result.timedOut {
+                lastError = "The model picker setup preview timed out."
+            } else if let failure = ClaudeModelPickerContextMinimumFailure(
+                json: result.standardOutput,
+                status: result.status) {
+                lastError = failure.message
+            } else {
+                lastError = "Switch could not generate a safe model picker setup preview."
+            }
             return nil
         }
         lastError = nil
@@ -1834,11 +1843,17 @@ final class BasetenSwitchState: ObservableObject {
             claudeModelPickerNotice = claudeModelPickerSuccessMessage(kind)
         } else {
             claudeModelPickerNotice = nil
-            lastError = primaryResult.timedOut
-                ? "The Claude Code model picker change timed out and could not be confirmed."
-                : mutationFailureMessage(
+            if primaryResult.timedOut {
+                lastError = "The Claude Code model picker change timed out and could not be confirmed."
+            } else if let failure = ClaudeModelPickerContextMinimumFailure(
+                json: finalResult.standardOutput,
+                status: finalResult.status) {
+                lastError = failure.message
+            } else {
+                lastError = mutationFailureMessage(
                     receipt,
                     fallback: "The Claude Code model picker change was not confirmed in the active configuration.")
+            }
         }
         clearPending(
             key: "claude-model-picker",

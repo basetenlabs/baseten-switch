@@ -147,6 +147,7 @@ type ModelRecord struct {
 	CanonicalModelID string                                 `json:"canonical_model_id"`
 	DisplayName      string                                 `json:"display_name"`
 	Family           string                                 `json:"family,omitempty"`
+	ReleaseDate      string                                 `json:"release_date,omitempty"`
 	ContextTokens    int64                                  `json:"context_tokens,omitempty"`
 	MaxOutputTokens  int64                                  `json:"max_output_tokens,omitempty"`
 	Availability     ModelAvailability                      `json:"availability"`
@@ -232,6 +233,11 @@ func validateModelRecord(record ModelRecord) error {
 		sanitizeCatalogFamily(record.Family) != record.Family {
 		return fmt.Errorf("family %q is invalid", record.Family)
 	}
+	if record.ReleaseDate != "" {
+		if !validModelReleaseDate(record.ReleaseDate) {
+			return fmt.Errorf("release_date %q is invalid", record.ReleaseDate)
+		}
+	}
 	if record.ContextTokens < 0 || record.MaxOutputTokens < 0 {
 		return fmt.Errorf("model limits must be nonnegative")
 	}
@@ -304,6 +310,16 @@ func validateModelRecord(record ModelRecord) error {
 		}
 	}
 	return nil
+}
+
+func validModelReleaseDate(value string) bool {
+	for _, layout := range []string{time.DateOnly, "2006-01"} {
+		parsed, err := time.Parse(layout, value)
+		if err == nil && parsed.Format(layout) == value {
+			return true
+		}
+	}
+	return false
 }
 
 func validateModelModalities(modalities ModelModalities) error {
@@ -743,6 +759,7 @@ func cloneModelRecord(record ModelRecord) ModelRecord {
 	out.CanonicalModelID = strings.Clone(record.CanonicalModelID)
 	out.DisplayName = strings.Clone(record.DisplayName)
 	out.Family = strings.Clone(record.Family)
+	out.ReleaseDate = strings.Clone(record.ReleaseDate)
 	out.Provenance = cloneProvenance(record.Provenance)
 	if record.Availability.Public != nil {
 		evidence := *record.Availability.Public
@@ -1043,6 +1060,9 @@ func mergeModelRecord(lower, higher ModelRecord) ModelRecord {
 		if preferFamilyMetadata(lower.Provenance, higher.Provenance) {
 			out.Family = higher.Family
 		}
+	}
+	if higher.ReleaseDate != "" {
+		out.ReleaseDate = higher.ReleaseDate
 	}
 	if higher.ContextTokens != 0 && providerMetadataWins {
 		out.ContextTokens = higher.ContextTokens

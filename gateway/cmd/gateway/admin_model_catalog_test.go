@@ -387,6 +387,10 @@ func TestModelCatalogReasoningProjectionUsesExactBasetenRecord(t *testing.T) {
 		t.Fatalf("projected models = %+v", projected)
 	}
 	reasoning := projected[0].Reasoning
+	if projected[0].ContextTokens != 1_048_576 {
+		t.Fatalf("exact context tokens = %d, want 1048576",
+			projected[0].ContextTokens)
+	}
 	if reasoning == nil || !reasoning.Supported ||
 		len(reasoning.Options) != 1 ||
 		reasoning.Options[0].Type != pricing.ReasoningToggle ||
@@ -397,9 +401,8 @@ func TestModelCatalogReasoningProjectionUsesExactBasetenRecord(t *testing.T) {
 		reasoning.Stale {
 		t.Fatalf("live reasoning projection = %+v", reasoning)
 	}
-	if projected[1].Reasoning != nil {
-		t.Fatalf("missing model reasoning = %+v",
-			projected[1].Reasoning)
+	if projected[1].Reasoning != nil || projected[1].ContextTokens != 0 {
+		t.Fatalf("missing model projection = %+v", projected[1])
 	}
 
 	freshAvailabilityAt := capturedAt.Add(72 * time.Hour)
@@ -443,6 +446,41 @@ func TestModelCatalogReasoningProjectionUsesExactBasetenRecord(t *testing.T) {
 	if stale == nil || !stale.Stale ||
 		stale.LoadedFrom != string(pricing.LoadedFromRuntimeCache) {
 		t.Fatalf("stale cache projection = %+v", stale)
+	}
+}
+
+func TestModelContextLimitsIncludeExactModelsAbsentFromLiveAccountCatalog(t *testing.T) {
+	p := pricing.New()
+	capturedAt := time.Date(2026, time.September, 3, 0, 0, 0, 0, time.UTC)
+	if err := p.ReplaceModelsDev(
+		[]byte(publicCatalogGatewayFixture),
+		capturedAt,
+		`"catalog-context-limits"`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.ReplaceProviderAvailability(
+		pricing.ProviderBaseten,
+		[]pricing.AvailabilityModel{{
+			CanonicalModelID: "other-org/Live-Only",
+			DisplayName:      "Live Only",
+		}},
+		basetenModelAPIsAvailabilitySource,
+		capturedAt.Add(time.Minute),
+		"sha256:live-only",
+	); err != nil {
+		t.Fatal(err)
+	}
+	limits := modelContextLimitsFromSnapshot(p.Capture())
+	var found *modelContextLimit
+	for i := range limits {
+		if limits[i].Slug == "zai-org/GLM-Test" {
+			found = &limits[i]
+			break
+		}
+	}
+	if found == nil || found.ContextTokens != 1_048_576 {
+		t.Fatalf("exact context limits = %+v, want absent-live GLM-Test at 1048576", limits)
 	}
 }
 

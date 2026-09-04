@@ -999,16 +999,6 @@ private struct RoutingOverviewView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                if state.fallbackPolicyWarningVisible {
-                    Label(
-                        "Cross-provider fallback replays the current conversation. This includes models selected from /model; provider-specific reasoning history may be rejected during tool-use continuation.",
-                        systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .accessibilityIdentifier(
-                            "fallback-policy-provider-affinity-warning")
-                }
                 if state.fallbackPolicyUnavailableMessage == nil,
                    let reason = state.fallbackPolicyMutationDisabledReason {
                     Text(reason)

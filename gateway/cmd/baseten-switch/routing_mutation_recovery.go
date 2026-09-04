@@ -828,6 +828,8 @@ func reviewedMutationMessage(code string) string {
 		return "the routing result could not be confirmed; recovery state was preserved"
 	case "reasoning_preflight_failed":
 		return "the reasoning policy could not be validated against the running router"
+	case claudePickerContextMinimumErrorCode:
+		return "the selected Baseten model has a known context window below Claude Code's 200000-token model picker minimum; choose a model with at least 200000 tokens"
 	case "fingerprint_failed":
 		return "the routing request could not be identified safely"
 	case "cleanup_predicate_changed":

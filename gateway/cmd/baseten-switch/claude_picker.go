@@ -26,6 +26,10 @@ import (
 
 const claudeModelPickerMinVersion = "2.1.243"
 const claudeModelPickerVersionOutputLimit = 4096
+const claudeStandardContextTokens int64 = 200_000
+const claudeOneMillionContextTokens int64 = 1_000_000
+const claudeOneMillionContextSuffix = "[1m]"
+const claudePickerContextMinimumErrorCode = "context_window_below_claude_picker_minimum"
 
 type claudeModelPickerBackup struct {
 	OriginalMissing          bool              `json:"original_missing,omitempty"`
@@ -36,21 +40,22 @@ type claudeModelPickerBackup struct {
 }
 
 type claudePickerStatus struct {
-	Enabled                bool   `json:"enabled"`
-	Configuration          string `json:"configuration"`
-	UserFileSync           string `json:"user_file_sync"`
-	KnownPolicy            string `json:"known_policy"`
-	AllowlistPolicy        string `json:"allowlist_policy"`
-	ManagedPolicy          string `json:"managed_policy"`
-	ReplacementMode        string `json:"replacement_mode"`
-	RuntimeVerification    string `json:"runtime_verification"`
-	ConfiguredRows         int    `json:"configured_rows"`
-	InstalledRows          int    `json:"installed_rows"`
-	SettingsPath           string `json:"settings_path"`
-	LegacyDiscoveryEnabled bool   `json:"legacy_discovery_enabled"`
-	SavedModel             string `json:"saved_model,omitempty"`
-	SavedModelUnconfigured bool   `json:"saved_model_unconfigured,omitempty"`
-	Message                string `json:"message,omitempty"`
+	Enabled                   bool   `json:"enabled"`
+	Configuration             string `json:"configuration"`
+	UserFileSync              string `json:"user_file_sync"`
+	KnownPolicy               string `json:"known_policy"`
+	AllowlistPolicy           string `json:"allowlist_policy"`
+	ManagedPolicy             string `json:"managed_policy"`
+	ReplacementMode           string `json:"replacement_mode"`
+	RuntimeVerification       string `json:"runtime_verification"`
+	ConfiguredRows            int    `json:"configured_rows"`
+	InstalledRows             int    `json:"installed_rows"`
+	SettingsPath              string `json:"settings_path"`
+	LegacyDiscoveryEnabled    bool   `json:"legacy_discovery_enabled"`
+	SavedModel                string `json:"saved_model,omitempty"`
+	SavedModelUnconfigured    bool   `json:"saved_model_unconfigured,omitempty"`
+	SavedModelContextMismatch bool   `json:"saved_model_context_mismatch,omitempty"`
+	Message                   string `json:"message,omitempty"`
 }
 
 type pickerReceiptState struct {
@@ -58,6 +63,11 @@ type pickerReceiptState struct {
 	previousToken string
 	adminBefore   *routingAdminStatus
 	activationErr error
+}
+
+type pickerConfigProjection struct {
+	raw           []byte
+	contextTokens map[string]int64
 }
 
 type claudePickerPreview struct {
@@ -80,6 +90,35 @@ type claudePickerAliasAmbiguity struct {
 
 type pickerManualResolutionError struct{ message string }
 
+type pickerContextMinimumError struct {
+	slug   string
+	tokens int64
+}
+
+func (e *pickerContextMinimumError) Error() string {
+	return fmt.Sprintf(
+		"Baseten model %q has a known context limit of %d tokens, below Claude Code's 200000-token model picker minimum; remove it from model_picker or select a model with at least 200000 tokens",
+		e.slug,
+		e.tokens,
+	)
+}
+
+func isPickerContextMinimum(err error) bool {
+	var target *pickerContextMinimumError
+	return errors.As(err, &target)
+}
+
+type claudePickerCatalogResponse struct {
+	State         string                     `json:"state"`
+	Models        []claudePickerCatalogModel `json:"models"`
+	ContextLimits []claudePickerCatalogModel `json:"context_limits"`
+}
+
+type claudePickerCatalogModel struct {
+	Slug          string `json:"slug"`
+	ContextTokens int64  `json:"context_tokens"`
+}
+
 func (e *pickerManualResolutionError) Error() string { return e.message }
 
 func manualPickerErrorf(format string, args ...any) error {
@@ -95,6 +134,11 @@ var (
 	claudePickerLookPath       = exec.LookPath
 	claudePickerCommand        = boundedClaudePickerCommand
 	claudePickerVersionTimeout = 2 * time.Second
+	fetchClaudePickerCatalog   = func(adminAddr string) (claudePickerCatalogResponse, error) {
+		var response claudePickerCatalogResponse
+		err := getJSON(adminAddr, "/v1/admin/model-catalog", &response)
+		return response, err
+	}
 )
 
 type boundedOutputBuffer struct {
@@ -157,20 +201,187 @@ func (a *claudeAdapter) reloadModelPicker() error {
 	return nil
 }
 
-func claudePickerRows(picker *config.ModelPicker, aliases map[string]string) []any {
+func claudePickerRows(
+	picker *config.ModelPicker,
+	aliases map[string]string,
+	contextTokens map[string]int64,
+	preservedOneMillionAliases map[string]bool,
+) ([]any, error) {
 	if picker == nil || !picker.Enabled {
-		return nil
+		return nil, nil
 	}
 	rows := make([]any, 0, len(picker.Models))
+	seenAliases := make(map[string]struct{}, len(picker.Models))
 	for _, model := range picker.Models {
+		if _, duplicate := seenAliases[model.Alias]; duplicate {
+			return nil, fmt.Errorf(
+				"model picker alias %q is duplicated",
+				model.Alias,
+			)
+		}
+		seenAliases[model.Alias] = struct{}{}
 		slug := aliases[model.Alias]
 		label := modelmeta.ResolveBaseten(slug).DisplayName + " via Baseten"
+		modelID := model.Alias
+		// A non-nil map is an authoritative projection. Missing and zero
+		// exact-model values are conservative. A nil map means the trusted
+		// projection is unavailable, so retain a still-owned prior suffix.
+		knownTokens, known := contextTokens[slug]
+		if contextTokens != nil && known && knownTokens > 0 &&
+			knownTokens < claudeStandardContextTokens {
+			return nil, &pickerContextMinimumError{
+				slug: slug, tokens: knownTokens,
+			}
+		}
+		useOneMillion := contextTokens != nil && known &&
+			knownTokens >= claudeOneMillionContextTokens
+		if contextTokens == nil && preservedOneMillionAliases[model.Alias] {
+			useOneMillion = true
+		}
+		if useOneMillion {
+			modelID += claudeOneMillionContextSuffix
+		}
 		row := map[string]any{
-			"model": model.Alias, "label": label, "description": "Served by Baseten.",
+			"model": modelID, "label": label, "description": "Served by Baseten.",
 		}
 		rows = append(rows, row)
 	}
-	return rows
+	return rows, nil
+}
+
+func copyPickerAliases(aliases map[string]string) map[string]string {
+	copy := make(map[string]string, len(aliases))
+	for alias, slug := range aliases {
+		copy[alias] = slug
+	}
+	return copy
+}
+
+func (a *claudeAdapter) preflightPickerContext(
+	picker *config.ModelPicker,
+	aliases map[string]string,
+) error {
+	response, err := fetchClaudePickerCatalog(
+		envDefault("BASETEN_SWITCH_ADMIN_ADDR", gateway.DefaultAdminAddr),
+	)
+	if err != nil {
+		// Without a trusted local projection, new rows remain in Claude Code's
+		// conservative 200K context bucket. Sync preserves any still-owned
+		// [1m] row separately when the whole projection is unavailable.
+		return nil
+	}
+	models := response.ContextLimits
+	if models == nil {
+		if response.State != "ready" {
+			return nil
+		}
+		// Compatibility with a running gateway that predates the complete
+		// exact-context projection. Its live account rows are still trusted,
+		// but cannot prove anything about configured models absent from them.
+		models = response.Models
+	}
+	contextTokens := make(map[string]int64, len(models))
+	for _, model := range models {
+		if model.Slug != "" {
+			contextTokens[model.Slug] = model.ContextTokens
+		}
+	}
+	_, err = claudePickerRows(picker, aliases, contextTokens, nil)
+	return err
+}
+
+func normalizeClaudePickerModelID(modelID string) (string, bool) {
+	if len(modelID) >= len(claudeOneMillionContextSuffix) &&
+		strings.EqualFold(
+			modelID[len(modelID)-len(claudeOneMillionContextSuffix):],
+			claudeOneMillionContextSuffix,
+		) {
+		return modelID[:len(modelID)-len(claudeOneMillionContextSuffix)], true
+	}
+	return modelID, false
+}
+
+func desiredPickerHasOneMillionAlias(rows []any, alias string) bool {
+	for _, row := range rows {
+		base, oneMillion := normalizeClaudePickerModelID(rowModel(row))
+		if oneMillion && base == alias {
+			return true
+		}
+	}
+	return false
+}
+
+func ownedOneMillionPickerAliases(
+	root map[string]any,
+	backup *claudeModelPickerBackup,
+) map[string]bool {
+	if backup == nil || backup.WrittenPickerFingerprint == "" {
+		return nil
+	}
+	obj, exists, err := modelPickerObject(root)
+	if err != nil || !exists {
+		return nil
+	}
+	rows, err := modelPickerOptions(obj)
+	if err != nil ||
+		!anchoredRowsEqual(rows, backup.WrittenRows, backup.WrittenAnchor) {
+		return nil
+	}
+	preserved := map[string]bool{}
+	for _, raw := range backup.WrittenRows {
+		var row map[string]any
+		if json.Unmarshal(raw, &row) != nil {
+			return nil
+		}
+		modelID, _ := row["model"].(string)
+		if alias, oneMillion := normalizeClaudePickerModelID(modelID); oneMillion {
+			if alias != "" {
+				preserved[alias] = true
+			}
+		}
+	}
+	return preserved
+}
+
+func pickerContextTokensFromAdmin(
+	status routingAdminStatus,
+	clientName string,
+) map[string]int64 {
+	for _, client := range status.Clients {
+		if client.Name != clientName || client.ModelPicker == nil {
+			continue
+		}
+		contextTokens := make(map[string]int64, len(client.ModelPicker.Models))
+		for _, model := range client.ModelPicker.Models {
+			if model.Slug != "" {
+				contextTokens[model.Slug] = model.ContextTokens
+			}
+		}
+		return contextTokens
+	}
+	return nil
+}
+
+func (a *claudeAdapter) activePickerContextTokens() map[string]int64 {
+	if state, _ := classifyPidfile(gatewayPidfilePath()); state != pidfileAlive {
+		return nil
+	}
+	raw, _, err := readExactConfig(a.configPath)
+	if err != nil {
+		return nil
+	}
+	status, err := fetchRoutingAdminStatus(
+		envDefault("BASETEN_SWITCH_ADMIN_ADDR", gateway.DefaultAdminAddr),
+	)
+	if err != nil ||
+		validateMutationAdminStatus(
+			status,
+			a.configPath,
+			exactConfigHash(raw),
+		) != nil {
+		return nil
+	}
+	return pickerContextTokensFromAdmin(status, a.clientName)
 }
 
 func canonicalJSON(v any) (json.RawMessage, error) {
@@ -450,35 +661,50 @@ func restorePickerBackupPreimage(path string, pre pickerBackupPreimage) error {
 }
 
 func (a *claudeAdapter) syncModelPicker(requireVersion bool, allowReplacementConversion ...bool) error {
-	projectionRaw, err := func() ([]byte, error) {
+	projection, err := func() (pickerConfigProjection, error) {
 		configLock, lockErr := acquireConfigMutationLock(a.configPath)
 		if lockErr != nil {
-			return nil, fmt.Errorf("lock picker config projection: %w", lockErr)
+			return pickerConfigProjection{}, fmt.Errorf("lock picker config projection: %w", lockErr)
 		}
 		defer configLock.close()
 		if recoverErr := recoverInterruptedExactConfigCommit(a.configPath); recoverErr != nil {
-			return nil, fmt.Errorf("recover picker config projection: %w", recoverErr)
+			return pickerConfigProjection{}, fmt.Errorf("recover picker config projection: %w", recoverErr)
 		}
 		raw, _, readErr := readExactConfig(a.configPath)
 		if readErr != nil {
-			return nil, readErr
+			return pickerConfigProjection{}, readErr
 		}
 		if reloadErr := a.reloadModelPicker(); reloadErr != nil {
-			return nil, reloadErr
+			return pickerConfigProjection{}, reloadErr
 		}
 		if current, _, readErr := readExactConfig(a.configPath); readErr != nil || !bytes.Equal(current, raw) {
-			return nil, fmt.Errorf("picker config changed while loading its settings projection; retry sync")
+			return pickerConfigProjection{}, fmt.Errorf("picker config changed while loading its settings projection; retry sync")
 		}
-		if state, _ := classifyPidfile(gatewayPidfilePath()); state == pidfileAlive {
-			admin, adminErr := fetchRoutingAdminStatus(envDefault("BASETEN_SWITCH_ADMIN_ADDR", gateway.DefaultAdminAddr))
-			if adminErr != nil {
-				return nil, fmt.Errorf("verify active picker config: %w", adminErr)
+		result := pickerConfigProjection{raw: raw}
+		state, _ := classifyPidfile(gatewayPidfilePath())
+		admin, adminErr := fetchRoutingAdminStatus(
+			envDefault("BASETEN_SWITCH_ADMIN_ADDR", gateway.DefaultAdminAddr),
+		)
+		if adminErr != nil && state == pidfileAlive {
+			return pickerConfigProjection{}, fmt.Errorf("verify active picker config: %w", adminErr)
+		}
+		if adminErr == nil {
+			activeErr := validateMutationAdminStatus(
+				admin,
+				a.configPath,
+				exactConfigHash(raw),
+			)
+			if activeErr != nil && state == pidfileAlive {
+				return pickerConfigProjection{}, fmt.Errorf("picker config is not active: %w", activeErr)
 			}
-			if activeErr := validateMutationAdminStatus(admin, a.configPath, exactConfigHash(raw)); activeErr != nil {
-				return nil, fmt.Errorf("picker config is not active: %w", activeErr)
+			if activeErr == nil {
+				result.contextTokens = pickerContextTokensFromAdmin(
+					admin,
+					a.clientName,
+				)
 			}
 		}
-		return raw, nil
+		return result, nil
 	}()
 	if err != nil {
 		return err
@@ -488,7 +714,7 @@ func (a *claudeAdapter) syncModelPicker(requireVersion bool, allowReplacementCon
 		return err
 	}
 	defer lock.close()
-	if current, _, readErr := readExactConfig(a.configPath); readErr != nil || !bytes.Equal(current, projectionRaw) {
+	if current, _, readErr := readExactConfig(a.configPath); readErr != nil || !bytes.Equal(current, projection.raw) {
 		return fmt.Errorf("picker config changed before settings lock acquisition; retry sync")
 	}
 	if a.modelPickerEnabled() && requireVersion {
@@ -529,7 +755,15 @@ func (a *claudeAdapter) syncModelPicker(requireVersion bool, allowReplacementCon
 		}
 		recordClaudeBackupFile(bak, snap)
 	}
-	desired := claudePickerRows(a.modelPicker, a.modelAliases)
+	desired, err := claudePickerRows(
+		a.modelPicker,
+		a.modelAliases,
+		projection.contextTokens,
+		ownedOneMillionPickerAliases(root, bak.ModelPicker),
+	)
+	if err != nil {
+		return fmt.Errorf("project Claude model picker: %w", err)
+	}
 	allowConversion := len(allowReplacementConversion) > 0 && allowReplacementConversion[0]
 	pickerBackup, changed, err := installModelPickerWithOptions(root, desired, bak.ModelPicker, allowConversion)
 	if err != nil {
@@ -538,7 +772,7 @@ func (a *claudeAdapter) syncModelPicker(requireVersion bool, allowReplacementCon
 	bak.ModelPicker = pickerBackup
 	projectionCurrent := func() bool {
 		current, _, readErr := readExactConfig(a.configPath)
-		return readErr == nil && bytes.Equal(current, projectionRaw)
+		return readErr == nil && bytes.Equal(current, projection.raw)
 	}
 	if !projectionCurrent() {
 		return fmt.Errorf("picker config changed before staging its settings projection; retry sync")
@@ -714,7 +948,8 @@ func (a *claudeAdapter) currentPickerStatus() (claudePickerStatus, error) {
 	}
 	if saved, ok := root["model"].(string); ok {
 		status.SavedModel = saved
-		if _, aliasExists := a.modelAliases[saved]; aliasExists && pickerModelIndex(a.modelPickerModels(), saved) < 0 {
+		savedAlias, _ := normalizeClaudePickerModelID(saved)
+		if _, aliasExists := a.modelAliases[savedAlias]; aliasExists && pickerModelIndex(a.modelPickerModels(), savedAlias) < 0 {
 			status.SavedModelUnconfigured = true
 		}
 	}
@@ -776,7 +1011,27 @@ func (a *claudeAdapter) currentPickerStatus() (claudePickerStatus, error) {
 			return status, nil
 		}
 		if status.Enabled && status.UserFileSync != "blocked" && bak != nil && bak.ModelPicker != nil && bak.ModelPicker.WrittenPickerFingerprint != "" {
-			want, _ := canonicalRows(claudePickerRows(a.modelPicker, a.modelAliases))
+			contextTokens := a.activePickerContextTokens()
+			desired, projectionErr := claudePickerRows(
+				a.modelPicker,
+				a.modelAliases,
+				contextTokens,
+				ownedOneMillionPickerAliases(root, bak.ModelPicker),
+			)
+			if projectionErr != nil {
+				status.UserFileSync = "blocked"
+				status.Message = projectionErr.Error()
+				return status, nil
+			}
+			savedAlias, savedOneMillion := normalizeClaudePickerModelID(
+				status.SavedModel,
+			)
+			if savedOneMillion &&
+				pickerModelIndex(a.modelPickerModels(), savedAlias) >= 0 &&
+				!desiredPickerHasOneMillionAlias(desired, savedAlias) {
+				status.SavedModelContextMismatch = true
+			}
+			want, _ := canonicalRows(desired)
 			if anchoredRowsEqual(rows, want, bak.ModelPicker.WrittenAnchor) && rawRowsEqual(want, bak.ModelPicker.WrittenRows) {
 				status.UserFileSync = "synced"
 			}
@@ -848,8 +1103,11 @@ func (a *claudeAdapter) pickerRemovalWarnings(alias string) []string {
 		return nil
 	}
 	var warnings []string
-	if saved, ok := root["model"].(string); ok && saved == alias {
-		warnings = append(warnings, fmt.Sprintf("saved Claude default model %q still points at the removed alias; select a new default in /model", alias))
+	if saved, ok := root["model"].(string); ok {
+		savedAlias, _ := normalizeClaudePickerModelID(saved)
+		if savedAlias == alias {
+			warnings = append(warnings, fmt.Sprintf("saved Claude default model %q still points at the removed alias; select a new default in /model", alias))
+		}
 	}
 	if effectiveLegacyDiscovery(root) {
 		warnings = append(warnings, fmt.Sprintf("legacy gateway model discovery is enabled, so removing %q from modelPicker may not hide it from /model", alias))
@@ -885,6 +1143,30 @@ func (a *claudeAdapter) mutatePickerConfig(args []string, opts mutationOptions, 
 			fmt.Fprintln(a.out, "claude picker enable --dry-run requires --json")
 			return 2
 		}
+		proposed := p
+		proposed.Enabled = true
+		if pickerWasAbsent {
+			for _, alias := range sortedAliasIDs(a.modelAliases) {
+				proposed.Models = append(
+					proposed.Models,
+					config.ModelPickerModel{Alias: alias},
+				)
+			}
+		}
+		if err := a.preflightPickerContext(
+			&proposed,
+			copyPickerAliases(a.modelAliases),
+		); err != nil {
+			code := "config_validation_failed"
+			if isPickerContextMinimum(err) {
+				code = claudePickerContextMinimumErrorCode
+			}
+			return failMutation(opts, stdout, mutationResult{
+				Operation: operation, Client: a.clientName,
+				Key: "model_picker", ConfigPath: a.configPath,
+				Requested: true,
+			}, code, err.Error(), false, 1)
+		}
 		preview := claudePickerEnablePreview{Models: []claudePickerPreview{}}
 		for _, alias := range sortedAliasIDs(a.modelAliases) {
 			slug := a.modelAliases[alias]
@@ -916,6 +1198,28 @@ func (a *claudeAdapter) mutatePickerConfig(args []string, opts mutationOptions, 
 		if err != nil {
 			fmt.Fprintf(a.out, "claude picker add preview: %v\n", err)
 			return 1
+		}
+		proposed := p
+		proposed.Enabled = true
+		proposed.Models = append(
+			proposed.Models,
+			config.ModelPickerModel{Alias: preview.Alias},
+		)
+		proposedAliases := copyPickerAliases(a.modelAliases)
+		proposedAliases[preview.Alias] = preview.Slug
+		if err := a.preflightPickerContext(
+			&proposed,
+			proposedAliases,
+		); err != nil {
+			code := "config_validation_failed"
+			if isPickerContextMinimum(err) {
+				code = claudePickerContextMinimumErrorCode
+			}
+			return failMutation(opts, stdout, mutationResult{
+				Operation: operation, RequestedTarget: args[1],
+				Client: a.clientName, Key: "model_picker",
+				ConfigPath: a.configPath, Requested: true,
+			}, code, err.Error(), false, 1)
 		}
 		_ = json.NewEncoder(stdout).Encode(preview)
 		return 0
@@ -998,6 +1302,23 @@ func (a *claudeAdapter) mutatePickerConfig(args []string, opts mutationOptions, 
 	}
 	if verb == "add" && opts.PickerAlias != "" {
 		requestedTarget += " via " + opts.PickerAlias
+	}
+	if (verb == "enable" || verb == "add" || verb == "move") && p.Enabled {
+		proposedAliases := copyPickerAliases(a.modelAliases)
+		for alias, slug := range aliasesToAdd {
+			proposedAliases[alias] = slug
+		}
+		if err := a.preflightPickerContext(&p, proposedAliases); err != nil {
+			code := "config_validation_failed"
+			if isPickerContextMinimum(err) {
+				code = claudePickerContextMinimumErrorCode
+			}
+			return failMutation(opts, stdout, mutationResult{
+				Operation: operation, RequestedTarget: requestedTarget,
+				Client: a.clientName, Key: "model_picker",
+				ConfigPath: a.configPath, Requested: true,
+			}, code, err.Error(), false, 1)
+		}
 	}
 
 	lock, err := acquireConfigMutationLock(a.configPath)
@@ -1396,6 +1717,7 @@ func aliasesForSlug(slug string, aliases map[string]string) []string {
 }
 
 func pickerModelIndex(models []config.ModelPickerModel, alias string) int {
+	alias, _ = normalizeClaudePickerModelID(alias)
 	for i := range models {
 		if models[i].Alias == alias {
 			return i
@@ -1455,6 +1777,9 @@ func doctorModelPickerCheck(add addCheck, a *claudeAdapter) {
 	}
 	if status.SavedModelUnconfigured {
 		warnings = append(warnings, fmt.Sprintf("saved default %q is no longer configured in model_picker", status.SavedModel))
+	}
+	if status.SavedModelContextMismatch {
+		warnings = append(warnings, fmt.Sprintf("saved default %q still requests 1M context, but its configured picker row now uses the 200K context bucket", status.SavedModel))
 	}
 	if len(warnings) > 0 {
 		add("claude", "model_picker", docWarn, baseFinding+"; "+strings.Join(warnings, "; "), "review Claude user settings and reopen /model")

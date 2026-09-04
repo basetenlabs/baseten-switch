@@ -37,14 +37,21 @@ type modelCatalogResponse struct {
 	State           string              `json:"state"`
 	SignedOutReason string              `json:"signed_out_reason"`
 	Models          []modelCatalogModel `json:"models"`
+	ContextLimits   []modelContextLimit `json:"context_limits"`
 	FetchedAt       string              `json:"fetched_at"`
 	Error           string              `json:"error"`
 }
 
+type modelContextLimit struct {
+	Slug          string `json:"slug"`
+	ContextTokens int64  `json:"context_tokens"`
+}
+
 type modelCatalogModel struct {
-	Slug        string                 `json:"slug"`
-	DisplayName string                 `json:"display_name"`
-	Reasoning   *modelCatalogReasoning `json:"reasoning,omitempty"`
+	Slug          string                 `json:"slug"`
+	DisplayName   string                 `json:"display_name"`
+	ContextTokens int64                  `json:"context_tokens"`
+	Reasoning     *modelCatalogReasoning `json:"reasoning,omitempty"`
 }
 
 type modelCatalogReasoning struct {
@@ -62,6 +69,7 @@ func (g *Gateway) adminModelCatalog(w http.ResponseWriter, r *http.Request) {
 		g.reject(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	contextLimits := modelContextLimitsFromSnapshot(g.pricing.Capture())
 
 	// The live catalog belongs to the selected Baseten CLI profile. The
 	// environment fallback is intentionally excluded from this account view.
@@ -71,6 +79,7 @@ func (g *Gateway) adminModelCatalog(w http.ResponseWriter, r *http.Request) {
 			State:           "signed_out",
 			SignedOutReason: modelCatalogSignedOutReasonNotSignedIn,
 			Models:          []modelCatalogModel{},
+			ContextLimits:   contextLimits,
 		})
 		return
 	}
@@ -88,40 +97,59 @@ func (g *Gateway) adminModelCatalog(w http.ResponseWriter, r *http.Request) {
 				State:           "signed_out",
 				SignedOutReason: reason,
 				Models:          []modelCatalogModel{},
+				ContextLimits:   contextLimits,
 			})
 			return
 		}
 		if errors.Is(err, errModelCatalogForbidden) {
 			writeModelCatalogJSON(w, r.Method, modelCatalogResponse{
-				State:  "error",
-				Models: []modelCatalogModel{},
-				Error:  "The selected Baseten credential does not have access to the model catalog",
+				State:         "error",
+				Models:        []modelCatalogModel{},
+				ContextLimits: contextLimits,
+				Error:         "The selected Baseten credential does not have access to the model catalog",
 			})
 			return
 		}
 		writeModelCatalogJSON(w, r.Method, modelCatalogResponse{
-			State:  "error",
-			Models: []modelCatalogModel{},
-			Error:  modelCatalogPublicError(err),
+			State:         "error",
+			Models:        []modelCatalogModel{},
+			ContextLimits: contextLimits,
+			Error:         modelCatalogPublicError(err),
 		})
 		return
 	}
 	fetchedAt := modelCatalogNow().UTC()
 	if err := g.publishBasetenModelAPIAvailability(models, fetchedAt); err != nil {
 		writeModelCatalogJSON(w, r.Method, modelCatalogResponse{
-			State:  "error",
-			Models: []modelCatalogModel{},
-			Error:  modelCatalogPublicError(err),
+			State:         "error",
+			Models:        []modelCatalogModel{},
+			ContextLimits: contextLimits,
+			Error:         modelCatalogPublicError(err),
 		})
 		return
 	}
 	snapshot := g.pricing.Capture()
 	models = modelCatalogModelsFromSnapshot(snapshot, models)
 	writeModelCatalogJSON(w, r.Method, modelCatalogResponse{
-		State:     "ready",
-		Models:    models,
-		FetchedAt: fetchedAt.Format(time.RFC3339),
+		State:         "ready",
+		Models:        models,
+		ContextLimits: modelContextLimitsFromSnapshot(snapshot),
+		FetchedAt:     fetchedAt.Format(time.RFC3339),
 	})
+}
+
+func modelContextLimitsFromSnapshot(
+	snapshot *pricing.Snapshot,
+) []modelContextLimit {
+	records := snapshot.Models(pricing.ProviderBaseten)
+	limits := make([]modelContextLimit, 0, len(records))
+	for _, record := range records {
+		limits = append(limits, modelContextLimit{
+			Slug:          record.CanonicalModelID,
+			ContextTokens: record.ContextTokens,
+		})
+	}
+	return limits
 }
 
 func (g *Gateway) publishBasetenModelAPIAvailability(
@@ -174,9 +202,17 @@ func modelCatalogModelsFromSnapshot(
 	resolved := make([]modelCatalogModel, len(models))
 	now := modelCatalogNow().UTC()
 	for i, model := range models {
+		var contextTokens int64
+		if record, ok := snapshot.Model(
+			pricing.ProviderBaseten,
+			model.Slug,
+		); ok {
+			contextTokens = record.ContextTokens
+		}
 		resolved[i] = modelCatalogModel{
-			Slug:        model.Slug,
-			DisplayName: basetenModelDisplayName(snapshot, model.Slug),
+			Slug:          model.Slug,
+			DisplayName:   basetenModelDisplayName(snapshot, model.Slug),
+			ContextTokens: contextTokens,
 			Reasoning: modelCatalogReasoningFromSnapshot(
 				snapshot,
 				model.Slug,

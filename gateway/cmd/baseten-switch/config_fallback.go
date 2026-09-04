@@ -20,7 +20,8 @@ const configFallbackUsage = `usage:
   baseten-switch config fallback model <client> <native-model> [mutation options]`
 
 type fallbackAdminClient struct {
-	Name                 string `json:"name"`
+	Name                 string                  `json:"name"`
+	ModelPicker          *modelPickerAdminStatus `json:"model_picker"`
 	BasetenModelFallback struct {
 		ConfiguredModel string  `json:"configured_model"`
 		ResolvedModel   string  `json:"resolved_model"`
@@ -29,6 +30,17 @@ type fallbackAdminClient struct {
 		Ready           bool    `json:"ready"`
 		Reason          *string `json:"reason"`
 	} `json:"baseten_model_fallback"`
+}
+
+type modelPickerAdminStatus struct {
+	Enabled bool                          `json:"enabled"`
+	Models  []modelPickerAdminStatusModel `json:"models"`
+}
+
+type modelPickerAdminStatusModel struct {
+	Alias         string `json:"alias"`
+	Slug          string `json:"slug"`
+	ContextTokens int64  `json:"context_tokens"`
 }
 
 type fallbackReadStatus struct {
@@ -187,10 +199,6 @@ func printFallbackPolicyStatus(out io.Writer, status fallbackReadStatus, active 
 		fmt.Fprintf(out, "%-13s   Baseten-specific models   %-8s   %s\n", client.Name, label, model)
 	}
 	fmt.Fprintln(out, "\nNative-origin requests preserve the exact model requested by the client.")
-	if status.Configured.OnBaseten429 || status.Configured.OnBaseten5xx ||
-		(status.Active != nil && (status.Active.OnBaseten429 || status.Active.OnBaseten5xx)) {
-		fmt.Fprintln(out, "\nWarning: cross-provider fallback replays the current conversation. Provider-specific reasoning history may be rejected by the native provider.")
-	}
 }
 
 func printFallbackPolicyTrigger(
@@ -237,9 +245,6 @@ func mutateFallbackPolicy(trigger string, enabled bool, opts mutationOptions, ou
 		Apply:        func(path string) error { return config.SetFallbackPolicyTrigger(path, trigger, enabled) },
 		HumanSuccess: "automatic fallback for HTTP " + trigger + " " + target,
 	}
-	if enabled {
-		spec.StructuredWarnings = []mutationWarning{{Code: "cross_provider_history_may_be_incompatible"}}
-	}
 	return runConfigFallbackMutation(opts, spec, out)
 }
 
@@ -264,9 +269,6 @@ func runConfigFallbackMutation(opts mutationOptions, spec journaledMutationSpec,
 		}
 	}
 	if replayed, rc := preflightTerminalReplay(path, opts, spec, out); replayed {
-		if rc == 0 && spec.Operation == "set_fallback_policy" && spec.Requested && !opts.JSON {
-			fmt.Fprintln(os.Stderr, "warning: cross-provider fallback replays the current conversation; provider-specific reasoning history may be rejected by the native provider")
-		}
 		return rc
 	}
 	file, err := config.Load(path)
@@ -301,11 +303,7 @@ func runConfigFallbackMutation(opts mutationOptions, spec journaledMutationSpec,
 	if err != nil {
 		return failMutation(opts, out, mutationResultForSpec(spec, opts.OperationID, path, ""), "config_read_failed", err.Error(), true, 1)
 	}
-	rc := runJournaledMutationLocked(path, prior, mode, opts, out, spec)
-	if rc == 0 && spec.Operation == "set_fallback_policy" && spec.Requested && !opts.JSON {
-		fmt.Fprintln(os.Stderr, "warning: cross-provider fallback replays the current conversation; provider-specific reasoning history may be rejected by the native provider")
-	}
-	return rc
+	return runJournaledMutationLocked(path, prior, mode, opts, out, spec)
 }
 
 func emitJSON(out io.Writer, value any) {
