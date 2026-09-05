@@ -101,9 +101,12 @@ points new sessions at Baseten Switch, enables deferred tool loading, and
 enables Claude Code's attribution block for compatibility with Anthropic's
 Auto mode checks. Restart Claude Code after enabling or disabling the integration.
 
-On startup, Switch upgrades attribution settings it can verify that it owns.
-If it reports a migration warning, run `baseten-switch claude on` to repair the
-integration. Restart Claude Code afterward.
+After upgrading from a version that disabled attribution, run the updated
+`baseten-switch doctor --fix` and approve the `claude on` repair, then restart
+Claude Code. This sets `CLAUDE_CODE_ATTRIBUTION_HEADER` to `"1"` through the
+normal integration setup and backup flow. You can also run
+`baseten-switch claude on` directly. Gateway startup does not change this
+setting; plain `doctor` only reports whether it needs repair.
 
 New installations also append the configured Baseten rows to Claude Code's
 `/model` picker. Claude continues to own and update its native model choices.
