@@ -28,8 +28,11 @@ func migrateClaudeAttributionBeforeStart(out io.Writer) {
 
 func (a *claudeAdapter) migrateAttribution() (bool, error) {
 	bak, err := loadClaudeBackup(a.backupPath)
-	if err != nil || bak == nil || bak.AttributionState != "" {
+	if err != nil || bak == nil {
 		return false, err
+	}
+	if written, owned := backupWrittenValue(bak, claudeAttributionEnvKey); bak.WrittenValues != nil && (!owned || written != "0") {
+		return false, nil
 	}
 	lock, err := a.acquireSettingsMutationLock()
 	if err != nil {
@@ -37,8 +40,11 @@ func (a *claudeAdapter) migrateAttribution() (bool, error) {
 	}
 	defer lock.close()
 	bak, err = loadClaudeBackup(a.backupPath)
-	if err != nil || bak == nil || bak.AttributionState != "" {
+	if err != nil || bak == nil {
 		return false, err
+	}
+	if written, owned := backupWrittenValue(bak, claudeAttributionEnvKey); bak.WrittenValues != nil && (!owned || written != "0") {
+		return false, nil
 	}
 	root, snap, err := readClaudeSettings(a.settingsPath)
 	if err != nil || !snap.Exists {
@@ -67,6 +73,7 @@ func (a *claudeAdapter) migrateAttribution() (bool, error) {
 		return false, nil
 	}
 	clean := bak.WrittenHash == sha256Hex(snap.Data) && claudeBackupMatchesFile(bak, snap)
+	a.initializeWrittenValues(bak, env)
 	changed := cur == "0"
 	if changed {
 		env[claudeAttributionEnvKey] = claudeAttributionValue
@@ -87,9 +94,10 @@ func (a *claudeAdapter) migrateAttribution() (bool, error) {
 	} else if err := snap.Verify(); err != nil {
 		return false, err
 	}
-	bak.AttributionState = claudeAttributionPreserved
 	if changed {
-		bak.AttributionState = claudeAttributionOwned
+		recordWrittenValues(bak, env, []string{claudeAttributionEnvKey})
+	} else {
+		delete(bak.WrittenValues, claudeAttributionEnvKey)
 	}
 	if err := saveClaudeBackup(a.backupPath, bak); err != nil {
 		return changed, err

@@ -569,27 +569,20 @@ func envString(env map[string]any, key string) (string, bool) {
 // and WrittenIdentity bind the backup to the file generation written by
 // `on`; a mismatch at `off` downgrades restore to strip-only-owned, while a
 // changed resolved target is refused.
-type claudeAttributionState string
-
-const (
-	// An omitted state identifies backups from versions that wrote "0".
-	claudeAttributionOwned     claudeAttributionState = "enabled"
-	claudeAttributionPreserved claudeAttributionState = "preserved"
-)
-
 type claudeBackup struct {
-	ConfigPath       string                   `json:"config_path"`
-	ResolvedPath     string                   `json:"resolved_path,omitempty"`
-	WrittenIdentity  *safefile.Identity       `json:"written_identity,omitempty"`
-	Values           map[string]string        `json:"values"`
-	Missing          []string                 `json:"missing"`
-	EnvExisted       bool                     `json:"env_existed"`
-	Model            string                   `json:"model,omitempty"`
-	ModelMissing     bool                     `json:"model_missing"`
-	Existed          bool                     `json:"existed"`
-	WrittenHash      string                   `json:"written_hash"`
-	AttributionState claudeAttributionState   `json:"attribution_state,omitempty"`
-	ModelPicker      *claudeModelPickerBackup `json:"model_picker,omitempty"`
+	ConfigPath      string             `json:"config_path"`
+	ResolvedPath    string             `json:"resolved_path,omitempty"`
+	WrittenIdentity *safefile.Identity `json:"written_identity,omitempty"`
+	Values          map[string]string  `json:"values"`
+	Missing         []string           `json:"missing"`
+	EnvExisted      bool               `json:"env_existed"`
+	Model           string             `json:"model,omitempty"`
+	ModelMissing    bool               `json:"model_missing"`
+	Existed         bool               `json:"existed"`
+	WrittenHash     string             `json:"written_hash"`
+	// Nil identifies legacy receipts. An empty map explicitly owns no env values.
+	WrittenValues map[string]string        `json:"written_values"`
+	ModelPicker   *claudeModelPickerBackup `json:"model_picker,omitempty"`
 }
 
 // claudeBackupPath keys the backup file by sha256(settings path) so
@@ -631,8 +624,8 @@ func saveClaudeBackup(path string, bak *claudeBackup) error {
 }
 
 // backupCovers reports whether the backup records the key, either as a
-// prior value or as a missing marker. A covered key is safe to delete
-// and restore on `off`; an uncovered one was never managed by us.
+// prior value or as a missing marker. Coverage preserves its original state;
+// the written-value receipt separately decides whether `off` still owns it.
 func backupCovers(bak *claudeBackup, key string) bool {
 	if bak == nil {
 		return false
@@ -646,6 +639,64 @@ func backupCovers(bak *claudeBackup, key string) bool {
 		}
 	}
 	return false
+}
+
+// backupWrittenValue describes the last managed write, not today's desired
+// value. Legacy receipts predate this metadata and only identify fixed knobs.
+func backupWrittenValue(bak *claudeBackup, key string) (string, bool) {
+	if !backupCovers(bak, key) {
+		return "", false
+	}
+	if bak.WrittenValues != nil {
+		value, ok := bak.WrittenValues[key]
+		return value, ok
+	}
+	switch key {
+	case claudeAttributionEnvKey:
+		return "0", true
+	case claudeToolSearchEnvKey:
+		return "true", true
+	default:
+		return "", false
+	}
+}
+
+// initializeWrittenValues upgrades the existing receipt without claiming
+// values edited since the legacy write. Routing values retain their established
+// structural ownership rules, including the retired settings-side subagent key.
+func (a *claudeAdapter) initializeWrittenValues(bak *claudeBackup, env map[string]any) bool {
+	if bak.WrittenValues != nil {
+		return false
+	}
+	written := map[string]string{}
+	for _, key := range claudeManagedEnvKeys {
+		cur, ok := envString(env, key)
+		previous, known := backupWrittenValue(bak, key)
+		if ok && backupCovers(bak, key) && ((known && cur == previous) || a.ownedEnvValue(key, cur)) {
+			written[key] = cur
+		}
+	}
+	bak.WrittenValues = written
+	return true
+}
+
+func recordWrittenValues(bak *claudeBackup, env map[string]any, keys []string) {
+	if bak.WrittenValues == nil {
+		bak.WrittenValues = map[string]string{}
+	}
+	for _, key := range keys {
+		if value, ok := envString(env, key); ok {
+			bak.WrittenValues[key] = value
+		}
+	}
+}
+
+func (a *claudeAdapter) backupOwnsCurrentValue(bak *claudeBackup, env map[string]any, key string) bool {
+	cur, ok := envString(env, key)
+	if written, known := backupWrittenValue(bak, key); known {
+		return ok && cur == written
+	}
+	return ok && a.ownedEnvValue(key, cur)
 }
 
 // recordBackupKey adds the key's pre-management state (value or
@@ -672,6 +723,12 @@ func cloneClaudeBackup(bak *claudeBackup) *claudeBackup {
 		cloned.Values[key] = value
 	}
 	cloned.Missing = append([]string(nil), bak.Missing...)
+	if bak.WrittenValues != nil {
+		cloned.WrittenValues = make(map[string]string, len(bak.WrittenValues))
+		for key, value := range bak.WrittenValues {
+			cloned.WrittenValues[key] = value
+		}
+	}
 	if bak.WrittenIdentity != nil {
 		identity := *bak.WrittenIdentity
 		cloned.WrittenIdentity = &identity
@@ -784,13 +841,7 @@ func (a *claudeAdapter) on() int {
 		}
 	}
 	changed := len(changedKeys) > 0
-	attributionState := claudeAttributionOwned
-	if cur, _ := envString(env, claudeAttributionEnvKey); bak != nil && cur == claudeAttributionValue {
-		attributionState = bak.AttributionState
-		if attributionState == "" {
-			attributionState = claudeAttributionPreserved
-		}
-	}
+	receiptChanged := bak != nil && a.initializeWrittenValues(bak, env)
 
 	// Persist the backup BEFORE modifying the settings file, so no
 	// failure or crash window exists in which the file is modified but
@@ -807,11 +858,12 @@ func (a *claudeAdapter) on() int {
 	backupChanged := false
 	if bak == nil && changed {
 		nb = &claudeBackup{
-			ConfigPath:  a.settingsPath,
-			Values:      map[string]string{},
-			EnvExisted:  envExistedPre,
-			Existed:     existed,
-			WrittenHash: sha256Hex(raw),
+			ConfigPath:    a.settingsPath,
+			Values:        map[string]string{},
+			EnvExisted:    envExistedPre,
+			Existed:       existed,
+			WrittenHash:   sha256Hex(raw),
+			WrittenValues: map[string]string{},
 		}
 		for _, key := range claudeOnEnvKeys {
 			if key == claudeManagedEnvKey && baseManaged {
@@ -889,7 +941,7 @@ func (a *claudeAdapter) on() int {
 				}
 				if hashTarget != nil && committed != nil {
 					hashTarget.WrittenHash = sha256Hex(newRaw)
-					hashTarget.AttributionState = attributionState
+					recordWrittenValues(hashTarget, env, changedKeys)
 					recordClaudeBackupFile(hashTarget, committed)
 					if saveErr := saveClaudeBackup(a.backupPath, hashTarget); saveErr != nil {
 						fmt.Fprintf(a.out, "claude on: warning: could not bind the retained backup to the committed file: %v\n", saveErr)
@@ -902,7 +954,7 @@ func (a *claudeAdapter) on() int {
 		}
 	}
 
-	if !changed && backupChanged {
+	if !changed && (backupChanged || receiptChanged) {
 		if claudeBeforeSettingsMutation != nil {
 			claudeBeforeSettingsMutation()
 		}
@@ -926,15 +978,14 @@ func (a *claudeAdapter) on() int {
 			hashTarget = bak
 		}
 		hashTarget.WrittenHash = sha256Hex(newRaw)
-		hashTarget.AttributionState = attributionState
+		recordWrittenValues(hashTarget, env, changedKeys)
 		recordClaudeBackupFile(hashTarget, committed)
 		if err := saveClaudeBackup(a.backupPath, hashTarget); err != nil {
 			fmt.Fprintf(a.out, "claude on: warning: could not refresh the backup drift hash: %v\n", err)
 		}
-	} else if bak != nil && bak.AttributionState != attributionState {
-		bak.AttributionState = attributionState
+	} else if receiptChanged {
 		if err := saveClaudeBackup(a.backupPath, bak); err != nil {
-			fmt.Fprintf(a.out, "claude on: warning: could not record attribution migration: %v\n", err)
+			fmt.Fprintf(a.out, "claude on: warning: could not refresh managed settings receipt: %v\n", err)
 		}
 	}
 
@@ -1064,11 +1115,14 @@ func (a *claudeAdapter) off() int {
 		return 1
 	}
 	if env != nil {
-		// Delete a managed key only when the backup covers it or its
-		// value is gateway-owned: an uncovered user value (e.g. a
-		// subagent model set before we ever managed that key) survives.
+		restore := map[string]bool{}
+		for _, key := range claudeManagedEnvKeys {
+			restore[key] = a.backupOwnsCurrentValue(bak, env, key)
+		}
+		// Even a clean full-file hash can follow a picker-only rewrite.
+		// Restore only env values that still match their managed write.
 		for _, k := range claudeManagedEnvKeys {
-			if k == claudeAttributionEnvKey && bak.AttributionState == claudeAttributionPreserved {
+			if !restore[k] {
 				continue
 			}
 			cur, ok := envString(env, k)
@@ -1077,13 +1131,13 @@ func (a *claudeAdapter) off() int {
 			}
 		}
 		for k, v := range bak.Values {
-			if k == claudeAttributionEnvKey && bak.AttributionState == claudeAttributionPreserved {
+			if !restore[k] {
 				continue
 			}
 			env[k] = v
 		}
 		for _, k := range bak.Missing {
-			if k == claudeAttributionEnvKey && bak.AttributionState == claudeAttributionPreserved {
+			if !restore[k] {
 				continue
 			}
 			if _, restored := bak.Values[k]; !restored {
@@ -1163,21 +1217,10 @@ func (a *claudeAdapter) offStripOnly(root map[string]any, snap *safefile.Snapsho
 		if bak != nil {
 			prior, priorSet = bak.Values[k]
 		}
-		writtenValue := a.desiredClaudeEnvValue(k)
-		if k == claudeAttributionEnvKey && bak != nil {
-			switch bak.AttributionState {
-			case "":
-				writtenValue = "0"
-			case claudeAttributionOwned:
-				writtenValue = claudeAttributionValue
-			default:
-				continue
-			}
-		}
-		// A covered prior value equal to the desired value predated
+		writtenValue, written := backupWrittenValue(bak, k)
+		// A covered prior value equal to the written value predated
 		// `on`; preserve it during drift instead of claiming ownership.
-		if ok && backupCovers(bak, k) &&
-			(k == claudeAttributionEnvKey || k == claudeToolSearchEnvKey) &&
+		if ok && written &&
 			cur == writtenValue &&
 			!(priorSet && prior == cur) {
 			strip = true
@@ -1253,6 +1296,7 @@ func retainPickerOnlyBackup(path string, bak *claudeBackup, raw []byte, snap *sa
 	}
 	bak.Values = map[string]string{}
 	bak.Missing = nil
+	bak.WrittenValues = map[string]string{}
 	bak.EnvExisted = true
 	bak.Model = ""
 	bak.ModelMissing = false

@@ -753,6 +753,7 @@ func (a *claudeAdapter) syncModelPicker(requireVersion bool, allowReplacementCon
 		bak = &claudeBackup{
 			ConfigPath: a.settingsPath, Values: map[string]string{}, EnvExisted: env != nil,
 			Existed: snap.Exists, WrittenHash: sha256Hex(snap.Data),
+			WrittenValues: map[string]string{},
 		}
 		recordClaudeBackupFile(bak, snap)
 	}

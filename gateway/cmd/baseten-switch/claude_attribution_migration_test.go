@@ -27,7 +27,7 @@ func legacyAttributionAdapter(t *testing.T) *claudeAdapter {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bak.AttributionState = ""
+	bak.WrittenValues = nil
 	bak.WrittenHash = sha256Hex(raw)
 	recordClaudeBackupFile(bak, snap)
 	if err := saveClaudeBackup(a.backupPath, bak); err != nil {
@@ -66,7 +66,7 @@ func TestClaudeAttributionMigrationAndOff(t *testing.T) {
 				t.Fatalf("attribution = %q, want enabled", got)
 			}
 			after, _ := loadClaudeBackup(a.backupPath)
-			if after.AttributionState != claudeAttributionOwned || !backupCovers(after, claudeAttributionEnvKey) {
+			if after.WrittenValues[claudeAttributionEnvKey] != "1" || !backupCovers(after, claudeAttributionEnvKey) {
 				t.Fatal("migration lost ownership state")
 			}
 			if drift && after.WrittenHash != before.WrittenHash {
@@ -151,7 +151,7 @@ func TestClaudeAttributionMigrationMarksAlreadyEnabled(t *testing.T) {
 				t.Fatalf("migration = %v, %v", changed, err)
 			}
 			after, _ := loadClaudeBackup(a.backupPath)
-			if after.AttributionState != claudeAttributionPreserved || before.WrittenHash != after.WrittenHash {
+			if after.WrittenValues == nil || after.WrittenValues[claudeAttributionEnvKey] != "" || before.WrittenHash != after.WrittenHash {
 				t.Fatal("marker update lost drift")
 			}
 			if !bytes.Equal(settingsBefore, fileBytes(t, a.settingsPath)) {
@@ -185,7 +185,7 @@ func TestClaudeObservedAttributionRemainsUserOwnedOnOff(t *testing.T) {
 				t.Fatalf("on = %d", rc)
 			}
 			after, _ := loadClaudeBackup(a.backupPath)
-			if after.AttributionState != claudeAttributionPreserved {
+			if after.WrittenValues == nil || after.WrittenValues[claudeAttributionEnvKey] != "" {
 				t.Fatal("observed value was claimed as written")
 			}
 			if before.Values[claudeAttributionEnvKey] != after.Values[claudeAttributionEnvKey] || backupCovers(before, claudeAttributionEnvKey) != backupCovers(after, claudeAttributionEnvKey) {
@@ -261,7 +261,7 @@ func TestClaudeAttributionMigrationRejectsConcurrentWrite(t *testing.T) {
 		t.Fatal("lost concurrent edit")
 	}
 	bak, _ := loadClaudeBackup(a.backupPath)
-	if bak.AttributionState != "" {
+	if bak.WrittenValues != nil {
 		t.Fatal("failed migration marked complete")
 	}
 }
@@ -278,7 +278,7 @@ func TestClaudeOnUpgradesLegacyAttributionAndRestoresOriginal(t *testing.T) {
 	}
 	assertClaudeOnValues(t, a)
 	bak, _ = loadClaudeBackup(a.backupPath)
-	if bak.AttributionState != claudeAttributionOwned {
+	if bak.WrittenValues[claudeAttributionEnvKey] != "1" {
 		t.Fatal("on did not mark migration")
 	}
 	if rc := a.off(); rc != 0 {
@@ -286,5 +286,32 @@ func TestClaudeOnUpgradesLegacyAttributionAndRestoresOriginal(t *testing.T) {
 	}
 	if got, _ := envValue(t, a.settingsPath, claudeAttributionEnvKey); got != "0" {
 		t.Fatal("original opt-out not restored")
+	}
+}
+
+func TestClaudeOnRecordsOnlyChangedEnvValues(t *testing.T) {
+	a, _ := testAdapter(t)
+	writeSettingsFile(t, a, `{"env":{"CLAUDE_CODE_ATTRIBUTION_HEADER":"1","ENABLE_TOOL_SEARCH":"manual"}}`)
+	if rc := a.on(); rc != 0 {
+		t.Fatalf("on = %d", rc)
+	}
+	bak, err := loadClaudeBackup(a.backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bak.WrittenValues) != 2 || bak.WrittenValues[claudeManagedEnvKey] != a.desiredURL() || bak.WrittenValues[claudeToolSearchEnvKey] != claudeToolSearchValue {
+		t.Fatalf("receipt does not describe the actual writes: %v", bak.WrittenValues)
+	}
+	if _, owned := bak.WrittenValues[claudeAttributionEnvKey]; owned {
+		t.Fatal("receipt claimed the preexisting attribution value")
+	}
+	if rc := a.off(); rc != 0 {
+		t.Fatalf("off = %d", rc)
+	}
+	if got, _ := envValue(t, a.settingsPath, claudeAttributionEnvKey); got != "1" {
+		t.Fatal("off removed preexisting attribution")
+	}
+	if got, _ := envValue(t, a.settingsPath, claudeToolSearchEnvKey); got != "manual" {
+		t.Fatal("off failed to restore the original tool-search value")
 	}
 }
