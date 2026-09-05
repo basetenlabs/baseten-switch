@@ -98,8 +98,8 @@ baseten-switch pi uninstall
 
 `baseten-switch claude on` saves the previous Claude Code environment values,
 points new sessions at Baseten Switch, enables deferred tool loading, and
-omits Claude Code's attribution block to improve gateway prompt-cache hit
-rates. Restart Claude Code after enabling or disabling the integration.
+enables Claude Code's attribution block for compatibility with Anthropic's
+Auto mode checks. Restart Claude Code after enabling or disabling the integration.
 
 New installations also append the configured Baseten rows to Claude Code's
 `/model` picker. Claude continues to own and update its native model choices.
@@ -201,6 +201,11 @@ CLI profile for login, logout, rotation, and profile changes.
 profile. Switch uses it only when `BASETEN_SWITCH_API_KEY_FALLBACK=1` and no
 selected profile credential is available. A selected OAuth or API-key profile
 always takes precedence.
+
+### Why are Claude Code Auto permission checks failing?
+
+Run `baseten-switch doctor`. If it reports disabled attribution, run
+`baseten-switch doctor --fix`, approve the repair, and restart Claude Code.
 
 ## Upgrade
 
