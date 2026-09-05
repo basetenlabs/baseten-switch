@@ -556,7 +556,7 @@ func TestClaudeOnPreservesOtherSettingsContent(t *testing.T) {
 
 func TestClaudeOnOnlyWritesWhenChanged(t *testing.T) {
 	a, out := testAdapter(t)
-	writeSettingsFile(t, a, `{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8081","CLAUDE_CODE_ATTRIBUTION_HEADER":"0","ENABLE_TOOL_SEARCH":"true"}}`)
+	writeSettingsFile(t, a, `{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8081","CLAUDE_CODE_ATTRIBUTION_HEADER":"1","ENABLE_TOOL_SEARCH":"true"}}`)
 	before := fileBytes(t, a.settingsPath)
 	if code := a.on(); code != 0 {
 		t.Fatal("on failed")
@@ -670,7 +670,7 @@ func TestClaudeOnRepairsCurrentBaseWithMissingKnobs(t *testing.T) {
 
 func TestClaudeOffWithoutBackupPreservesMatchingUserKnobs(t *testing.T) {
 	a, _ := testAdapter(t)
-	content := `{"env":{"CLAUDE_CODE_ATTRIBUTION_HEADER":"0","ENABLE_TOOL_SEARCH":"true","OTHER":"keep"}}` + "\n"
+	content := `{"env":{"CLAUDE_CODE_ATTRIBUTION_HEADER":"1","ENABLE_TOOL_SEARCH":"true","OTHER":"keep"}}` + "\n"
 	writeSettingsFile(t, a, content)
 	if code := a.off(); code != 0 {
 		t.Fatal("off failed")

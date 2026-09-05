@@ -429,7 +429,7 @@ func newDoctorFixture(t *testing.T, mut func(*doctorFixtureCfg)) *doctorFixture 
 				modelEnvPart += fmt.Sprintf(`,%q:%q`, k, v)
 			}
 		}
-		settingsJSON = fmt.Sprintf(`{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:%s","CLAUDE_CODE_ATTRIBUTION_HEADER":"0","ENABLE_TOOL_SEARCH":"true"%s%s}}`, fx.doorPort, subagentEnvPart, modelEnvPart)
+		settingsJSON = fmt.Sprintf(`{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:%s","CLAUDE_CODE_ATTRIBUTION_HEADER":"1","ENABLE_TOOL_SEARCH":"true"%s%s}}`, fx.doorPort, subagentEnvPart, modelEnvPart)
 	}
 	if err := os.WriteFile(fx.settings, []byte(settingsJSON), 0o600); err != nil {
 		t.Fatal(err)
@@ -723,7 +723,7 @@ func TestDoctorClaudeManagedEnvKnobsRequireExactValues(t *testing.T) {
 		fx := newDoctorFixture(t, nil)
 		root := readTree(t, fx.settings)
 		env := root["env"].(map[string]any)
-		env[claudeAttributionEnvKey] = "1"
+		env[claudeAttributionEnvKey] = "0"
 		env[claudeToolSearchEnvKey] = "auto"
 		b, _ := json.Marshal(root)
 		if err := os.WriteFile(fx.settings, b, 0o600); err != nil {
@@ -731,7 +731,7 @@ func TestDoctorClaudeManagedEnvKnobsRequireExactValues(t *testing.T) {
 		}
 		rep := runDoctor(doctorOpts{})
 		for name, want := range map[string]string{
-			"attribution_header": `"0"`,
+			"attribution_header": `"1"`,
 			"tool_search":        `"true"`,
 		} {
 			c := findCheck(t, rep, "claude", name)
@@ -1975,7 +1975,7 @@ func TestDoctorFixLoopCap(t *testing.T) {
 	fx := newDoctorFixture(t, nil)
 	liveAdmin := os.Getenv("BASETEN_SWITCH_ADMIN_ADDR")
 	closedAdmin := closedPortAddr(t)
-	goodSettings := fmt.Sprintf(`{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:%s","CLAUDE_CODE_ATTRIBUTION_HEADER":"0","ENABLE_TOOL_SEARCH":"true"}}`, fx.doorPort)
+	goodSettings := fmt.Sprintf(`{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:%s","CLAUDE_CODE_ATTRIBUTION_HEADER":"1","ENABLE_TOOL_SEARCH":"true"}}`, fx.doorPort)
 	badSettings := `{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:1","CLAUDE_CODE_ATTRIBUTION_HEADER":"0","ENABLE_TOOL_SEARCH":"true"}}`
 	if err := os.WriteFile(fx.settings, []byte(badSettings), 0o600); err != nil {
 		t.Fatal(err)

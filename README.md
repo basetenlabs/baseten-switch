@@ -98,8 +98,12 @@ baseten-switch pi uninstall
 
 `baseten-switch claude on` saves the previous Claude Code environment values,
 points new sessions at Baseten Switch, enables deferred tool loading, and
-omits Claude Code's attribution block to improve gateway prompt-cache hit
-rates. Restart Claude Code after enabling or disabling the integration.
+enables Claude Code's attribution block for compatibility with Anthropic's
+Auto mode checks. Restart Claude Code after enabling or disabling the integration.
+
+On startup, Switch upgrades attribution settings it can verify that it owns.
+If it reports a migration warning, run `baseten-switch claude on` to repair the
+integration. Restart Claude Code afterward.
 
 New installations also append the configured Baseten rows to Claude Code's
 `/model` picker. Claude continues to own and update its native model choices.

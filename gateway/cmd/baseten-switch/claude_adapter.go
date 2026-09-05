@@ -60,7 +60,10 @@ const (
 	claudeAliasPrefix       = "claude-baseten-" // the model-discovery contract alias namespace
 	claudeHarnessName       = "claude"
 
-	claudeAttributionValue = "0"
+	// Preserve Claude Code's attribution block for native provider requests,
+	// including Auto permission checks routed through the gateway.
+	// https://code.claude.com/docs/en/llm-gateway-protocol#system-prompt-attribution-block
+	claudeAttributionValue = "1"
 	// Claude Code documents "true" as the always-on tool-search value.
 	// Keep this centralized because accepted values are versioned by the
 	// harness, while the adapter's backup/restore behavior is key-based.
@@ -566,18 +569,27 @@ func envString(env map[string]any, key string) (string, bool) {
 // and WrittenIdentity bind the backup to the file generation written by
 // `on`; a mismatch at `off` downgrades restore to strip-only-owned, while a
 // changed resolved target is refused.
+type claudeAttributionState string
+
+const (
+	// An omitted state identifies backups from versions that wrote "0".
+	claudeAttributionOwned     claudeAttributionState = "enabled"
+	claudeAttributionPreserved claudeAttributionState = "preserved"
+)
+
 type claudeBackup struct {
-	ConfigPath      string                   `json:"config_path"`
-	ResolvedPath    string                   `json:"resolved_path,omitempty"`
-	WrittenIdentity *safefile.Identity       `json:"written_identity,omitempty"`
-	Values          map[string]string        `json:"values"`
-	Missing         []string                 `json:"missing"`
-	EnvExisted      bool                     `json:"env_existed"`
-	Model           string                   `json:"model,omitempty"`
-	ModelMissing    bool                     `json:"model_missing"`
-	Existed         bool                     `json:"existed"`
-	WrittenHash     string                   `json:"written_hash"`
-	ModelPicker     *claudeModelPickerBackup `json:"model_picker,omitempty"`
+	ConfigPath       string                   `json:"config_path"`
+	ResolvedPath     string                   `json:"resolved_path,omitempty"`
+	WrittenIdentity  *safefile.Identity       `json:"written_identity,omitempty"`
+	Values           map[string]string        `json:"values"`
+	Missing          []string                 `json:"missing"`
+	EnvExisted       bool                     `json:"env_existed"`
+	Model            string                   `json:"model,omitempty"`
+	ModelMissing     bool                     `json:"model_missing"`
+	Existed          bool                     `json:"existed"`
+	WrittenHash      string                   `json:"written_hash"`
+	AttributionState claudeAttributionState   `json:"attribution_state,omitempty"`
+	ModelPicker      *claudeModelPickerBackup `json:"model_picker,omitempty"`
 }
 
 // claudeBackupPath keys the backup file by sha256(settings path) so
@@ -772,6 +784,13 @@ func (a *claudeAdapter) on() int {
 		}
 	}
 	changed := len(changedKeys) > 0
+	attributionState := claudeAttributionOwned
+	if cur, _ := envString(env, claudeAttributionEnvKey); bak != nil && cur == claudeAttributionValue {
+		attributionState = bak.AttributionState
+		if attributionState == "" {
+			attributionState = claudeAttributionPreserved
+		}
+	}
 
 	// Persist the backup BEFORE modifying the settings file, so no
 	// failure or crash window exists in which the file is modified but
@@ -870,6 +889,7 @@ func (a *claudeAdapter) on() int {
 				}
 				if hashTarget != nil && committed != nil {
 					hashTarget.WrittenHash = sha256Hex(newRaw)
+					hashTarget.AttributionState = attributionState
 					recordClaudeBackupFile(hashTarget, committed)
 					if saveErr := saveClaudeBackup(a.backupPath, hashTarget); saveErr != nil {
 						fmt.Fprintf(a.out, "claude on: warning: could not bind the retained backup to the committed file: %v\n", saveErr)
@@ -906,9 +926,15 @@ func (a *claudeAdapter) on() int {
 			hashTarget = bak
 		}
 		hashTarget.WrittenHash = sha256Hex(newRaw)
+		hashTarget.AttributionState = attributionState
 		recordClaudeBackupFile(hashTarget, committed)
 		if err := saveClaudeBackup(a.backupPath, hashTarget); err != nil {
 			fmt.Fprintf(a.out, "claude on: warning: could not refresh the backup drift hash: %v\n", err)
+		}
+	} else if bak != nil && bak.AttributionState != attributionState {
+		bak.AttributionState = attributionState
+		if err := saveClaudeBackup(a.backupPath, bak); err != nil {
+			fmt.Fprintf(a.out, "claude on: warning: could not record attribution migration: %v\n", err)
 		}
 	}
 
@@ -1042,15 +1068,24 @@ func (a *claudeAdapter) off() int {
 		// value is gateway-owned: an uncovered user value (e.g. a
 		// subagent model set before we ever managed that key) survives.
 		for _, k := range claudeManagedEnvKeys {
+			if k == claudeAttributionEnvKey && bak.AttributionState == claudeAttributionPreserved {
+				continue
+			}
 			cur, ok := envString(env, k)
 			if backupCovers(bak, k) || (ok && a.ownedEnvValue(k, cur)) {
 				delete(env, k)
 			}
 		}
 		for k, v := range bak.Values {
+			if k == claudeAttributionEnvKey && bak.AttributionState == claudeAttributionPreserved {
+				continue
+			}
 			env[k] = v
 		}
 		for _, k := range bak.Missing {
+			if k == claudeAttributionEnvKey && bak.AttributionState == claudeAttributionPreserved {
+				continue
+			}
 			if _, restored := bak.Values[k]; !restored {
 				delete(env, k)
 			}
@@ -1128,11 +1163,22 @@ func (a *claudeAdapter) offStripOnly(root map[string]any, snap *safefile.Snapsho
 		if bak != nil {
 			prior, priorSet = bak.Values[k]
 		}
+		writtenValue := a.desiredClaudeEnvValue(k)
+		if k == claudeAttributionEnvKey && bak != nil {
+			switch bak.AttributionState {
+			case "":
+				writtenValue = "0"
+			case claudeAttributionOwned:
+				writtenValue = claudeAttributionValue
+			default:
+				continue
+			}
+		}
 		// A covered prior value equal to the desired value predated
 		// `on`; preserve it during drift instead of claiming ownership.
 		if ok && backupCovers(bak, k) &&
 			(k == claudeAttributionEnvKey || k == claudeToolSearchEnvKey) &&
-			cur == a.desiredClaudeEnvValue(k) &&
+			cur == writtenValue &&
 			!(priorSet && prior == cur) {
 			strip = true
 		}

@@ -660,6 +660,7 @@ func cmdGatewayStart(args []string) int {
 		return 1
 	}
 	cfg = gateway.LoadConfig()
+	migrateClaudeAttributionBeforeStart(os.Stderr)
 	if foreground {
 		return runForeground(cfg)
 	}
