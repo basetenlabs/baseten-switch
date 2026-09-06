@@ -49,6 +49,19 @@ full gate includes a live identity refresh against the maintainer's existing
 Baseten CLI credential store. It must not be run with credentials supplied by
 an untrusted pull request.
 
+For release workflow or packaging changes, also run the contracts required by
+the macOS CI job:
+
+```sh
+scripts/release/test-release-contract.sh
+scripts/release/test-release-workflow.sh
+scripts/release/test-render-formula.sh
+scripts/release/test-publish-homebrew.sh
+```
+
+See [RELEASING.md](RELEASING.md) for release configuration, publication, and
+Homebrew update recovery.
+
 ## Pull requests
 
 Keep changes focused and include tests for user-visible behavior. Describe any
