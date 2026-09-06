@@ -459,6 +459,111 @@ final class ReasoningConfigurationTests: XCTestCase {
         XCTAssertEqual(Set(rows.map(\.model)), [model, nemotron])
     }
 
+    func testDisplayIncludesEnabledPickerOnlyFastModelWithBinaryControls() {
+        let fast = "zai-org/GLM-5.2-Fast"
+        let client = reasoningVisibilityClient(
+            defaultModel: model,
+            families: [("opus", model)],
+            pickerEnabled: true,
+            pickerModels: [
+                ("claude-baseten-glm-5-2-fast", fast),
+            ])
+
+        let rows = reasoningRowsForDisplay(client: client, liveModels: [])
+        let fastRow = try! XCTUnwrap(rows.first { $0.model == fast })
+
+        XCTAssertEqual(reasoningSelection(status: fastRow.status), .off)
+        XCTAssertEqual(reasoningChoices(status: fastRow.status), [.on, .off])
+        XCTAssertTrue(fastRow.mappingFamilies.isEmpty)
+    }
+
+    func testDisplayExcludesModelsFromDisabledPicker() {
+        let fast = "zai-org/GLM-5.2-Fast"
+        let client = reasoningVisibilityClient(
+            defaultModel: model,
+            families: [("opus", model)],
+            pickerEnabled: false,
+            pickerModels: [
+                ("claude-baseten-glm-5-2-fast", fast),
+            ])
+
+        XCTAssertEqual(
+            reasoningRowsForDisplay(client: client, liveModels: []).map(\.model),
+            [model])
+    }
+
+    func testDisplayDeduplicatesPickerAliasesAndRoutingSelections() {
+        let fast = "zai-org/GLM-5.2-Fast"
+        let client = reasoningVisibilityClient(
+            defaultModel: fast,
+            families: [("opus", fast)],
+            subagentModel: fast,
+            subagentRouting: "on",
+            subagentEffective: fast,
+            pickerEnabled: true,
+            pickerModels: [
+                ("claude-baseten-glm-fast", fast),
+                ("claude-baseten-glm-fast-long", fast),
+                ("native", "native"),
+            ])
+
+        let rows = reasoningRowsForDisplay(client: client, liveModels: [])
+
+        XCTAssertEqual(rows.map(\.model), [fast])
+        XCTAssertEqual(rows[0].mappingFamilies, ["Opus"])
+    }
+
+    func testDisplayRetainsUnavailablePickerModelAsReadOnly() {
+        let retired = "moonshotai/Retired-Reasoner"
+        let client = reasoningVisibilityClient(
+            defaultModel: model,
+            families: [("opus", model)],
+            unavailableModels: [retired],
+            pickerEnabled: true,
+            pickerModels: [
+                ("claude-baseten-retired-reasoner", retired),
+            ])
+
+        let rows = reasoningRowsForDisplay(client: client, liveModels: [])
+        let retiredRow = try! XCTUnwrap(rows.first { $0.model == retired })
+
+        XCTAssertFalse(retiredRow.status.available)
+        XCTAssertTrue(reasoningChoices(status: retiredRow.status).isEmpty)
+        XCTAssertEqual(reasoningSelection(status: retiredRow.status), .off)
+        XCTAssertEqual(
+            retiredRow.status.unavailableReason,
+            "catalog_metadata_missing")
+    }
+
+    func testDisplayDoesNotInventPickerControlsWithoutAdminProjection() {
+        let pickerOnly = ClientStatus(dict: [
+            "name": "claude-code",
+            "enabled": true,
+            "bind_addr": "127.0.0.1:8789",
+            "model_picker": [
+                "enabled": true,
+                "models": [[
+                    "alias": "claude-baseten-example-reasoner",
+                    "slug": "example-org/Example-Reasoner",
+                    "label": "Example Reasoner",
+                    "description": "Served by Baseten.",
+                    "context_tokens": 32_000,
+                ]],
+            ],
+            "model_catalog": [[
+                "label": "Example Reasoner",
+                "storage_target": "claude-baseten-example-reasoner",
+                "slug": "example-org/Example-Reasoner",
+                "alias": "claude-baseten-example-reasoner",
+                "available": true,
+            ]],
+            "model_options": ["baseten": [:]],
+        ])!
+
+        XCTAssertTrue(
+            reasoningRowsForDisplay(client: pickerOnly, liveModels: []).isEmpty)
+    }
+
     func testDisplayExcludesInactiveAndInheritedSubagentTargets() {
         let nemotron = "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B"
         let inactive = reasoningVisibilityClient(
@@ -1030,14 +1135,18 @@ final class ReasoningConfigurationTests: XCTestCase {
         subagentModel: String = "",
         subagentRouting: String = "off",
         subagentEffective: String = "inherit",
-        unavailableModels: Set<String> = []
+        unavailableModels: Set<String> = [],
+        pickerEnabled: Bool? = nil,
+        pickerModels: [(alias: String, slug: String)] = []
     ) -> ClientStatus {
+        let fast = "zai-org/GLM-5.2-Fast"
         let kimi = "moonshotai/Kimi-K2.7-Code"
         let nemotron = "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B"
         let retired = "moonshotai/Retired-Reasoner"
         let gpt = "openai/gpt-oss-120b"
         let catalogModels = [
             (model, "GLM 5.2", "claude-baseten-glm-5-2"),
+            (fast, "GLM 5.2 Fast", "claude-baseten-glm-5-2-fast"),
             (kimi, "Kimi K2.7 Code", "claude-baseten-kimi-k2-7-code"),
             (nemotron, "Nemotron Ultra", "claude-baseten-nemotron-ultra"),
             (retired, "Retired Reasoner", "claude-baseten-retired-reasoner"),
@@ -1063,7 +1172,7 @@ final class ReasoningConfigurationTests: XCTestCase {
                     ] as [String: Any],
                 ] as [String: Any])
         })
-        return ClientStatus(dict: [
+        var dictionary: [String: Any] = [
             "name": "claude-code",
             "enabled": true,
             "bind_addr": "127.0.0.1:8789",
@@ -1098,7 +1207,22 @@ final class ReasoningConfigurationTests: XCTestCase {
                 ] as [String: Any]
             },
             "model_options": ["baseten": options],
-        ])!
+        ]
+        if let pickerEnabled {
+            dictionary["model_picker"] = [
+                "enabled": pickerEnabled,
+                "models": pickerModels.map { pickerModel in
+                    [
+                        "alias": pickerModel.alias,
+                        "slug": pickerModel.slug,
+                        "label": "Picker model",
+                        "description": "Served by Baseten.",
+                        "context_tokens": 32_000,
+                    ] as [String: Any]
+                },
+            ]
+        }
+        return ClientStatus(dict: dictionary)!
     }
 
     private func reasoningLiveModel(stale: Bool) -> LiveModelCatalogEntry {
