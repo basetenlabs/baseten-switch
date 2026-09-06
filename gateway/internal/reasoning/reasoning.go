@@ -16,6 +16,7 @@ type Mode string
 
 const (
 	ModePassthrough   Mode = "passthrough"
+	ModeOn            Mode = "on"
 	ModeOff           Mode = "off"
 	ModeFollowHarness Mode = "follow_harness"
 	ModeFixed         Mode = "fixed"
@@ -85,6 +86,22 @@ type Decision struct {
 type AdapterAvailability struct {
 	Modes   []Mode
 	Efforts []string
+}
+
+type messagesCompatibility struct {
+	Provider         string
+	CanonicalModelID string
+	ExplicitOnOff    bool
+	DefaultOff       bool
+}
+
+var reviewedMessagesCompatibility = []messagesCompatibility{
+	{
+		Provider:         "baseten",
+		CanonicalModelID: "zai-org/GLM-5.2-Fast",
+		ExplicitOnOff:    true,
+		DefaultOff:       true,
+	},
 }
 
 // PolicyError is a local request preflight error. Gateway routing may advance
@@ -184,7 +201,7 @@ func Resolve(in Input) (Decision, error) {
 			)
 		}
 		return decision, nil
-	case ModeOff:
+	case ModeOn, ModeOff:
 		if !in.Capability.Known || !in.Capability.Supported {
 			return Decision{}, policyError(
 				in,
@@ -192,11 +209,11 @@ func Resolve(in Input) (Decision, error) {
 				"the exact target has no validated reasoning capability",
 			)
 		}
-		if !supportsMessagesOff(in) {
+		if !supportsMessagesExplicitOnOff(in) {
 			return Decision{}, policyError(
 				in,
 				decision.Mode,
-				"Messages Off requires a toggle capability",
+				"Messages On and Off require a reviewed binary control",
 			)
 		}
 		return decision, nil
@@ -223,7 +240,7 @@ func EffectivePolicy(in Input) Decision {
 			Source: SourceConfigured,
 		}
 	}
-	if supportsMessagesOff(in) {
+	if supportsMessagesDefaultOff(in) {
 		return Decision{
 			Mode:   ModeOff,
 			Source: SourceCompatibilityDefault,
@@ -249,10 +266,11 @@ func ReviewedAdapterAvailability(in Input) AdapterAvailability {
 		!in.Capability.Supported {
 		return availability
 	}
-	if supportsMessagesOff(in) {
+	if supportsMessagesExplicitOnOff(in) {
 		availability.Modes = append(
 			availability.Modes,
 			ModeOff,
+			ModeOn,
 		)
 	}
 	if supportsMessagesFollowHarness(in) {
@@ -264,12 +282,42 @@ func ReviewedAdapterAvailability(in Input) AdapterAvailability {
 	return availability
 }
 
-func supportsMessagesOff(in Input) bool {
-	return in.Provider == "baseten" &&
-		in.WireShape == WireAnthropicMessages &&
-		in.Capability.Known &&
-		in.Capability.Supported &&
-		in.Capability.Toggle
+func supportsMessagesDefaultOff(in Input) bool {
+	if in.Provider != "baseten" ||
+		in.WireShape != WireAnthropicMessages ||
+		!in.Capability.Known ||
+		!in.Capability.Supported {
+		return false
+	}
+	if in.Capability.Toggle {
+		return true
+	}
+	compatibility, ok := reviewedMessagesCompatibilityFor(in)
+	return ok && compatibility.ExplicitOnOff && compatibility.DefaultOff
+}
+
+func supportsMessagesExplicitOnOff(in Input) bool {
+	if in.Provider != "baseten" ||
+		in.WireShape != WireAnthropicMessages ||
+		!in.Capability.Known ||
+		!in.Capability.Supported {
+		return false
+	}
+	if in.Capability.Toggle {
+		return true
+	}
+	compatibility, ok := reviewedMessagesCompatibilityFor(in)
+	return ok && compatibility.ExplicitOnOff
+}
+
+func reviewedMessagesCompatibilityFor(in Input) (messagesCompatibility, bool) {
+	for _, compatibility := range reviewedMessagesCompatibility {
+		if compatibility.Provider == in.Provider &&
+			compatibility.CanonicalModelID == in.CanonicalModelID {
+			return compatibility, true
+		}
+	}
+	return messagesCompatibility{}, false
 }
 
 func supportsMessagesFollowHarness(in Input) bool {
@@ -333,15 +381,15 @@ func InspectAnthropicMessages(body []byte) RequestedReasoning {
 // ApplyAnthropicMessages applies a reviewed same-shape Messages policy.
 // Passthrough preserves the original bytes. Follow Harness preserves reviewed
 // enabled and disabled controls, and normalizes Claude's adaptive control to
-// the Baseten Messages toggle shape. Off replaces only the top-level reasoning
-// control. Every transform retains all other JSON fields.
+// the Baseten Messages toggle shape. On and Off replace only the top-level
+// reasoning control. Every transform retains all other JSON fields.
 func ApplyAnthropicMessages(body []byte, decision Decision) ([]byte, error) {
 	switch decision.Mode {
 	case ModePassthrough:
 		return body, nil
 	case ModeFollowHarness:
 		return normalizeAnthropicAdaptiveThinking(body)
-	case ModeOff:
+	case ModeOn, ModeOff:
 		var envelope map[string]json.RawMessage
 		if err := json.Unmarshal(body, &envelope); err != nil ||
 			envelope == nil {
@@ -355,7 +403,11 @@ func ApplyAnthropicMessages(body []byte, decision Decision) ([]byte, error) {
 				Reason:    reason,
 			}
 		}
-		envelope["thinking"] = json.RawMessage(`{"type":"disabled"}`)
+		thinking := json.RawMessage(`{"type":"disabled"}`)
+		if decision.Mode == ModeOn {
+			thinking = json.RawMessage(`{"type":"enabled"}`)
+		}
+		envelope["thinking"] = thinking
 		transformed, err := json.Marshal(envelope)
 		if err != nil {
 			return nil, &PolicyError{

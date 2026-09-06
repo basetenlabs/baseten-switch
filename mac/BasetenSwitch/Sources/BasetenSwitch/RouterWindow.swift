@@ -1247,7 +1247,7 @@ private struct ClientRoutingView: View {
             } content: {
                 VStack(alignment: .leading, spacing: 10) {
                 Text(
-                    "These settings apply when \(clientDisplayName(client.name)) uses the selected Baseten model.")
+                    "Switch controls reasoning on or off. \(clientDisplayName(client.name)) effort is forwarded unchanged; support for effort levels depends on the model.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
@@ -1339,72 +1339,79 @@ private struct ClientRoutingView: View {
                     .accessibilityLabel(
                         "Saving \(row.displayName) reasoning")
             }
-            if defaultPassthroughReadOnly {
-                Label(
-                    reasoningDefaultPassthroughReadOnlyLabel(),
-                    systemImage: "info.circle")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else if choices.isEmpty {
-                Label(
-                    "No configurable reasoning control",
-                    systemImage: "info.circle")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } else {
-                VStack(alignment: .trailing, spacing: 6) {
+            VStack(alignment: .trailing, spacing: 6) {
+                if defaultPassthroughReadOnly {
+                    Label(
+                        reasoningDefaultPassthroughReadOnlyLabel(),
+                        systemImage: "info.circle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
                     if selection == .pendingDefault {
                         Text("Resetting to Safe Default…")
                             .font(.caption.weight(.medium))
                             .foregroundStyle(.secondary)
-                    } else if case .unavailable(let value) = selection {
-                        Text(
-                            "Saved: \(reasoningEffortLabel(value)) (Unavailable)")
-                            .font(.caption.weight(.medium))
-                            .foregroundStyle(.red)
-                    }
-                    Picker(
-                        "\(row.displayName) reasoning",
-                        selection: reasoningBinding(row)
+                    } else if let legacyLabel = reasoningLegacySelectionLabel(
+                        selection,
+                        clientName: client.name
                     ) {
-                        ForEach(choices, id: \.self) { choice in
-                            Text(reasoningChoiceLabel(
-                                choice,
-                                clientName: client.name))
-                                .tag(choice)
-                        }
+                        Text("Saved: \(legacyLabel)")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(
+                                row.status.available
+                                    ? Color.secondary
+                                    : Color.red)
                     }
-                    .labelsHidden()
-                    .pickerStyle(.segmented)
-                    .fixedSize()
-                    .disabled(
-                        isPreview
-                            || !state.canMutateReasoning
-                            || !reasoningCatalogAllowsMutation
-                            || state.pendingReasoning != nil)
-                    .accessibilityIdentifier(
-                        "reasoning-\(row.provider)-\(row.model)")
-                    if reasoningShowsResetAction(row.status) {
-                        Button("Reset to Safe Default") {
-                            guard !isPreview else { return }
-                            state.requestReasoning(
-                                client: client.name,
-                                provider: row.provider,
-                                model: row.model,
-                                policy: ReasoningPolicyValue(
-                                    mode: .default))
+                    if choices.isEmpty {
+                        Label(
+                            "No configurable reasoning control",
+                            systemImage: "info.circle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Picker(
+                            "\(row.displayName) reasoning",
+                            selection: reasoningBinding(row)
+                        ) {
+                            ForEach(choices, id: \.self) { choice in
+                                Text(reasoningChoiceLabel(
+                                    choice,
+                                    clientName: client.name))
+                                    .tag(choice)
+                            }
                         }
-                        .buttonStyle(.link)
-                        .font(.caption)
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                        .fixedSize()
                         .disabled(
                             isPreview
                                 || !state.canMutateReasoning
                                 || !reasoningCatalogAllowsMutation
                                 || state.pendingReasoning != nil)
                         .accessibilityIdentifier(
-                            "reasoning-reset-\(row.provider)-\(row.model)")
+                            "reasoning-\(row.provider)-\(row.model)")
                     }
+                }
+                if reasoningShowsResetAction(row.status) {
+                    Button("Reset to Safe Default") {
+                        guard !isPreview else { return }
+                        state.requestReasoning(
+                            client: client.name,
+                            provider: row.provider,
+                            model: row.model,
+                            policy: ReasoningPolicyValue(
+                                mode: .default))
+                    }
+                    .buttonStyle(.link)
+                    .font(.caption)
+                    .disabled(
+                        isPreview
+                            || !state.canMutateReasoning
+                            || !reasoningCatalogAllowsMutation
+                            || state.pendingReasoning != nil)
+                    .accessibilityIdentifier(
+                        "reasoning-reset-\(row.provider)-\(row.model)")
                 }
             }
         }

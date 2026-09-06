@@ -463,6 +463,7 @@ struct LiveModelCatalogEntry: Equatable, Sendable {
 
 enum ReasoningPolicyMode: String, Equatable, Sendable {
     case `default`
+    case on
     case off
     case followHarness = "follow_harness"
     case fixed

@@ -340,7 +340,7 @@ Plain doctor is read-only. --fix cannot be combined with --json.
   baseten-switch claude picker status|enable [--dry-run --json] [--convert-replacement-mode]|list|add <slug> [--alias <alias>] [--dry-run --json]|remove <alias>|move <alias> --before <alias>|sync [--convert-replacement-mode]|disable
   baseten-switch claude subagents [<model>|on|inherit]
   baseten-switch claude route [<family> <target|default>]
-  baseten-switch claude reasoning baseten <model> off|follow-harness|effort <value>|default
+  baseten-switch claude reasoning baseten <model> on|off|follow-harness|effort <value>|default
 
 on sets ANTHROPIC_BASE_URL, CLAUDE_CODE_ATTRIBUTION_HEADER, and
 ENABLE_TOOL_SEARCH in ~/.claude/settings.json, and backs up prior values. off
@@ -365,7 +365,7 @@ for the final Baseten model.
 	{"codex", "Manage the opt-in Codex gateway profile", `Usage:
   baseten-switch codex on|off|status
   baseten-switch codex route <baseten-slug>
-  baseten-switch codex reasoning baseten <model> off|follow-harness|effort <value>|default
+  baseten-switch codex reasoning baseten <model> on|off|follow-harness|effort <value>|default
 
 on writes the managed $CODEX_HOME/baseten.config.toml overlay and points its
 provider at the gateway door. It refuses to modify an existing overlay that is
