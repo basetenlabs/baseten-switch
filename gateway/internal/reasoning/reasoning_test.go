@@ -18,6 +18,18 @@ func glmInput() Input {
 	}
 }
 
+func glmFastEffortInput() Input {
+	return Input{
+		Provider:         "baseten",
+		CanonicalModelID: "zai-org/GLM-5.2-Fast",
+		WireShape:        WireAnthropicMessages,
+		Capability: Capability{
+			Known: true, Supported: true,
+			Efforts: []string{"none", "high", "max"},
+		},
+	}
+}
+
 func TestResolveCompatibilityAndConfiguredPolicies(t *testing.T) {
 	t.Run("toggle models default off independent of identity", func(t *testing.T) {
 		for _, model := range []string{
@@ -63,6 +75,120 @@ func TestResolveCompatibilityAndConfiguredPolicies(t *testing.T) {
 				got.Source != SourceInternalPassthrough {
 				t.Fatalf("decision = %+v, want passthrough", got)
 			}
+		}
+	})
+
+	t.Run("reviewed exact compatibility defaults off", func(t *testing.T) {
+		got, err := Resolve(glmFastEffortInput())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Mode != ModeOff || got.Source != SourceCompatibilityDefault {
+			t.Fatalf("decision = %+v, want compatibility Off", got)
+		}
+	})
+
+	t.Run("reviewed default compatibility is exact and validated", func(t *testing.T) {
+		for _, tc := range []struct {
+			name   string
+			mutate func(*Input)
+		}{
+			{name: "neighboring model", mutate: func(in *Input) { in.CanonicalModelID += "-Preview" }},
+			{name: "other provider", mutate: func(in *Input) { in.Provider = "example" }},
+			{name: "other wire", mutate: func(in *Input) { in.WireShape = WireOpenAIResponses }},
+			{name: "unknown metadata", mutate: func(in *Input) { in.Capability = Capability{} }},
+			{name: "unsupported metadata", mutate: func(in *Input) { in.Capability.Supported = false }},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				in := glmFastEffortInput()
+				tc.mutate(&in)
+				got, err := Resolve(in)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got.Mode != ModePassthrough || got.Source != SourceInternalPassthrough {
+					t.Fatalf("decision = %+v, want passthrough", got)
+				}
+			})
+		}
+	})
+
+	t.Run("configured On requires a reviewed binary control", func(t *testing.T) {
+		for _, tc := range []struct {
+			name      string
+			input     Input
+			wantError bool
+		}{
+			{name: "catalog toggle", input: glmInput()},
+			{name: "reviewed exact model", input: glmFastEffortInput()},
+			{
+				name: "neighboring model",
+				input: func() Input {
+					in := glmFastEffortInput()
+					in.CanonicalModelID = "zai-org/GLM-5.2-Fast-Preview"
+					return in
+				}(),
+				wantError: true,
+			},
+			{
+				name: "other adapter",
+				input: func() Input {
+					in := glmFastEffortInput()
+					in.WireShape = WireOpenAIResponses
+					return in
+				}(),
+				wantError: true,
+			},
+			{
+				name: "unknown metadata",
+				input: func() Input {
+					in := glmFastEffortInput()
+					in.Capability = Capability{}
+					return in
+				}(),
+				wantError: true,
+			},
+			{
+				name: "unsupported metadata",
+				input: func() Input {
+					in := glmFastEffortInput()
+					in.Capability.Supported = false
+					return in
+				}(),
+				wantError: true,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				in := tc.input
+				in.Stored = StoredPolicy{Present: true, Mode: ModeOn}
+				got, err := Resolve(in)
+				if tc.wantError {
+					if !IsPolicyError(err) || !AllowsFallback(err) {
+						t.Fatalf("error = %v, want fallback-eligible policy error", err)
+					}
+					return
+				}
+				if err != nil || got.Mode != ModeOn || got.Source != SourceConfigured {
+					t.Fatalf("decision = %+v error = %v", got, err)
+				}
+			})
+		}
+	})
+
+	t.Run("reviewed explicit compatibility does not broaden follow harness", func(t *testing.T) {
+		in := glmFastEffortInput()
+		in.Stored = StoredPolicy{Present: true, Mode: ModeFollowHarness}
+		if _, err := Resolve(in); !IsPolicyError(err) {
+			t.Fatalf("error = %v, want policy error", err)
+		}
+	})
+
+	t.Run("reviewed exact model accepts explicit Off", func(t *testing.T) {
+		in := glmFastEffortInput()
+		in.Stored = StoredPolicy{Present: true, Mode: ModeOff}
+		got, err := Resolve(in)
+		if err != nil || got.Mode != ModeOff || got.Source != SourceConfigured {
+			t.Fatalf("decision = %+v error = %v", got, err)
 		}
 	})
 
@@ -266,11 +392,34 @@ func TestReviewedAdapterAvailability(t *testing.T) {
 			in := glmInput()
 			in.CanonicalModelID = model
 			got := ReviewedAdapterAvailability(in)
-			if len(got.Modes) != 2 ||
+			if len(got.Modes) != 3 ||
 				got.Modes[0] != ModeOff ||
-				got.Modes[1] != ModeFollowHarness ||
+				got.Modes[1] != ModeOn ||
+				got.Modes[2] != ModeFollowHarness ||
 				len(got.Efforts) != 0 {
 				t.Fatalf("%s availability = %+v", model, got)
+			}
+		}
+	})
+
+	t.Run("reviewed exact effort model offers only explicit On and Off", func(t *testing.T) {
+		got := ReviewedAdapterAvailability(glmFastEffortInput())
+		want := []Mode{ModeOff, ModeOn}
+		if !reflect.DeepEqual(got.Modes, want) || len(got.Efforts) != 0 {
+			t.Fatalf("availability = %+v, want modes %v", got, want)
+		}
+	})
+
+	t.Run("reviewed compatibility is exact provider and model scoped", func(t *testing.T) {
+		for _, mutate := range []func(*Input){
+			func(in *Input) { in.Provider = "example" },
+			func(in *Input) { in.CanonicalModelID += "-Preview" },
+		} {
+			in := glmFastEffortInput()
+			mutate(&in)
+			got := ReviewedAdapterAvailability(in)
+			if len(got.Modes) != 0 || len(got.Efforts) != 0 {
+				t.Fatalf("availability = %+v for input %+v", got, in)
 			}
 		}
 	})
@@ -386,6 +535,75 @@ func TestInspectAndApplyAnthropicMessages(t *testing.T) {
 			before,
 		)
 	}
+}
+
+func TestApplyAnthropicMessagesForcedOnAndOff(t *testing.T) {
+	const largeInteger = "9007199254740993123456789"
+	for _, mode := range []Mode{ModeOn, ModeOff} {
+		for _, tc := range []struct {
+			name     string
+			thinking string
+		}{
+			{name: "absent"},
+			{name: "disabled", thinking: `,"thinking":{"type":"disabled","display":"ignored"}`},
+			{name: "adaptive", thinking: `,"thinking":{"type":"adaptive","display":"omitted"}`},
+			{name: "enabled budget", thinking: `,"thinking":{"type":"enabled","budget_tokens":2047}`},
+		} {
+			t.Run(string(mode)+"/"+tc.name, func(t *testing.T) {
+				body := []byte(`{"model":"example/model","system":"keep","max_tokens":4096,"large_integer":` +
+					largeInteger +
+					`,"output_config":{"effort":"medium"},"tools":[{"name":"lookup","input_schema":{"type":"object"}}],"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"prior","signature":"sig_test"},{"type":"text","text":"ready"}]},{"role":"user","content":"hello"}]` +
+					tc.thinking + `}`)
+				var before map[string]json.RawMessage
+				if err := json.Unmarshal(body, &before); err != nil {
+					t.Fatal(err)
+				}
+				got, err := ApplyAnthropicMessages(body, Decision{Mode: mode})
+				if err != nil {
+					t.Fatal(err)
+				}
+				var envelope map[string]json.RawMessage
+				if err := json.Unmarshal(got, &envelope); err != nil {
+					t.Fatal(err)
+				}
+				wantType := "enabled"
+				if mode == ModeOff {
+					wantType = "disabled"
+				}
+				if string(envelope["thinking"]) != `{"type":"`+wantType+`"}` {
+					t.Fatalf("thinking = %s", envelope["thinking"])
+				}
+				delete(before, "thinking")
+				delete(envelope, "thinking")
+				if !equalCompactRawMessages(before, envelope) {
+					t.Fatalf("non-thinking fields changed\n got: %s\nwant: %s", got, body)
+				}
+			})
+		}
+	}
+}
+
+func equalCompactRawMessages(
+	left map[string]json.RawMessage,
+	right map[string]json.RawMessage,
+) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, leftValue := range left {
+		rightValue, ok := right[key]
+		if !ok {
+			return false
+		}
+		var leftCompact bytes.Buffer
+		var rightCompact bytes.Buffer
+		if json.Compact(&leftCompact, leftValue) != nil ||
+			json.Compact(&rightCompact, rightValue) != nil ||
+			!bytes.Equal(leftCompact.Bytes(), rightCompact.Bytes()) {
+			return false
+		}
+	}
+	return true
 }
 
 func TestClaudeAdaptiveThinkingInspectionAndFollowHarnessNormalization(

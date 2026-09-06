@@ -75,7 +75,7 @@ const (
 
 func cmdCodex(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: baseten-switch codex on|off|status|route <baseten-slug>|reasoning baseten <model> off|follow-harness|effort <value>|default  (start/stop are aliases for on/off)")
+		fmt.Fprintln(os.Stderr, "usage: baseten-switch codex on|off|status|route <baseten-slug>|reasoning baseten <model> on|off|follow-harness|effort <value>|default  (start/stop are aliases for on/off)")
 		return 2
 	}
 	if replayed, rc := preflightCodexTerminalReplay(args); replayed {

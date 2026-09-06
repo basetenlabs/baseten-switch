@@ -12,6 +12,7 @@ import (
 
 	"github.com/basetenlabs/baseten-switch/gateway/internal/config"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/pricing"
+	"github.com/basetenlabs/baseten-switch/gateway/internal/reasoning"
 )
 
 const adminReasoningCatalogFixture = `{
@@ -36,6 +37,15 @@ const adminReasoningCatalogFixture = `{
         "family": "glm",
         "reasoning": true,
         "reasoning_options": [{"type": "toggle"}]
+      },
+      "zai-org/GLM-5.2-Fast": {
+        "id": "zai-org/GLM-5.2-Fast",
+        "name": "GLM 5.2 Fast",
+        "family": "glm",
+        "reasoning": true,
+        "reasoning_options": [
+          {"type": "effort", "values": ["none", "high", "max"]}
+        ]
       },
       "moonshotai/Kimi-K2.7-Code": {
         "id": "moonshotai/Kimi-K2.7-Code",
@@ -118,9 +128,10 @@ func TestClientReasoningProjectionDeduplicatesReachableTargets(t *testing.T) {
 		glm.Configured.Mode != "default" ||
 		glm.Effective.Mode != "off" ||
 		glm.Source != "compatibility_default" ||
-		len(glm.AvailableModes) != 2 ||
+		len(glm.AvailableModes) != 3 ||
 		glm.AvailableModes[0] != "off" ||
-		glm.AvailableModes[1] != "follow_harness" ||
+		glm.AvailableModes[1] != "on" ||
+		glm.AvailableModes[2] != "follow_harness" ||
 		!glm.Available ||
 		glm.UnavailableReason != "" ||
 		glm.Error != "" {
@@ -131,9 +142,10 @@ func TestClientReasoningProjectionDeduplicatesReachableTargets(t *testing.T) {
 		kimi.Effective.Mode != "off" ||
 		kimi.Source != "compatibility_default" ||
 		!kimi.Available ||
-		len(kimi.AvailableModes) != 2 ||
+		len(kimi.AvailableModes) != 3 ||
 		kimi.AvailableModes[0] != "off" ||
-		kimi.AvailableModes[1] != "follow_harness" {
+		kimi.AvailableModes[1] != "on" ||
+		kimi.AvailableModes[2] != "follow_harness" {
 		t.Fatalf("Kimi projection = %+v", kimi)
 	}
 	deepseek := models["deepseek-ai/DeepSeek-V4-Pro"].Reasoning
@@ -164,21 +176,28 @@ func TestClientReasoningProjectionDefaultsFromCapabilityAndAdapter(
 			model:      "zai-org/GLM-5.2",
 			wantMode:   "off",
 			wantSource: "compatibility_default",
-			wantModes:  []string{"off", "follow_harness"},
+			wantModes:  []string{"off", "on", "follow_harness"},
 		},
 		{
 			name:       "Kimi toggle",
 			model:      "moonshotai/Kimi-K2.7-Code",
 			wantMode:   "off",
 			wantSource: "compatibility_default",
-			wantModes:  []string{"off", "follow_harness"},
+			wantModes:  []string{"off", "on", "follow_harness"},
 		},
 		{
 			name:       "Nemotron toggle",
 			model:      "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B",
 			wantMode:   "off",
 			wantSource: "compatibility_default",
-			wantModes:  []string{"off", "follow_harness"},
+			wantModes:  []string{"off", "on", "follow_harness"},
+		},
+		{
+			name:       "reviewed Messages binary control defaults exact effort model Off",
+			model:      "zai-org/GLM-5.2-Fast",
+			wantMode:   "off",
+			wantSource: "compatibility_default",
+			wantModes:  []string{"off", "on"},
 		},
 		{
 			name:       "effort only is read-only passthrough",
@@ -224,6 +243,32 @@ func TestClientReasoningProjectionDefaultsFromCapabilityAndAdapter(
 				t.Fatalf("projection = %+v", status)
 			}
 		})
+	}
+}
+
+func TestClientReasoningProjectionFastExplicitOn(t *testing.T) {
+	snapshot := adminReasoningSnapshot(t, time.Now().UTC())
+	rc := resolvedClientConfig{
+		Name:          "claude-code",
+		ProtocolShape: "anthropic",
+		Route:         "baseten",
+		DefaultModel:  "zai-org/GLM-5.2-Fast",
+	}
+	status := projectClientReasoningPolicy(
+		rc,
+		snapshot,
+		pricing.ProviderBaseten,
+		"zai-org/GLM-5.2-Fast",
+		reasoning.StoredPolicy{Present: true, Mode: reasoning.ModeOn},
+	)
+	if !status.Available ||
+		status.Effective.Mode != "on" ||
+		status.Source != "user_config" ||
+		!slices.Equal(status.AvailableModes, []string{"off", "on"}) ||
+		len(status.AvailableEfforts) != 0 ||
+		status.UnavailableReason != "" ||
+		status.Error != "" {
+		t.Fatalf("projection = %+v", status)
 	}
 }
 
@@ -311,9 +356,10 @@ func TestClientReasoningProjectionStaleRemainsUsableAndUnknownIsLoud(
 	)[pricing.ProviderBaseten]["zai-org/GLM-5.2"].Reasoning
 	if stale == nil ||
 		!stale.Available ||
-		len(stale.AvailableModes) != 2 ||
+		len(stale.AvailableModes) != 3 ||
 		stale.AvailableModes[0] != "off" ||
-		stale.AvailableModes[1] != "follow_harness" ||
+		stale.AvailableModes[1] != "on" ||
+		stale.AvailableModes[2] != "follow_harness" ||
 		stale.UnavailableReason != "" ||
 		stale.Error != "" {
 		t.Fatalf("stale validated projection = %+v", stale)
@@ -521,9 +567,10 @@ func TestReasoningPreflightChecksOnlyRequestedClient(t *testing.T) {
 		claude.Reachability[0] != "explicit_raw_slug" ||
 		len(claude.FailureBehaviors) != 1 ||
 		claude.FailureBehaviors[0] != "local_error" ||
-		len(claude.AvailableModes) != 2 ||
+		len(claude.AvailableModes) != 3 ||
 		claude.AvailableModes[0] != "off" ||
-		claude.AvailableModes[1] != "follow_harness" ||
+		claude.AvailableModes[1] != "on" ||
+		claude.AvailableModes[2] != "follow_harness" ||
 		claude.UnavailableReason != "" ||
 		claude.Error != "" {
 		t.Fatalf("Claude impact = %+v", claude)
@@ -548,6 +595,11 @@ func TestReasoningPreflightRejectsInvalidPolicyStructure(t *testing.T) {
 		policy string
 		want   string
 	}{
+		{
+			name:   "on with effort",
+			policy: `{"mode":"on","effort":"medium"}`,
+			want:   `mode "on" forbids effort`,
+		},
 		{
 			name:   "off with effort",
 			policy: `{"mode":"off","effort":"high"}`,
