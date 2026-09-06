@@ -52,6 +52,27 @@ func TestSetClientModelReasoningPolicyCreatesNestedMappingsAndPreservesBytes(t *
 	}
 }
 
+func TestSetClientModelReasoningPolicyRoundTripsOn(t *testing.T) {
+	path := writeReasoningEditConfig(t, "global:\n  routing_enabled: true\nclients:\n  - name: claude-code\n    enabled: true\n    protocol_shape: anthropic\n    default_model: zai-org/GLM-5.2-Fast\n")
+	if err := SetClientModelReasoningPolicy(
+		path,
+		"claude-code",
+		"baseten",
+		"zai-org/GLM-5.2-Fast",
+		ReasoningPolicy{Mode: ReasoningOn},
+	); err != nil {
+		t.Fatal(err)
+	}
+	file, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := file.Clients[0].ModelOptions["baseten"]["zai-org/GLM-5.2-Fast"].Reasoning
+	if got == nil || got.Mode != ReasoningOn || got.Effort != "" {
+		t.Fatalf("reasoning policy = %#v", got)
+	}
+}
+
 func TestSetClientModelReasoningPolicyExpandsEmptyMappings(t *testing.T) {
 	tests := []struct {
 		name string
@@ -154,6 +175,7 @@ func TestClientReasoningPolicyRejectsUnsafeValuesWithoutWriting(t *testing.T) {
 		{name: "newline", client: "claude-code", provider: "baseten", model: "bad\nkey", policy: ReasoningPolicy{Mode: ReasoningOff}},
 		{name: "fixed missing effort", client: "claude-code", provider: "baseten", model: "org/model", policy: ReasoningPolicy{Mode: ReasoningFixed}},
 		{name: "off with effort", client: "claude-code", provider: "baseten", model: "org/model", policy: ReasoningPolicy{Mode: ReasoningOff, Effort: "high"}},
+		{name: "on with effort", client: "claude-code", provider: "baseten", model: "org/model", policy: ReasoningPolicy{Mode: ReasoningOn, Effort: "medium"}},
 		{name: "unsafe effort", client: "claude-code", provider: "baseten", model: "org/model", policy: ReasoningPolicy{Mode: ReasoningFixed, Effort: "high\ninjected: true"}},
 	}
 	for _, tc := range tests {

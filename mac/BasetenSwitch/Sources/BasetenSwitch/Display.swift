@@ -149,6 +149,7 @@ func projectModelCatalog(
 enum ReasoningChoice: Hashable, Sendable {
     case defaultPassthrough
     case pendingDefault
+    case on
     case off
     case followHarness
     case effort(String)
@@ -156,16 +157,13 @@ enum ReasoningChoice: Hashable, Sendable {
 
     var policy: ReasoningPolicyValue? {
         switch self {
-        case .defaultPassthrough, .pendingDefault:
+        case .defaultPassthrough, .pendingDefault,
+             .followHarness, .effort, .unavailable:
             return nil
+        case .on:
+            return ReasoningPolicyValue(mode: .on)
         case .off:
             return ReasoningPolicyValue(mode: .off)
-        case .followHarness:
-            return ReasoningPolicyValue(mode: .followHarness)
-        case .effort(let effort):
-            return ReasoningPolicyValue(mode: .fixed, effort: effort)
-        case .unavailable:
-            return nil
         }
     }
 }
@@ -206,6 +204,11 @@ func reasoningRowsForDisplay(
     if client.subagentRouting != "off",
        client.subagentEffective != "inherit" {
         select(client.subagentModel)
+    }
+    if let modelPicker = client.modelPicker, modelPicker.enabled {
+        for pickerModel in modelPicker.models {
+            select(pickerModel.slug)
+        }
     }
 
     var seenModels = Set<String>()
@@ -248,26 +251,12 @@ func reasoningRowsForDisplay(
 func reasoningChoices(
     status: ClientReasoningStatus
 ) -> [ReasoningChoice] {
-    var choices: [ReasoningChoice] = []
-    for mode in status.availableModes {
-        switch mode {
-        case .off:
-            choices.append(.off)
-        case .followHarness:
-            choices.append(.followHarness)
-        case .default, .fixed, .passthrough:
-            break
-        }
+    guard status.available,
+          status.availableModes.contains(.on),
+          status.availableModes.contains(.off) else {
+        return []
     }
-    choices.append(contentsOf: status.availableEfforts.map(
-        ReasoningChoice.effort))
-    if !choices.isEmpty,
-       status.configured.mode == .default,
-       status.effective.mode == .passthrough {
-        choices.insert(.defaultPassthrough, at: 0)
-    }
-    var seen = Set<ReasoningChoice>()
-    return choices.filter { seen.insert($0).inserted }
+    return [.on, .off]
 }
 
 func reasoningUsesDefaultPassthroughReadOnlyState(
@@ -284,17 +273,13 @@ func reasoningUsesDefaultPassthroughReadOnlyState(
 }
 
 func reasoningDefaultPassthroughReadOnlyLabel() -> String {
-    "Reasoning stays on for this model"
+    "Uses provider default"
 }
 
 func reasoningShowsResetAction(
     _ status: ClientReasoningStatus
 ) -> Bool {
-    guard status.configured.mode != .default else {
-        return false
-    }
-    return status.configured.mode != .off
-        || status.effective.mode != .off
+    status.configured.mode != .default
 }
 
 func reasoningSelection(
@@ -306,6 +291,8 @@ func reasoningSelection(
             ? status.effective
             : status.configured)
     switch policy.mode {
+    case .on:
+        return .on
     case .off:
         return .off
     case .followHarness:
@@ -331,12 +318,14 @@ func reasoningChoiceLabel(
         return "Default · Pass through unchanged"
     case .pendingDefault:
         return "Resetting to Safe Default…"
+    case .on:
+        return "On"
     case .off:
         return "Off"
     case .followHarness:
-        return "Use \(clientDisplayName(clientName)) setting"
+        return "Follow \(clientDisplayName(clientName)) (Legacy)"
     case .effort(let effort):
-        return reasoningEffortLabel(effort)
+        return "\(reasoningEffortLabel(effort)) (Legacy)"
     case .unavailable(let value):
         return "\(reasoningEffortLabel(value)) (Unavailable)"
     }
@@ -357,13 +346,40 @@ func reasoningCaption(
     row: ReasoningDisplayRow,
     clientName: String
 ) -> String {
-    if row.status.source == "compatibility_default" {
-        return "Safe default: reasoning off when \(clientDisplayName(clientName)) uses this model."
+    let client = clientDisplayName(clientName)
+    switch row.status.configured.mode {
+    case .on:
+        guard row.status.available else { return "Saved policy: On." }
+        return "Switch enables reasoning. \(client) effort is forwarded unchanged."
+    case .off:
+        guard row.status.available else { return "Saved policy: Off." }
+        return "Switch disables reasoning when \(client) uses this model."
+    case .followHarness:
+        return "Saved legacy policy: follow \(client)’s reasoning setting when supported."
+    case .fixed:
+        return "Saved legacy effort: \(reasoningEffortLabel(row.status.configured.effort))."
+    case .default, .passthrough:
+        if row.status.source == "compatibility_default",
+           row.status.effective.mode == .off {
+            return "Safe default: Off."
+        }
+        if row.status.effective.mode == .passthrough {
+            return "Default: provider behavior is unchanged."
+        }
+        return "Used when \(client) routes to this Baseten model."
     }
-    if row.status.configured.mode == .followHarness {
-        return "\(clientDisplayName(clientName))’s reasoning setting passes through when the adapter supports it."
+}
+
+func reasoningLegacySelectionLabel(
+    _ selection: ReasoningChoice,
+    clientName: String
+) -> String? {
+    switch selection {
+    case .followHarness, .effort, .unavailable:
+        return reasoningChoiceLabel(selection, clientName: clientName)
+    case .defaultPassthrough, .pendingDefault, .on, .off:
+        return nil
     }
-    return "Used when \(clientDisplayName(clientName)) routes to this Baseten model."
 }
 
 private func canonicalModelID(

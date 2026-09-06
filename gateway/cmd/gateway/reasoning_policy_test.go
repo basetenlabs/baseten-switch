@@ -62,6 +62,108 @@ func assertGatewayThinkingDisabled(t *testing.T, body []byte) {
 	}
 }
 
+func assertGatewayThinkingEnabled(t *testing.T, body []byte) {
+	t.Helper()
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		t.Fatalf("decode transformed body: %v\nbody: %s", err, body)
+	}
+	if string(envelope["thinking"]) != `{"type":"enabled"}` {
+		t.Fatalf(
+			"transformed thinking = %s, want exactly {\"type\":\"enabled\"}",
+			envelope["thinking"],
+		)
+	}
+}
+
+func TestReasoningPolicyFastExplicitOnPreservesEffortAndReportsNoEffectiveEffort(
+	t *testing.T,
+) {
+	g := reasoningTestGateway(t)
+	if err := g.pricing.ReplaceModelsDev(
+		[]byte(adminReasoningCatalogFixture),
+		time.Now().UTC(),
+		`"fast-explicit-on"`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	rc := resolvedAnthropicBasetenDefaultReasoning(t)
+	rc.DefaultModel = "zai-org/GLM-5.2-Fast"
+	rc.ModelOptions = config.ModelOptions{
+		pricing.ProviderBaseten: {
+			"zai-org/GLM-5.2-Fast": {
+				Reasoning: &config.ReasoningPolicy{Mode: config.ReasoningOn},
+			},
+		},
+	}
+	body := []byte(`{
+		"model":"claude-example-model",
+		"output_config":{"effort":"medium"},
+		"messages":[{"role":"user","content":"hello"}]
+	}`)
+	got, telemetry, err := applyBasetenReasoningPolicy(
+		g.pricing.Capture(),
+		rc,
+		body,
+		"zai-org/GLM-5.2-Fast",
+		"messages",
+		"anthropic",
+		reasoning.InspectAnthropicMessages(body),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertGatewayThinkingEnabled(t, got)
+	if !bytes.Contains(got, []byte(`"effort":"medium"`)) {
+		t.Fatalf("transformed body = %s, want unchanged effort", got)
+	}
+	if telemetry.policyMode == nil || *telemetry.policyMode != "on" ||
+		telemetry.effectiveEnabled == nil || !*telemetry.effectiveEnabled ||
+		telemetry.effectiveEffort != nil {
+		t.Fatalf("telemetry = %+v", telemetry)
+	}
+}
+
+func TestReasoningPolicyFastDefaultsOffAndPreservesEffort(t *testing.T) {
+	g := reasoningTestGateway(t)
+	if err := g.pricing.ReplaceModelsDev(
+		[]byte(adminReasoningCatalogFixture),
+		time.Now().UTC(),
+		`"fast-default-off"`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	rc := resolvedAnthropicBasetenDefaultReasoning(t)
+	rc.DefaultModel = "zai-org/GLM-5.2-Fast"
+	body := []byte(`{
+		"model":"claude-example-model",
+		"output_config":{"effort":"medium"},
+		"messages":[{"role":"user","content":"hello"}]
+	}`)
+	got, telemetry, err := applyBasetenReasoningPolicy(
+		g.pricing.Capture(),
+		rc,
+		body,
+		"zai-org/GLM-5.2-Fast",
+		"messages",
+		"anthropic",
+		reasoning.InspectAnthropicMessages(body),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertGatewayThinkingDisabled(t, got)
+	if !bytes.Contains(got, []byte(`"effort":"medium"`)) {
+		t.Fatalf("transformed body = %s, want unchanged effort", got)
+	}
+	if telemetry.policyMode == nil || *telemetry.policyMode != "off" ||
+		telemetry.policySource == nil || *telemetry.policySource != "compatibility_default" ||
+		telemetry.effectiveEnabled == nil || *telemetry.effectiveEnabled ||
+		telemetry.effectiveEffort != nil {
+		t.Fatalf("telemetry = %+v", telemetry)
+	}
+}
+
 func TestReasoningPolicyMappedToggleDefaultsOff(t *testing.T) {
 	g := reasoningTestGateway(t)
 	rc := resolvedAnthropicBasetenDefaultReasoning(t)
@@ -698,106 +800,146 @@ func TestReasoningPolicyChangesResolvedClientHash(t *testing.T) {
 	}
 }
 
-func TestReasoningPolicyMappedOffRuntimeFallbackPreservesNativeBody(
-	t *testing.T,
-) {
-	var basetenHits atomic.Int32
-	var basetenBody []byte
-	baseten := httptest.NewServer(http.HandlerFunc(
-		func(w http.ResponseWriter, r *http.Request) {
-			basetenHits.Add(1)
-			basetenBody, _ = io.ReadAll(r.Body)
-			w.WriteHeader(http.StatusInternalServerError)
+func TestReasoningPolicyRuntimeFallbackPreservesNativeBody(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		targetModel    string
+		stored         *config.ReasoningPolicy
+		wantMode       string
+		wantEnabled    bool
+		wantSource     string
+		assertThinking func(*testing.T, []byte)
+	}{
+		{
+			name:           "Fast default Off",
+			targetModel:    "zai-org/GLM-5.2-Fast",
+			wantMode:       "off",
+			wantEnabled:    false,
+			wantSource:     "compatibility_default",
+			assertThinking: assertGatewayThinkingDisabled,
 		},
-	))
-	defer baseten.Close()
+		{
+			name:           "explicit On",
+			targetModel:    "zai-org/GLM-5.2-Fast",
+			stored:         &config.ReasoningPolicy{Mode: config.ReasoningOn},
+			wantMode:       "on",
+			wantEnabled:    true,
+			wantSource:     "user_config",
+			assertThinking: assertGatewayThinkingEnabled,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var basetenHits atomic.Int32
+			var basetenBody []byte
+			baseten := httptest.NewServer(http.HandlerFunc(
+				func(w http.ResponseWriter, r *http.Request) {
+					basetenHits.Add(1)
+					basetenBody, _ = io.ReadAll(r.Body)
+					w.WriteHeader(http.StatusInternalServerError)
+				},
+			))
+			defer baseten.Close()
 
-	var nativeBody []byte
-	native := httptest.NewServer(http.HandlerFunc(
-		func(w http.ResponseWriter, r *http.Request) {
-			nativeBody, _ = io.ReadAll(r.Body)
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{
-				"id":"msg_native",
-				"type":"message",
-				"role":"assistant",
-				"content":[{"type":"text","text":"native"}],
+			var nativeBody []byte
+			native := httptest.NewServer(http.HandlerFunc(
+				func(w http.ResponseWriter, r *http.Request) {
+					nativeBody, _ = io.ReadAll(r.Body)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{
+						"id":"msg_native",
+						"type":"message",
+						"role":"assistant",
+						"content":[{"type":"text","text":"native"}],
+						"model":"claude-example-model",
+						"usage":{"input_tokens":1,"output_tokens":1}
+					}`))
+				},
+			))
+			defer native.Close()
+
+			cfg := testConfig(t, baseten.URL, native.URL)
+			rc := resolvedAnthropicBasetenDefaultReasoning(t)
+			rc.DefaultModel = tc.targetModel
+			rc.FallbackRoute = "anthropic"
+			if tc.stored != nil {
+				rc.ModelOptions = config.ModelOptions{
+					pricing.ProviderBaseten: {
+						tc.targetModel: {Reasoning: tc.stored},
+					},
+				}
+			}
+			g, adminListener, _ := newGateway(t, cfg, rc)
+			defer adminListener.Close()
+			if err := g.pricing.ReplaceModelsDev(
+				[]byte(adminReasoningCatalogFixture),
+				time.Now().UTC(),
+				`"runtime-fallback"`,
+			); err != nil {
+				t.Fatal(err)
+			}
+			stop := start(t, g)
+			defer stop()
+
+			body := []byte(`{
 				"model":"claude-opus-4-8",
-				"usage":{"input_tokens":1,"output_tokens":1}
-			}`))
-		},
-	))
-	defer native.Close()
-
-	cfg := testConfig(t, baseten.URL, native.URL)
-	rc := resolvedAnthropicBasetenDefaultReasoning(t)
-	rc.FallbackRoute = "anthropic"
-	g, adminListener, _ := newGateway(t, cfg, rc)
-	defer adminListener.Close()
-	stop := start(t, g)
-	defer stop()
-
-	body := []byte(`{
-		"model":"claude-opus-4-8",
-		"thinking":{"type":"enabled","budget_tokens":32000},
-		"messages":[{"role":"user","content":"hello"}]
-	}`)
-	req, _ := http.NewRequest(
-		http.MethodPost,
-		clientURL(g, "claude-code", "/v1/messages"),
-		bytes.NewReader(body),
-	)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer tok")
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		responseBody, _ := io.ReadAll(response.Body)
-		t.Fatalf("status = %d body = %s", response.StatusCode, responseBody)
-	}
-	if basetenHits.Load() != 1 {
-		t.Fatalf("Baseten hits = %d, want 1", basetenHits.Load())
-	}
-	assertGatewayThinkingDisabled(t, basetenBody)
-	if !bytes.Equal(nativeBody, body) {
-		t.Fatalf(
-			"native fallback body changed\ngot:  %s\nwant: %s",
-			nativeBody,
-			body,
-		)
-	}
-	rows := waitForRows(t, cfg.TelemetryDir, 1, 2*time.Second)
-	row := rows[0]
-	if row.RequestedReasoningPresent == nil ||
-		!*row.RequestedReasoningPresent {
-		t.Fatalf(
-			"fallback requested_reasoning_present = %v, want true",
-			row.RequestedReasoningPresent,
-		)
-	}
-	if row.ReasoningPolicyMode == nil ||
-		*row.ReasoningPolicyMode != "off" ||
-		row.EffectiveReasoningEnabled == nil ||
-		*row.EffectiveReasoningEnabled ||
-		row.ReasoningPolicySource == nil ||
-		*row.ReasoningPolicySource != "compatibility_default" {
-		t.Fatalf(
-			"runtime fallback policy: mode=%v enabled=%v source=%v",
-			row.ReasoningPolicyMode,
-			row.EffectiveReasoningEnabled,
-			row.ReasoningPolicySource,
-		)
-	}
-	if row.Fallback.Trigger == nil ||
-		*row.Fallback.Trigger != "http_500" {
-		t.Fatalf("fallback trigger = %v, want http_500", row.Fallback.Trigger)
+				"thinking":{"type":"adaptive","display":"omitted"},
+				"output_config":{"effort":"medium"},
+				"messages":[{"role":"user","content":"hello"}]
+			}`)
+			req, _ := http.NewRequest(
+				http.MethodPost,
+				clientURL(g, "claude-code", "/v1/messages"),
+				bytes.NewReader(body),
+			)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer tok")
+			response, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusOK {
+				responseBody, _ := io.ReadAll(response.Body)
+				t.Fatalf("status = %d body = %s", response.StatusCode, responseBody)
+			}
+			if basetenHits.Load() != 1 {
+				t.Fatalf("Baseten hits = %d, want 1", basetenHits.Load())
+			}
+			tc.assertThinking(t, basetenBody)
+			if !bytes.Contains(basetenBody, []byte(`"effort":"medium"`)) {
+				t.Fatalf("Baseten body = %s, want unchanged effort", basetenBody)
+			}
+			if !bytes.Equal(nativeBody, body) {
+				t.Fatalf(
+					"native fallback body changed\ngot:  %s\nwant: %s",
+					nativeBody,
+					body,
+				)
+			}
+			row := waitForRows(t, cfg.TelemetryDir, 1, 2*time.Second)[0]
+			if row.ReasoningPolicyMode == nil ||
+				*row.ReasoningPolicyMode != tc.wantMode ||
+				row.EffectiveReasoningEnabled == nil ||
+				*row.EffectiveReasoningEnabled != tc.wantEnabled ||
+				row.EffectiveReasoningEffort != nil ||
+				row.ReasoningPolicySource == nil ||
+				*row.ReasoningPolicySource != tc.wantSource {
+				t.Fatalf(
+					"runtime fallback policy: mode=%v enabled=%v effort=%v source=%v",
+					row.ReasoningPolicyMode,
+					row.EffectiveReasoningEnabled,
+					row.EffectiveReasoningEffort,
+					row.ReasoningPolicySource,
+				)
+			}
+			if row.Fallback.Trigger == nil || *row.Fallback.Trigger != "http_500" {
+				t.Fatalf("fallback trigger = %v, want http_500", row.Fallback.Trigger)
+			}
+		})
 	}
 }
 
-func TestReasoningPolicyConfiguredOffOpenAIShapesPreflightFallbackHTTP(
+func TestReasoningPolicyConfiguredBinaryModeOpenAIShapesPreflightFallbackHTTP(
 	t *testing.T,
 ) {
 	for _, tc := range []struct {
@@ -805,6 +947,7 @@ func TestReasoningPolicyConfiguredOffOpenAIShapesPreflightFallbackHTTP(
 		clientName string
 		path       string
 		body       []byte
+		mode       config.ReasoningMode
 	}{
 		{
 			name:       "Chat Completions",
@@ -813,6 +956,7 @@ func TestReasoningPolicyConfiguredOffOpenAIShapesPreflightFallbackHTTP(
 			body: []byte(
 				`{"model":"gpt-5","messages":[{"role":"user","content":"hello"}],"reasoning_effort":"high"}`,
 			),
+			mode: config.ReasoningOff,
 		},
 		{
 			name:       "Responses",
@@ -821,6 +965,16 @@ func TestReasoningPolicyConfiguredOffOpenAIShapesPreflightFallbackHTTP(
 			body: []byte(
 				`{"model":"gpt-5","input":"hello","reasoning":{"effort":"high"}}`,
 			),
+			mode: config.ReasoningOff,
+		},
+		{
+			name:       "Responses On",
+			clientName: "codex",
+			path:       "/v1/responses",
+			body: []byte(
+				`{"model":"gpt-5","input":"hello","reasoning":{"effort":"high"}}`,
+			),
+			mode: config.ReasoningOn,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -852,7 +1006,7 @@ func TestReasoningPolicyConfiguredOffOpenAIShapesPreflightFallbackHTTP(
 				pricing.ProviderBaseten: {
 					"zai-org/GLM-5.2": {
 						Reasoning: &config.ReasoningPolicy{
-							Mode: config.ReasoningOff,
+							Mode: tc.mode,
 						},
 					},
 				},

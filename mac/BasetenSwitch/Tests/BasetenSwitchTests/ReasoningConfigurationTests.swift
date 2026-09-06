@@ -266,7 +266,7 @@ final class ReasoningConfigurationTests: XCTestCase {
         {
           "provider": "baseten",
           "model": "zai-org/GLM-5.2",
-          "policy": {"mode": "follow_harness"},
+          "policy": {"mode": "on"},
           "available": true,
           "error": "",
           "warning": "",
@@ -278,7 +278,7 @@ final class ReasoningConfigurationTests: XCTestCase {
               "supported": true,
               "reachability": ["family:opus"],
               "failure_behaviors": [],
-              "available_modes": ["off", "follow_harness"],
+              "available_modes": ["on", "off", "follow_harness"],
               "available_efforts": [],
               "unavailable_reason": "",
               "error": ""
@@ -299,7 +299,7 @@ final class ReasoningConfigurationTests: XCTestCase {
             client: "claude-code",
             provider: "baseten",
             model: model,
-            policy: ReasoningPolicyValue(mode: .followHarness))
+            policy: ReasoningPolicyValue(mode: .on))
 
         let request = try XCTUnwrap(ReasoningURLProtocol.observedRequest)
         XCTAssertEqual(request.httpMethod, "POST")
@@ -315,16 +315,18 @@ final class ReasoningConfigurationTests: XCTestCase {
         XCTAssertEqual(object["model"] as? String, model)
         XCTAssertEqual(
             (object["policy"] as? [String: Any])?["mode"] as? String,
-            "follow_harness")
+            "on")
         XCTAssertEqual(snapshot.clients.map(\.name), ["claude-code"])
-        XCTAssertEqual(snapshot.clients[0].availableModes, [.off, .followHarness])
+        XCTAssertEqual(
+            snapshot.clients[0].availableModes,
+            [.on, .off, .followHarness])
     }
 
     func testDisplayDeduplicatesFamiliesAndUsesGatewayOrderedChoices() {
         let client = reasoningClient(
             configured: ["mode": "default"],
             effective: ["mode": "off"],
-            availableModes: ["off", "follow_harness"],
+            availableModes: ["off", "on", "follow_harness"],
             availableEfforts: ["low", "high"],
             families: ["fable", "opus", "sonnet", "haiku"])
         let live = [reasoningLiveModel(stale: false)]
@@ -338,10 +340,33 @@ final class ReasoningConfigurationTests: XCTestCase {
             ["Fable", "Haiku", "Opus", "Sonnet"])
         XCTAssertEqual(
             reasoningChoices(status: rows[0].status),
-            [.off, .followHarness, .effort("low"), .effort("high")])
+            [.on, .off])
         XCTAssertEqual(
             reasoningSelection(status: rows[0].status),
             .off)
+    }
+
+    func testBinaryControlsRequireAvailableOnAndOffProjection() {
+        func choices(
+            modes: [String],
+            available: Bool = true
+        ) -> [ReasoningChoice] {
+            let dictionary = reasoningStatusDictionary(
+                configured: ["mode": "default"],
+                effective: ["mode": "passthrough"],
+                availableModes: modes,
+                availableEfforts: ["low", "medium", "high"])
+            var projected = dictionary
+            projected["available"] = available
+            return reasoningChoices(
+                status: ClientReasoningStatus(dict: projected)!)
+        }
+
+        XCTAssertEqual(choices(modes: ["on", "off"]), [.on, .off])
+        XCTAssertTrue(choices(modes: ["on"]).isEmpty)
+        XCTAssertTrue(choices(modes: ["off"]).isEmpty)
+        XCTAssertTrue(
+            choices(modes: ["on", "off"], available: false).isEmpty)
     }
 
     func testDisplayIncludesOnlySelectedModelsFromBroadGatewayOptions() {
@@ -434,6 +459,111 @@ final class ReasoningConfigurationTests: XCTestCase {
         XCTAssertEqual(Set(rows.map(\.model)), [model, nemotron])
     }
 
+    func testDisplayIncludesEnabledPickerOnlyFastModelWithBinaryControls() {
+        let fast = "zai-org/GLM-5.2-Fast"
+        let client = reasoningVisibilityClient(
+            defaultModel: model,
+            families: [("opus", model)],
+            pickerEnabled: true,
+            pickerModels: [
+                ("claude-baseten-glm-5-2-fast", fast),
+            ])
+
+        let rows = reasoningRowsForDisplay(client: client, liveModels: [])
+        let fastRow = try! XCTUnwrap(rows.first { $0.model == fast })
+
+        XCTAssertEqual(reasoningSelection(status: fastRow.status), .off)
+        XCTAssertEqual(reasoningChoices(status: fastRow.status), [.on, .off])
+        XCTAssertTrue(fastRow.mappingFamilies.isEmpty)
+    }
+
+    func testDisplayExcludesModelsFromDisabledPicker() {
+        let fast = "zai-org/GLM-5.2-Fast"
+        let client = reasoningVisibilityClient(
+            defaultModel: model,
+            families: [("opus", model)],
+            pickerEnabled: false,
+            pickerModels: [
+                ("claude-baseten-glm-5-2-fast", fast),
+            ])
+
+        XCTAssertEqual(
+            reasoningRowsForDisplay(client: client, liveModels: []).map(\.model),
+            [model])
+    }
+
+    func testDisplayDeduplicatesPickerAliasesAndRoutingSelections() {
+        let fast = "zai-org/GLM-5.2-Fast"
+        let client = reasoningVisibilityClient(
+            defaultModel: fast,
+            families: [("opus", fast)],
+            subagentModel: fast,
+            subagentRouting: "on",
+            subagentEffective: fast,
+            pickerEnabled: true,
+            pickerModels: [
+                ("claude-baseten-glm-fast", fast),
+                ("claude-baseten-glm-fast-long", fast),
+                ("native", "native"),
+            ])
+
+        let rows = reasoningRowsForDisplay(client: client, liveModels: [])
+
+        XCTAssertEqual(rows.map(\.model), [fast])
+        XCTAssertEqual(rows[0].mappingFamilies, ["Opus"])
+    }
+
+    func testDisplayRetainsUnavailablePickerModelAsReadOnly() {
+        let retired = "moonshotai/Retired-Reasoner"
+        let client = reasoningVisibilityClient(
+            defaultModel: model,
+            families: [("opus", model)],
+            unavailableModels: [retired],
+            pickerEnabled: true,
+            pickerModels: [
+                ("claude-baseten-retired-reasoner", retired),
+            ])
+
+        let rows = reasoningRowsForDisplay(client: client, liveModels: [])
+        let retiredRow = try! XCTUnwrap(rows.first { $0.model == retired })
+
+        XCTAssertFalse(retiredRow.status.available)
+        XCTAssertTrue(reasoningChoices(status: retiredRow.status).isEmpty)
+        XCTAssertEqual(reasoningSelection(status: retiredRow.status), .off)
+        XCTAssertEqual(
+            retiredRow.status.unavailableReason,
+            "catalog_metadata_missing")
+    }
+
+    func testDisplayDoesNotInventPickerControlsWithoutAdminProjection() {
+        let pickerOnly = ClientStatus(dict: [
+            "name": "claude-code",
+            "enabled": true,
+            "bind_addr": "127.0.0.1:8789",
+            "model_picker": [
+                "enabled": true,
+                "models": [[
+                    "alias": "claude-baseten-example-reasoner",
+                    "slug": "example-org/Example-Reasoner",
+                    "label": "Example Reasoner",
+                    "description": "Served by Baseten.",
+                    "context_tokens": 32_000,
+                ]],
+            ],
+            "model_catalog": [[
+                "label": "Example Reasoner",
+                "storage_target": "claude-baseten-example-reasoner",
+                "slug": "example-org/Example-Reasoner",
+                "alias": "claude-baseten-example-reasoner",
+                "available": true,
+            ]],
+            "model_options": ["baseten": [:]],
+        ])!
+
+        XCTAssertTrue(
+            reasoningRowsForDisplay(client: pickerOnly, liveModels: []).isEmpty)
+    }
+
     func testDisplayExcludesInactiveAndInheritedSubagentTargets() {
         let nemotron = "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B"
         let inactive = reasoningVisibilityClient(
@@ -490,7 +620,7 @@ final class ReasoningConfigurationTests: XCTestCase {
         XCTAssertTrue(reasoningChoices(status: status).isEmpty)
         XCTAssertEqual(
             reasoningDefaultPassthroughReadOnlyLabel(),
-            "Reasoning stays on for this model")
+            "Uses provider default")
         XCTAssertEqual(
             reasoningSelection(status: status),
             .defaultPassthrough)
@@ -498,70 +628,74 @@ final class ReasoningConfigurationTests: XCTestCase {
         XCTAssertFalse(reasoningShowsUnavailableWarning(status))
     }
 
-    func testExplicitFollowHarnessRemainsEditableAndCanResetToSafeDefault() {
+    func testExplicitFollowHarnessRemainsLegacyAndCanResetToDefault() {
         let status = reasoningStatus(
             configured: ["mode": "follow_harness"],
             effective: ["mode": "follow_harness"],
-            availableModes: ["off", "follow_harness"],
+            availableModes: ["on", "off", "follow_harness"],
             availableEfforts: [])
 
         XCTAssertFalse(
             reasoningUsesDefaultPassthroughReadOnlyState(status))
         XCTAssertEqual(
             reasoningChoices(status: status),
-            [.off, .followHarness])
+            [.on, .off])
         XCTAssertEqual(
             reasoningSelection(status: status),
             .followHarness)
         XCTAssertTrue(reasoningShowsResetAction(status))
     }
 
-    func testDistinctOffAndFollowHarnessRemainEditable() {
+    func testBinaryControlsDoNotRelabelLegacyFollowHarness() {
         let defaultStatus = reasoningStatus(
             configured: ["mode": "default"],
             effective: ["mode": "off"],
-            availableModes: ["off", "follow_harness"],
+            availableModes: ["off", "on", "follow_harness"],
             availableEfforts: [])
 
         XCTAssertFalse(
             reasoningUsesDefaultPassthroughReadOnlyState(defaultStatus))
         XCTAssertEqual(
             reasoningChoices(status: defaultStatus),
-            [.off, .followHarness])
+            [.on, .off])
         XCTAssertEqual(reasoningSelection(status: defaultStatus), .off)
 
         let explicitStatus = reasoningStatus(
             configured: ["mode": "follow_harness"],
             effective: ["mode": "follow_harness"],
-            availableModes: ["off", "follow_harness"],
+            availableModes: ["off", "on", "follow_harness"],
             availableEfforts: [])
         XCTAssertFalse(
             reasoningUsesDefaultPassthroughReadOnlyState(explicitStatus))
         XCTAssertEqual(
             reasoningChoices(status: explicitStatus),
-            [.off, .followHarness])
+            [.on, .off])
+        XCTAssertEqual(
+            reasoningSelection(status: explicitStatus),
+            .followHarness)
+        XCTAssertNil(reasoningSelection(status: explicitStatus).policy)
         XCTAssertTrue(reasoningShowsResetAction(explicitStatus))
     }
 
-    func testResetIsHiddenOnlyForExplicitOffWithEffectiveOff() {
-        let noOpOff = reasoningStatus(
+    func testResetIsShownForEveryExplicitPolicy() {
+        let explicitOff = reasoningStatus(
             configured: ["mode": "off"],
             effective: ["mode": "off"],
-            availableModes: ["off", "follow_harness"],
+            availableModes: ["off", "on"],
             availableEfforts: [])
-        XCTAssertFalse(reasoningShowsResetAction(noOpOff))
+        XCTAssertTrue(reasoningShowsResetAction(explicitOff))
 
-        let behaviorChangingOff = reasoningStatus(
-            configured: ["mode": "off"],
-            effective: ["mode": "passthrough"],
-            availableModes: ["off", "follow_harness"],
+        let explicitOn = reasoningStatus(
+            configured: ["mode": "on"],
+            effective: ["mode": "on"],
+            availableModes: ["off", "on"],
             availableEfforts: [])
-        XCTAssertTrue(reasoningShowsResetAction(behaviorChangingOff))
+        XCTAssertTrue(reasoningShowsResetAction(explicitOn))
 
         let followHarness = reasoningStatus(
             configured: ["mode": "follow_harness"],
             effective: ["mode": "follow_harness"],
-            availableModes: ["off", "follow_harness"],
+            availableModes: ["off", "on", "follow_harness"],
             availableEfforts: [])
         XCTAssertTrue(reasoningShowsResetAction(followHarness))
 
@@ -571,6 +705,13 @@ final class ReasoningConfigurationTests: XCTestCase {
             availableModes: ["follow_harness"],
             availableEfforts: ["low", "high"])
         XCTAssertTrue(reasoningShowsResetAction(fixed))
+
+        let inherited = reasoningStatus(
+            configured: ["mode": "default"],
+            effective: ["mode": "off"],
+            availableModes: ["off", "on"],
+            availableEfforts: [])
+        XCTAssertFalse(reasoningShowsResetAction(inherited))
     }
 
     func testUnavailableDefaultOffDoesNotSynthesizeOffChoice() {
@@ -589,7 +730,7 @@ final class ReasoningConfigurationTests: XCTestCase {
             reasoningUsesDefaultPassthroughReadOnlyState(status))
         XCTAssertEqual(
             reasoningChoices(status: status),
-            [.followHarness])
+            [])
         XCTAssertFalse(reasoningChoices(status: status).contains(.off))
         XCTAssertEqual(reasoningSelection(status: status), .off)
         XCTAssertTrue(reasoningShowsUnavailableWarning(status))
@@ -607,6 +748,7 @@ final class ReasoningConfigurationTests: XCTestCase {
         XCTAssertEqual(
             reasoningSelection(status: removed),
             .unavailable("xhigh"))
+        XCTAssertTrue(reasoningChoices(status: removed).isEmpty)
         XCTAssertTrue(reasoningShowsResetAction(removed))
     }
 
@@ -647,7 +789,7 @@ final class ReasoningConfigurationTests: XCTestCase {
         let defaultClient = reasoningClient(
             configured: ["mode": "default"],
             effective: ["mode": "off"],
-            availableModes: ["off", "follow_harness"],
+            availableModes: ["off", "on", "follow_harness"],
             availableEfforts: [],
             source: "compatibility_default",
             families: ["fable", "opus", "sonnet", "haiku"])
@@ -656,12 +798,12 @@ final class ReasoningConfigurationTests: XCTestCase {
             liveModels: [reasoningLiveModel(stale: false)])[0]
         XCTAssertEqual(
             reasoningCaption(row: defaultRow, clientName: defaultClient.name),
-            "Safe default: reasoning off when Claude Code uses this model.")
+            "Safe default: Off.")
 
         let followClient = reasoningClient(
             configured: ["mode": "follow_harness"],
             effective: ["mode": "follow_harness"],
-            availableModes: ["off", "follow_harness"],
+            availableModes: ["off", "on", "follow_harness"],
             availableEfforts: [],
             families: ["fable", "opus", "sonnet", "haiku"])
         let followRow = reasoningRowsForDisplay(
@@ -669,10 +811,52 @@ final class ReasoningConfigurationTests: XCTestCase {
             liveModels: [reasoningLiveModel(stale: false)])[0]
         XCTAssertEqual(
             reasoningCaption(row: followRow, clientName: followClient.name),
-            "Claude Code’s reasoning setting passes through when the adapter supports it.")
+            "Saved legacy policy: follow Claude Code’s reasoning setting when supported.")
+
+        let onStatus = reasoningStatus(
+            configured: ["mode": "on"],
+            effective: ["mode": "on"],
+            availableModes: ["on", "off"],
+            availableEfforts: [])
+        let onRow = ReasoningDisplayRow(
+            provider: "baseten",
+            model: model,
+            displayName: "GLM 5.2",
+            status: onStatus,
+            capability: nil,
+            mappingFamilies: ["Opus"])
+        XCTAssertEqual(
+            reasoningCaption(row: onRow, clientName: "claude-code"),
+            "Switch enables reasoning. Claude Code effort is forwarded unchanged.")
+
+        var unavailableDictionary = reasoningStatusDictionary(
+            configured: ["mode": "on"],
+            effective: ["mode": "passthrough"],
+            availableModes: [],
+            availableEfforts: [])
+        unavailableDictionary["available"] = false
+        let unavailableRow = ReasoningDisplayRow(
+            provider: "baseten",
+            model: model,
+            displayName: "GLM 5.2",
+            status: ClientReasoningStatus(dict: unavailableDictionary)!,
+            capability: nil,
+            mappingFamilies: ["Opus"])
+        XCTAssertEqual(
+            reasoningCaption(
+                row: unavailableRow,
+                clientName: "claude-code"),
+            "Saved policy: On.")
     }
 
     func testReasoningDispatchAndReconciliationUseExactTypedProjection() {
+        XCTAssertEqual(
+            reasoningDispatchArgs(
+                client: "claude-code",
+                provider: "baseten",
+                model: model,
+                policy: ReasoningPolicyValue(mode: .on)),
+            ["claude", "reasoning", "baseten", model, "on"])
         XCTAssertEqual(
             reasoningDispatchArgs(
                 client: "claude-code",
@@ -739,7 +923,7 @@ final class ReasoningConfigurationTests: XCTestCase {
             client: "claude-code",
             provider: "baseten",
             model: model,
-            policy: ReasoningPolicyValue(mode: .followHarness)))
+            policy: ReasoningPolicyValue(mode: .on)))
         XCTAssertFalse(state.requestReasoning(
             client: "claude-code",
             provider: "baseten",
@@ -757,7 +941,7 @@ final class ReasoningConfigurationTests: XCTestCase {
                 "reasoning",
                 "baseten",
                 model,
-                "follow-harness",
+                "on",
             ])
         XCTAssertNil(state.pendingReasoning)
         state.stop()
@@ -780,7 +964,7 @@ final class ReasoningConfigurationTests: XCTestCase {
             client: "anthropic-fallback",
             provider: "baseten",
             model: model,
-            policy: ReasoningPolicyValue(mode: .followHarness)))
+            policy: ReasoningPolicyValue(mode: .on)))
         await waitUntil { state.pendingReasoning == nil }
 
         let clients = await preflight.clients
@@ -793,7 +977,7 @@ final class ReasoningConfigurationTests: XCTestCase {
                 "reasoning",
                 "baseten",
                 model,
-                "follow-harness",
+                "on",
             ])
         state.stop()
     }
@@ -951,14 +1135,18 @@ final class ReasoningConfigurationTests: XCTestCase {
         subagentModel: String = "",
         subagentRouting: String = "off",
         subagentEffective: String = "inherit",
-        unavailableModels: Set<String> = []
+        unavailableModels: Set<String> = [],
+        pickerEnabled: Bool? = nil,
+        pickerModels: [(alias: String, slug: String)] = []
     ) -> ClientStatus {
+        let fast = "zai-org/GLM-5.2-Fast"
         let kimi = "moonshotai/Kimi-K2.7-Code"
         let nemotron = "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B"
         let retired = "moonshotai/Retired-Reasoner"
         let gpt = "openai/gpt-oss-120b"
         let catalogModels = [
             (model, "GLM 5.2", "claude-baseten-glm-5-2"),
+            (fast, "GLM 5.2 Fast", "claude-baseten-glm-5-2-fast"),
             (kimi, "Kimi K2.7 Code", "claude-baseten-kimi-k2-7-code"),
             (nemotron, "Nemotron Ultra", "claude-baseten-nemotron-ultra"),
             (retired, "Retired Reasoner", "claude-baseten-retired-reasoner"),
@@ -974,7 +1162,7 @@ final class ReasoningConfigurationTests: XCTestCase {
                         "configured": ["mode": "default"],
                         "effective": ["mode": "off"],
                         "source": "compatibility_default",
-                        "available_modes": ["off", "follow_harness"],
+                        "available_modes": ["off", "on", "follow_harness"],
                         "available_efforts": [],
                         "available": available,
                         "unavailable_reason": available
@@ -984,7 +1172,7 @@ final class ReasoningConfigurationTests: XCTestCase {
                     ] as [String: Any],
                 ] as [String: Any])
         })
-        return ClientStatus(dict: [
+        var dictionary: [String: Any] = [
             "name": "claude-code",
             "enabled": true,
             "bind_addr": "127.0.0.1:8789",
@@ -1019,7 +1207,22 @@ final class ReasoningConfigurationTests: XCTestCase {
                 ] as [String: Any]
             },
             "model_options": ["baseten": options],
-        ])!
+        ]
+        if let pickerEnabled {
+            dictionary["model_picker"] = [
+                "enabled": pickerEnabled,
+                "models": pickerModels.map { pickerModel in
+                    [
+                        "alias": pickerModel.alias,
+                        "slug": pickerModel.slug,
+                        "label": "Picker model",
+                        "description": "Served by Baseten.",
+                        "context_tokens": 32_000,
+                    ] as [String: Any]
+                },
+            ]
+        }
+        return ClientStatus(dict: dictionary)!
     }
 
     private func reasoningLiveModel(stale: Bool) -> LiveModelCatalogEntry {
@@ -1084,7 +1287,7 @@ final class ReasoningConfigurationTests: XCTestCase {
         ReasoningPreflightSnapshot(dict: [
             "provider": "baseten",
             "model": model,
-            "policy": ["mode": "follow_harness"],
+            "policy": ["mode": "on"],
             "available": true,
             "error": "",
             "warning": "",
@@ -1110,7 +1313,7 @@ final class ReasoningConfigurationTests: XCTestCase {
                 ? []
                 : ["native_fallback", "local_error"],
             "available_modes": supported
-                ? ["off", "follow_harness"]
+                ? ["on", "off", "follow_harness"]
                 : ["off"],
             "available_efforts": [],
             "unavailable_reason": supported ? "" : "adapter_unsupported",
@@ -1143,7 +1346,9 @@ final class ReasoningConfigurationTests: XCTestCase {
                             "reasoning": reasoningStatusDictionary(
                                 configured: ["mode": "default"],
                                 effective: ["mode": "off"],
-                                availableModes: ["off", "follow_harness"],
+                                availableModes: [
+                                    "off", "on", "follow_harness",
+                                ],
                                 availableEfforts: []),
                         ],
                     ],

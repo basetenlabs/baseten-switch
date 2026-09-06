@@ -216,6 +216,7 @@ type Door struct {
 type ReasoningMode string
 
 const (
+	ReasoningOn            ReasoningMode = "on"
 	ReasoningOff           ReasoningMode = "off"
 	ReasoningFollowHarness ReasoningMode = "follow_harness"
 	ReasoningFixed         ReasoningMode = "fixed"
@@ -602,7 +603,7 @@ func validateModelOptions(
 // gateway.yaml, admin preflight, and typed mutation callers.
 func ValidateReasoningPolicy(policy ReasoningPolicy) error {
 	switch policy.Mode {
-	case ReasoningOff, ReasoningFollowHarness:
+	case ReasoningOn, ReasoningOff, ReasoningFollowHarness:
 		if policy.Effort != "" {
 			return fmt.Errorf(
 				"reasoning mode %q forbids effort",
