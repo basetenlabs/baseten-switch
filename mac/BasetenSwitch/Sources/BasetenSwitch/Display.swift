@@ -205,6 +205,11 @@ func reasoningRowsForDisplay(
        client.subagentEffective != "inherit" {
         select(client.subagentModel)
     }
+    if let modelPicker = client.modelPicker, modelPicker.enabled {
+        for pickerModel in modelPicker.models {
+            select(pickerModel.slug)
+        }
+    }
 
     var seenModels = Set<String>()
     return options.compactMap { optionModel, option in
