@@ -89,3 +89,10 @@ jobs:
 
       - name: Run the hermetic repository gate
         run: scripts/check.sh --offline
+
+      - name: Verify release and Homebrew publication contracts
+        run: |
+          scripts/release/test-release-contract.sh
+          scripts/release/test-release-workflow.sh
+          scripts/release/test-render-formula.sh
+          scripts/release/test-publish-homebrew.sh
