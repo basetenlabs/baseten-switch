@@ -1205,7 +1205,7 @@ func TestAnthropicListenerOpenAIRouteTranslates(t *testing.T) {
 	stop := start(t, g)
 	defer stop()
 
-	body := []byte(`{"model":"gpt-x","max_tokens":16,"system":"be brief","messages":[{"role":"user","content":"ping"}]}`)
+	body := []byte(`{"model":"gpt-x","max_tokens":16,"system":"be brief","tools":[{"name":"Artifact","input_schema":{"type":"object","properties":{"field":{"type":"string","pattern":"[^\\p{Cc}]+"}}}}],"messages":[{"role":"user","content":"ping"}]}`)
 	req, _ := http.NewRequest("POST", clientURL(g, "claude-code", "/v1/messages"), bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
@@ -1230,6 +1230,10 @@ func TestAnthropicListenerOpenAIRouteTranslates(t *testing.T) {
 	first := msgs[0].(map[string]interface{})
 	if first["role"] != "system" || first["content"] != "be brief" {
 		t.Fatalf("system prompt not converted: %v", msgs)
+	}
+	openAIToolField := up["tools"].([]interface{})[0].(map[string]interface{})["function"].(map[string]interface{})["parameters"].(map[string]interface{})["properties"].(map[string]interface{})["field"].(map[string]interface{})
+	if openAIToolField["pattern"] != `[^\p{Cc}]+` {
+		t.Fatalf("native OpenAI route must preserve ECMAScript pattern: %v", openAIToolField)
 	}
 	rb, _ := io.ReadAll(resp.Body)
 	var am map[string]interface{}
@@ -2618,7 +2622,7 @@ func TestBasetenUpstreamShapeOpenAITranslatesAndRewritesModel(t *testing.T) {
 	stop := start(t, g)
 	defer stop()
 
-	body := []byte(`{"model":"claude-opus-4-8","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`)
+	body := []byte(`{"model":"claude-opus-4-8","max_tokens":8,"tools":[{"name":"Artifact","input_schema":{"type":"object","properties":{"field":{"type":"string","pattern":"^(?!__.*__$)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}\"\\\\./[\\]]{1,200}$"}}}}],"messages":[{"role":"user","content":"hi"}]}`)
 	req, _ := http.NewRequest("POST", clientURL(g, "claude-code", "/v1/messages"), bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
@@ -2642,6 +2646,13 @@ func TestBasetenUpstreamShapeOpenAITranslatesAndRewritesModel(t *testing.T) {
 	}
 	if _, hasSystem := up["system"]; hasSystem {
 		t.Fatalf("anthropic system field leaked into openai body: %v", up)
+	}
+	toolField := up["tools"].([]interface{})[0].(map[string]interface{})["function"].(map[string]interface{})["parameters"].(map[string]interface{})["properties"].(map[string]interface{})["field"].(map[string]interface{})
+	if _, hasPattern := toolField["pattern"]; hasPattern {
+		t.Fatalf("Baseten-incompatible Unicode property pattern leaked upstream: %v", toolField)
+	}
+	if !strings.Contains(fmtString(toolField["description"]), `\p{Cc}`) {
+		t.Fatalf("removed pattern was not preserved as model guidance: %v", toolField)
 	}
 	rows := waitForRows(t, cfg.TelemetryDir, 1, 2*time.Second)
 	if !rows[0].Translated || rows[0].ConfiguredRoute != "baseten" {
