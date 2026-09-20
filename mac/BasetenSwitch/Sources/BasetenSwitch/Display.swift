@@ -273,7 +273,7 @@ func reasoningUsesDefaultPassthroughReadOnlyState(
 }
 
 func reasoningDefaultPassthroughReadOnlyLabel() -> String {
-    "Uses provider default"
+    "Switch does not override reasoning"
 }
 
 func reasoningShowsResetAction(
@@ -361,10 +361,10 @@ func reasoningCaption(
     case .default, .passthrough:
         if row.status.source == "compatibility_default",
            row.status.effective.mode == .off {
-            return "Safe default: Off."
+            return "Switch defaults reasoning to Off for this model."
         }
         if row.status.effective.mode == .passthrough {
-            return "Default: provider behavior is unchanged."
+            return "Switch does not override reasoning."
         }
         return "Used when \(client) routes to this Baseten model."
     }

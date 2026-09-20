@@ -692,10 +692,27 @@ func parseModelsDevReasoningOption(
 		if err := rejectUnexpectedReasoningOptionFields(
 			fields,
 			"type",
+			"api",
+			"default_mode",
 		); err != nil {
 			return ReasoningOption{}, false, err
 		}
-		option := ReasoningOption{Type: ReasoningToggle}
+		api, err := parseOptionalReasoningString(fields, "api")
+		if err != nil {
+			return ReasoningOption{}, false, err
+		}
+		defaultMode, err := parseOptionalReasoningString(
+			fields,
+			"default_mode",
+		)
+		if err != nil {
+			return ReasoningOption{}, false, err
+		}
+		option := ReasoningOption{
+			Type:        ReasoningToggle,
+			API:         ReasoningOptionAPI(api),
+			DefaultMode: ReasoningDefaultMode(defaultMode),
+		}
 		if err := validateReasoningOption(option); err != nil {
 			return ReasoningOption{}, false, err
 		}
@@ -775,6 +792,25 @@ func parseModelsDevReasoningOption(
 		// their complete semantics. Preserve the known options in this model.
 		return ReasoningOption{}, false, nil
 	}
+}
+
+func parseOptionalReasoningString(
+	fields map[string]json.RawMessage,
+	name string,
+) (string, error) {
+	raw, ok := fields[name]
+	if !ok {
+		return "", nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return "", fmt.Errorf("%s is not a string", name)
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil || value == "" ||
+		strings.TrimSpace(value) != value {
+		return "", fmt.Errorf("%s is not a non-empty trimmed string", name)
+	}
+	return value, nil
 }
 
 func rejectUnexpectedReasoningOptionFields(

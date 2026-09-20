@@ -464,6 +464,7 @@ func TestReasoningPolicyUnsupportedAdapterDefaultsPassthrough(t *testing.T) {
 func TestReasoningPolicyModelsWithoutOffDefaultPassthrough(t *testing.T) {
 	for _, model := range []string{
 		"deepseek-ai/DeepSeek-V4-Pro",
+		"example/Scoped-Reasoning",
 		"example/No-Control",
 	} {
 		t.Run(model, func(t *testing.T) {
@@ -821,6 +822,15 @@ func TestReasoningPolicyRuntimeFallbackPreservesNativeBody(t *testing.T) {
 		{
 			name:           "explicit On",
 			targetModel:    "zai-org/GLM-5.2-Fast",
+			stored:         &config.ReasoningPolicy{Mode: config.ReasoningOn},
+			wantMode:       "on",
+			wantEnabled:    true,
+			wantSource:     "user_config",
+			assertThinking: assertGatewayThinkingEnabled,
+		},
+		{
+			name:           "catalog scoped explicit On",
+			targetModel:    "example/Scoped-Reasoning",
 			stored:         &config.ReasoningPolicy{Mode: config.ReasoningOn},
 			wantMode:       "on",
 			wantEnabled:    true,

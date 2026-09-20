@@ -52,11 +52,13 @@ type RequestedReasoning struct {
 }
 
 type Capability struct {
-	Known        bool
-	Supported    bool
-	Toggle       bool
-	Efforts      []string
-	BudgetTokens bool
+	Known                 bool
+	Supported             bool
+	Toggle                bool
+	MessagesExplicitOnOff bool
+	MessagesDefaultOff    bool
+	Efforts               []string
+	BudgetTokens          bool
 }
 
 type StoredPolicy struct {
@@ -292,6 +294,10 @@ func supportsMessagesDefaultOff(in Input) bool {
 	if in.Capability.Toggle {
 		return true
 	}
+	if in.Capability.MessagesExplicitOnOff &&
+		in.Capability.MessagesDefaultOff {
+		return true
+	}
 	compatibility, ok := reviewedMessagesCompatibilityFor(in)
 	return ok && compatibility.ExplicitOnOff && compatibility.DefaultOff
 }
@@ -303,7 +309,7 @@ func supportsMessagesExplicitOnOff(in Input) bool {
 		!in.Capability.Supported {
 		return false
 	}
-	if in.Capability.Toggle {
+	if in.Capability.Toggle || in.Capability.MessagesExplicitOnOff {
 		return true
 	}
 	compatibility, ok := reviewedMessagesCompatibilityFor(in)

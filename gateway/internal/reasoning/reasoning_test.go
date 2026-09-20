@@ -30,6 +30,20 @@ func glmFastEffortInput() Input {
 	}
 }
 
+func scopedMessagesInput() Input {
+	return Input{
+		Provider:         "baseten",
+		CanonicalModelID: "example/Scoped-Reasoning-Test",
+		WireShape:        WireAnthropicMessages,
+		Capability: Capability{
+			Known:                 true,
+			Supported:             true,
+			MessagesExplicitOnOff: true,
+			Efforts:               []string{"low", "high"},
+		},
+	}
+}
+
 func TestResolveCompatibilityAndConfiguredPolicies(t *testing.T) {
 	t.Run("toggle models default off independent of identity", func(t *testing.T) {
 		for _, model := range []string{
@@ -88,6 +102,55 @@ func TestResolveCompatibilityAndConfiguredPolicies(t *testing.T) {
 		}
 	})
 
+	t.Run("exact compatibility overrides scoped passthrough default", func(t *testing.T) {
+		in := glmFastEffortInput()
+		in.Capability.MessagesExplicitOnOff = true
+		got, err := Resolve(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Mode != ModeOff || got.Source != SourceCompatibilityDefault {
+			t.Fatalf("decision = %+v, want compatibility Off", got)
+		}
+	})
+
+	t.Run("scoped Messages control preserves passthrough default", func(t *testing.T) {
+		got, err := Resolve(scopedMessagesInput())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Mode != ModePassthrough ||
+			got.Source != SourceInternalPassthrough {
+			t.Fatalf("decision = %+v, want passthrough", got)
+		}
+	})
+
+	t.Run("scoped Messages control can declare default off", func(t *testing.T) {
+		in := scopedMessagesInput()
+		in.Capability.MessagesDefaultOff = true
+		got, err := Resolve(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Mode != ModeOff || got.Source != SourceCompatibilityDefault {
+			t.Fatalf("decision = %+v, want compatibility Off", got)
+		}
+	})
+
+	t.Run("scoped default off without its control is ignored", func(t *testing.T) {
+		in := scopedMessagesInput()
+		in.Capability.MessagesExplicitOnOff = false
+		in.Capability.MessagesDefaultOff = true
+		got, err := Resolve(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Mode != ModePassthrough ||
+			got.Source != SourceInternalPassthrough {
+			t.Fatalf("decision = %+v, want passthrough", got)
+		}
+	})
+
 	t.Run("reviewed default compatibility is exact and validated", func(t *testing.T) {
 		for _, tc := range []struct {
 			name   string
@@ -121,6 +184,19 @@ func TestResolveCompatibilityAndConfiguredPolicies(t *testing.T) {
 		}{
 			{name: "catalog toggle", input: glmInput()},
 			{name: "reviewed exact model", input: glmFastEffortInput()},
+			{
+				name:  "scoped Messages control",
+				input: scopedMessagesInput(),
+			},
+			{
+				name: "scoped control on another wire",
+				input: func() Input {
+					in := scopedMessagesInput()
+					in.WireShape = WireOpenAIResponses
+					return in
+				}(),
+				wantError: true,
+			},
 			{
 				name: "neighboring model",
 				input: func() Input {
@@ -177,6 +253,14 @@ func TestResolveCompatibilityAndConfiguredPolicies(t *testing.T) {
 
 	t.Run("reviewed explicit compatibility does not broaden follow harness", func(t *testing.T) {
 		in := glmFastEffortInput()
+		in.Stored = StoredPolicy{Present: true, Mode: ModeFollowHarness}
+		if _, err := Resolve(in); !IsPolicyError(err) {
+			t.Fatalf("error = %v, want policy error", err)
+		}
+	})
+
+	t.Run("scoped Messages control does not broaden follow harness", func(t *testing.T) {
+		in := scopedMessagesInput()
 		in.Stored = StoredPolicy{Present: true, Mode: ModeFollowHarness}
 		if _, err := Resolve(in); !IsPolicyError(err) {
 			t.Fatalf("error = %v, want policy error", err)
@@ -410,6 +494,21 @@ func TestReviewedAdapterAvailability(t *testing.T) {
 		}
 	})
 
+	t.Run("scoped Messages control is identity independent", func(t *testing.T) {
+		for _, model := range []string{
+			"example/Scoped-Reasoning-Test",
+			"future/Unseen-Reasoning-Test",
+		} {
+			in := scopedMessagesInput()
+			in.CanonicalModelID = model
+			got := ReviewedAdapterAvailability(in)
+			want := []Mode{ModeOff, ModeOn}
+			if !reflect.DeepEqual(got.Modes, want) || len(got.Efforts) != 0 {
+				t.Fatalf("%s availability = %+v, want modes %v", model, got, want)
+			}
+		}
+	})
+
 	t.Run("reviewed compatibility is exact provider and model scoped", func(t *testing.T) {
 		for _, mutate := range []func(*Input){
 			func(in *Input) { in.Provider = "example" },
@@ -580,6 +679,17 @@ func TestApplyAnthropicMessagesForcedOnAndOff(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestApplyAnthropicMessagesPassthroughPreservesExactBytes(t *testing.T) {
+	body := []byte("  {\n\t\"thinking\": {\"type\":\"adaptive\"},\n\t\"output_config\":{\"effort\":\"medium\"}\n}  ")
+	got, err := ApplyAnthropicMessages(body, Decision{Mode: ModePassthrough})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("passthrough changed bytes\n got: %q\nwant: %q", got, body)
 	}
 }
 

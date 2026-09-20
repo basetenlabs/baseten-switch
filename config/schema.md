@@ -112,7 +112,7 @@ projection.
 
 `global.model_options` is not accepted. Model options are client-scoped.
 
-An absent override uses the runtime safe default. A catalog toggle on the
+An absent override uses the runtime safe default. An unscoped catalog toggle on the
 reviewed Messages adapter defaults to Off. An exact reviewed compatibility can
 also define an Off default for a known, reasoning-capable model. All other
 models default to passthrough. Therefore the canonical `gateway.example.yaml`
@@ -124,13 +124,39 @@ and defaults to Off when its catalog metadata reports reasoning support.
 Available modes depend on both the selected model's catalog capabilities and
 the client's protocol. The UI exposes only controls that the active
 combination supports. Claude Messages supports On, Off, and `follow_harness`
-for catalog models with a reasoning toggle, but not categorical effort values.
+for catalog models with an unscoped reasoning toggle, but not categorical effort values.
 An exact reviewed adapter compatibility may expose On and Off, and may select
 Off as that model's safe default, without changing its catalog metadata. The
 full app offers only projected On and Off choices. Saved legacy
 `follow_harness` and `fixed` policies remain visible and resettable but are not
 new UI choices. Other protocols expose exact catalog efforts only when they can
 encode them.
+
+Switch also recognizes an API-scoped catalog toggle for a Messages-specific
+binary control:
+
+```json
+{
+  "reasoning": true,
+  "reasoning_options": [
+    {"type": "effort", "values": ["low", "high"]},
+    {
+      "type": "toggle",
+      "api": "anthropic_messages",
+      "default_mode": "passthrough"
+    }
+  ]
+}
+```
+
+This is a supported catalog ingestion shape, not a claim that a catalog
+publisher currently emits it for any particular model. `api` accepts only
+`anthropic_messages`. `default_mode` accepts `passthrough` or `off`; omitting
+it means `passthrough`. The scoped toggle adds only On and Off for the reviewed
+same-shape Messages adapter. It does not map categorical effort, and it does not
+enable `follow_harness`. A legacy unscoped `{"type":"toggle"}` keeps its
+existing On, Off, `follow_harness`, and default-Off behavior. Publishers must
+not combine scoped and unscoped toggles for one model.
 
 On and Off replace only the top-level Messages `thinking` object with the
 reviewed enabled or disabled form. Other request fields remain unchanged,
@@ -141,8 +167,9 @@ and the [Baseten Messages reference](https://docs.baseten.co/reference/inference
 
 Resetting a model removes its explicit override and recomputes the safe
 default. The full app labels this action `Reset to Safe Default`. A model with
-no editable control and default passthrough is a valid read-only provider
-default, not a configuration error.
+no editable control and default passthrough is a valid read-only state, not a
+configuration error. The app labels it `Switch does not override reasoning`;
+this does not mean reasoning is disabled.
 
 ## `clients[]`
 

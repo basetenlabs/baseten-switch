@@ -1247,7 +1247,7 @@ private struct ClientRoutingView: View {
             } content: {
                 VStack(alignment: .leading, spacing: 10) {
                 Text(
-                    "Switch controls reasoning on or off. \(clientDisplayName(client.name)) effort is forwarded unchanged; support for effort levels depends on the model.")
+                    "Choose On or Off where Switch can control reasoning. \(clientDisplayName(client.name)) effort is forwarded unchanged. For other models, Switch does not override reasoning.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
 

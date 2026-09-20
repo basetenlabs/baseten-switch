@@ -44,7 +44,8 @@ const adminReasoningCatalogFixture = `{
         "family": "glm",
         "reasoning": true,
         "reasoning_options": [
-          {"type": "effort", "values": ["none", "high", "max"]}
+          {"type": "effort", "values": ["none", "high", "max"]},
+          {"type": "toggle", "api": "anthropic_messages", "default_mode": "passthrough"}
         ]
       },
       "moonshotai/Kimi-K2.7-Code": {
@@ -65,6 +66,15 @@ const adminReasoningCatalogFixture = `{
         "reasoning": true,
         "reasoning_options": [
           {"type": "effort", "values": ["low", "high"]}
+        ]
+      },
+      "example/Scoped-Reasoning": {
+        "id": "example/Scoped-Reasoning",
+        "name": "Scoped Reasoning",
+        "reasoning": true,
+        "reasoning_options": [
+          {"type": "effort", "values": ["low", "high"]},
+          {"type": "toggle", "api": "anthropic_messages"}
         ]
       },
       "example/No-Control": {
@@ -207,6 +217,13 @@ func TestClientReasoningProjectionDefaultsFromCapabilityAndAdapter(
 			wantModes:  []string{},
 		},
 		{
+			name:       "scoped Messages toggle is editable with passthrough default",
+			model:      "example/Scoped-Reasoning",
+			wantMode:   "passthrough",
+			wantSource: "internal_passthrough",
+			wantModes:  []string{"off", "on"},
+		},
+		{
 			name:       "no controls is read-only passthrough",
 			model:      "example/No-Control",
 			wantMode:   "passthrough",
@@ -269,6 +286,82 @@ func TestClientReasoningProjectionFastExplicitOn(t *testing.T) {
 		status.UnavailableReason != "" ||
 		status.Error != "" {
 		t.Fatalf("projection = %+v", status)
+	}
+}
+
+func TestClientReasoningProjectionWaitsForScopedCatalogDeclaration(
+	t *testing.T,
+) {
+	catalog := pricing.New()
+	withoutScopedToggle := strings.Replace(
+		adminReasoningCatalogFixture,
+		`,
+          {"type": "toggle", "api": "anthropic_messages"}`,
+		``,
+		1,
+	)
+	if withoutScopedToggle == adminReasoningCatalogFixture {
+		t.Fatal("test fixture did not remove scoped toggle")
+	}
+	capturedAt := time.Now().UTC()
+	if err := catalog.ReplaceModelsDev(
+		[]byte(withoutScopedToggle), capturedAt, `"before-scoped-toggle"`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	rc := resolvedClientConfig{
+		Name:          "claude-code",
+		ProtocolShape: "anthropic",
+		Route:         "baseten",
+		DefaultModel:  "example/Scoped-Reasoning",
+	}
+	before := computeClientModelOptions(
+		rc,
+		catalog.Capture(),
+	)[pricing.ProviderBaseten][rc.DefaultModel].Reasoning
+	if before == nil || before.Effective.Mode != "passthrough" ||
+		len(before.AvailableModes) != 0 {
+		t.Fatalf("pre-refresh projection = %+v", before)
+	}
+
+	if err := catalog.ReplaceModelsDev(
+		[]byte(adminReasoningCatalogFixture),
+		capturedAt.Add(time.Minute),
+		`"after-scoped-toggle"`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	after := computeClientModelOptions(
+		rc,
+		catalog.Capture(),
+	)[pricing.ProviderBaseten][rc.DefaultModel].Reasoning
+	if after == nil || after.Effective.Mode != "passthrough" ||
+		after.Source != "internal_passthrough" ||
+		!slices.Equal(after.AvailableModes, []string{"off", "on"}) {
+		t.Fatalf("post-refresh projection = %+v", after)
+	}
+
+	withOffDefault := strings.Replace(
+		adminReasoningCatalogFixture,
+		`{"type": "toggle", "api": "anthropic_messages"}`,
+		`{"type": "toggle", "api": "anthropic_messages", "default_mode": "off"}`,
+		1,
+	)
+	if err := catalog.ReplaceModelsDev(
+		[]byte(withOffDefault),
+		capturedAt.Add(2*time.Minute),
+		`"scoped-toggle-off-default"`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	offDefault := computeClientModelOptions(
+		rc,
+		catalog.Capture(),
+	)[pricing.ProviderBaseten][rc.DefaultModel].Reasoning
+	if offDefault == nil || offDefault.Effective.Mode != "off" ||
+		offDefault.Source != "compatibility_default" ||
+		!slices.Equal(offDefault.AvailableModes, []string{"off", "on"}) {
+		t.Fatalf("scoped Off-default projection = %+v", offDefault)
 	}
 }
 

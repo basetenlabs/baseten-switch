@@ -109,19 +109,61 @@ type ModelAvailability struct {
 
 type ReasoningOptionType string
 
+type ReasoningOptionAPI string
+
+type ReasoningDefaultMode string
+
 const (
 	ReasoningToggle       ReasoningOptionType = "toggle"
 	ReasoningEffort       ReasoningOptionType = "effort"
 	ReasoningBudgetTokens ReasoningOptionType = "budget_tokens"
+
+	ReasoningAPIAnthropicMessages ReasoningOptionAPI = "anthropic_messages"
+
+	ReasoningDefaultPassthrough ReasoningDefaultMode = "passthrough"
+	ReasoningDefaultOff         ReasoningDefaultMode = "off"
 )
 
 // ReasoningOption is one provider-scoped semantic control advertised by the
 // model catalog. It intentionally contains no provider request-field names.
+// An unscoped toggle retains the legacy unscoped capability semantics. An
+// API-scoped toggle declares only the named protocol control, with an
+// independent safe default.
 type ReasoningOption struct {
-	Type   ReasoningOptionType `json:"type"`
-	Values []*string           `json:"values,omitempty"`
-	Min    *int64              `json:"min,omitempty"`
-	Max    *int64              `json:"max,omitempty"`
+	Type        ReasoningOptionType  `json:"type"`
+	API         ReasoningOptionAPI   `json:"api,omitempty"`
+	DefaultMode ReasoningDefaultMode `json:"default_mode,omitempty"`
+	Values      []*string            `json:"values,omitempty"`
+	Min         *int64               `json:"min,omitempty"`
+	Max         *int64               `json:"max,omitempty"`
+}
+
+func (option *ReasoningOption) UnmarshalJSON(body []byte) error {
+	type reasoningOptionJSON ReasoningOption
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil || fields == nil {
+		return fmt.Errorf("reasoning option is not an object")
+	}
+	allowed := map[string]bool{
+		"type": true, "api": true, "default_mode": true,
+		"values": true, "min": true, "max": true,
+	}
+	for name := range fields {
+		if !allowed[name] {
+			return fmt.Errorf("reasoning option field %q is unknown", name)
+		}
+	}
+	for _, name := range []string{"api", "default_mode"} {
+		if _, err := parseOptionalReasoningString(fields, name); err != nil {
+			return fmt.Errorf("reasoning option: %w", err)
+		}
+	}
+	var decoded reasoningOptionJSON
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return err
+	}
+	*option = ReasoningOption(decoded)
+	return nil
 }
 
 // ReasoningCapability distinguishes unsupported reasoning from supported
@@ -368,10 +410,20 @@ func validateReasoningCapability(capability ReasoningCapability) error {
 	if !capability.Supported && len(capability.Options) != 0 {
 		return fmt.Errorf("unsupported reasoning cannot advertise options")
 	}
+	seenToggleAPIs := map[ReasoningOptionAPI]bool{}
 	for index, option := range capability.Options {
 		if err := validateReasoningOption(option); err != nil {
 			return fmt.Errorf("option %d: %w", index, err)
 		}
+		if option.Type == ReasoningToggle {
+			if seenToggleAPIs[option.API] {
+				return fmt.Errorf("toggle API %q is duplicated", option.API)
+			}
+			seenToggleAPIs[option.API] = true
+		}
+	}
+	if seenToggleAPIs[""] && len(seenToggleAPIs) != 1 {
+		return fmt.Errorf("unscoped and API-scoped toggles cannot be combined")
 	}
 	return nil
 }
@@ -382,7 +434,27 @@ func validateReasoningOption(option ReasoningOption) error {
 		if len(option.Values) != 0 || option.Min != nil || option.Max != nil {
 			return fmt.Errorf("toggle contains fields for another option type")
 		}
+		switch option.API {
+		case "":
+			if option.DefaultMode != "" {
+				return fmt.Errorf("unscoped toggle cannot declare default_mode")
+			}
+		case ReasoningAPIAnthropicMessages:
+			switch option.DefaultMode {
+			case "", ReasoningDefaultPassthrough, ReasoningDefaultOff:
+			default:
+				return fmt.Errorf(
+					"toggle default_mode %q is invalid",
+					option.DefaultMode,
+				)
+			}
+		default:
+			return fmt.Errorf("toggle API %q is invalid", option.API)
+		}
 	case ReasoningEffort:
+		if option.API != "" || option.DefaultMode != "" {
+			return fmt.Errorf("effort contains toggle fields")
+		}
 		if option.Min != nil || option.Max != nil {
 			return fmt.Errorf("effort contains budget bounds")
 		}
@@ -395,6 +467,9 @@ func validateReasoningOption(option ReasoningOption) error {
 			}
 		}
 	case ReasoningBudgetTokens:
+		if option.API != "" || option.DefaultMode != "" {
+			return fmt.Errorf("budget_tokens contains toggle fields")
+		}
 		if len(option.Values) != 0 {
 			return fmt.Errorf("budget_tokens contains effort values")
 		}

@@ -369,6 +369,90 @@ final class ReasoningConfigurationTests: XCTestCase {
             choices(modes: ["on", "off"], available: false).isEmpty)
     }
 
+    func testBinaryControlsFollowProjectionWithoutModelNameGates() {
+        let projectedModel = "example-org/Catalog-Reasoner"
+        let familiarModel = "zai-org/GLM-5.2-Fast"
+        let client = ClientStatus(dict: [
+            "name": "claude-code",
+            "enabled": true,
+            "bind_addr": "127.0.0.1:8789",
+            "families": [[
+                "family": "opus",
+                "configured_target": projectedModel,
+                "configured_source": "explicit",
+            ]],
+            "model_picker": [
+                "enabled": true,
+                "models": [
+                    [
+                        "alias": "claude-baseten-catalog-reasoner",
+                        "slug": projectedModel,
+                        "label": "Catalog Reasoner",
+                        "description": "Served by Baseten.",
+                        "context_tokens": 32_000,
+                    ],
+                    [
+                        "alias": "claude-baseten-familiar-model",
+                        "slug": familiarModel,
+                        "label": "Familiar Model",
+                        "description": "Served by Baseten.",
+                        "context_tokens": 32_000,
+                    ],
+                ],
+            ],
+            "model_catalog": [
+                [
+                    "label": "Catalog Reasoner",
+                    "storage_target": "claude-baseten-catalog-reasoner",
+                    "slug": projectedModel,
+                    "alias": "claude-baseten-catalog-reasoner",
+                    "available": true,
+                ],
+                [
+                    "label": "Familiar Model",
+                    "storage_target": "claude-baseten-familiar-model",
+                    "slug": familiarModel,
+                    "alias": "claude-baseten-familiar-model",
+                    "available": true,
+                ],
+            ],
+            "model_options": [
+                "baseten": [
+                    projectedModel: [
+                        "reasoning": reasoningStatusDictionary(
+                            configured: ["mode": "default"],
+                            effective: ["mode": "passthrough"],
+                            availableModes: ["on", "off"],
+                            availableEfforts: []),
+                    ],
+                    familiarModel: [
+                        "reasoning": reasoningStatusDictionary(
+                            configured: ["mode": "default"],
+                            effective: ["mode": "passthrough"],
+                            availableModes: [],
+                            availableEfforts: []),
+                    ],
+                ],
+            ],
+        ])!
+
+        let rows = reasoningRowsForDisplay(client: client, liveModels: [])
+        let projectedRow = try! XCTUnwrap(
+            rows.first { $0.model == projectedModel })
+        let familiarRow = try! XCTUnwrap(
+            rows.first { $0.model == familiarModel })
+
+        XCTAssertEqual(
+            reasoningChoices(status: projectedRow.status),
+            [.on, .off])
+        XCTAssertEqual(
+            reasoningSelection(status: projectedRow.status),
+            .defaultPassthrough)
+        XCTAssertTrue(reasoningChoices(status: familiarRow.status).isEmpty)
+        XCTAssertTrue(
+            reasoningUsesDefaultPassthroughReadOnlyState(familiarRow.status))
+    }
+
     func testDisplayIncludesOnlySelectedModelsFromBroadGatewayOptions() {
         let client = reasoningVisibilityClient(
             defaultModel: model,
@@ -620,7 +704,7 @@ final class ReasoningConfigurationTests: XCTestCase {
         XCTAssertTrue(reasoningChoices(status: status).isEmpty)
         XCTAssertEqual(
             reasoningDefaultPassthroughReadOnlyLabel(),
-            "Uses provider default")
+            "Switch does not override reasoning")
         XCTAssertEqual(
             reasoningSelection(status: status),
             .defaultPassthrough)
@@ -798,7 +882,25 @@ final class ReasoningConfigurationTests: XCTestCase {
             liveModels: [reasoningLiveModel(stale: false)])[0]
         XCTAssertEqual(
             reasoningCaption(row: defaultRow, clientName: defaultClient.name),
-            "Safe default: Off.")
+            "Switch defaults reasoning to Off for this model.")
+
+        let passthroughStatus = reasoningStatus(
+            configured: ["mode": "default"],
+            effective: ["mode": "passthrough"],
+            availableModes: ["on", "off"],
+            availableEfforts: [])
+        let passthroughRow = ReasoningDisplayRow(
+            provider: "baseten",
+            model: "example-org/Catalog-Reasoner",
+            displayName: "Catalog Reasoner",
+            status: passthroughStatus,
+            capability: nil,
+            mappingFamilies: [])
+        XCTAssertEqual(
+            reasoningCaption(
+                row: passthroughRow,
+                clientName: defaultClient.name),
+            "Switch does not override reasoning.")
 
         let followClient = reasoningClient(
             configured: ["mode": "follow_harness"],
