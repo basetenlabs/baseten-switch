@@ -143,6 +143,29 @@ which intentionally contains the key.
 
 ## Writing tests: isolation seams
 
+### Disposable VM cleanup
+
+When testing in a virtual machine, include its disk in the test cleanup plan.
+Stopping a VM does not delete its disk. Keep an environment needed for pending
+manual review, then make an explicit retention or deletion decision when that
+review finishes or is canceled.
+
+- Identify the exact VM and the test task that owns it. Preserve required test
+  evidence and guest-only work before removal.
+- Complete fixture restoration and release test-session ownership before
+  stopping the VM. Unresolved recovery is a reason to retain it and report a
+  blocker, not to bypass the cleanup checks.
+- Obtain approval covering the exact VMs before deleting their disks. Protect
+  running tests, pending manual reviews, other tasks' environments and reusable
+  base images. Age or stopped state alone does not establish that a VM is unused.
+- Use the VM manager's supported deletion command for the approved targets.
+  Avoid wildcard pruning. Verify removal and actual host free space afterward.
+- At test closeout, report deleted VMs and storage reclaimed. For each retained
+  VM, record an owner, retention reason and next review date. Review these records
+  and available disk space before allocating more test VMs.
+
+### Runtime isolation
+
 Production code honors env overrides so tests and scratch instances never
 touch real state. Any test that boots a component must set the relevant ones:
 
