@@ -11,6 +11,7 @@ func TestValidateRoutingPolicyAcceptsClientReasoningModes(t *testing.T) {
 		name   string
 		policy ReasoningPolicy
 	}{
+		{name: "on", policy: ReasoningPolicy{Mode: ReasoningOn}},
 		{name: "off", policy: ReasoningPolicy{Mode: ReasoningOff}},
 		{name: "follow harness", policy: ReasoningPolicy{Mode: ReasoningFollowHarness}},
 		{name: "fixed effort", policy: ReasoningPolicy{Mode: ReasoningFixed, Effort: "high"}},
@@ -94,6 +95,20 @@ func TestValidateRoutingPolicyRejectsInvalidClientReasoningStructure(t *testing.
 				},
 			},
 			want: `mode "fixed" requires effort`,
+		},
+		{
+			name: "on with effort",
+			options: ModelOptions{
+				"baseten": {
+					"zai-org/GLM-5.2-Fast": ModelOption{
+						Reasoning: &ReasoningPolicy{
+							Mode:   ReasoningOn,
+							Effort: "medium",
+						},
+					},
+				},
+			},
+			want: `mode "on" forbids effort`,
 		},
 		{
 			name: "off with effort",

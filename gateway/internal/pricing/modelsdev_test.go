@@ -78,6 +78,15 @@ const modelsDevFixture = `{
           {"type": "budget_tokens", "min": -1, "max": 32000}
         ]
       },
+      "example/Scoped-Reasoning-Test": {
+        "id": "example/Scoped-Reasoning-Test",
+        "name": "Scoped Reasoning Test",
+        "reasoning": true,
+        "reasoning_options": [
+          {"type": "effort", "values": ["low", "high"]},
+          {"type": "toggle", "api": "anthropic_messages", "default_mode": "passthrough"}
+        ]
+      },
       "empty-options/Reasoning-Test": {
         "id": "empty-options/Reasoning-Test",
         "name": "Empty Options Reasoning Test",
@@ -377,6 +386,18 @@ func TestModelsDevReasoningPreservesProviderScopedOptions(t *testing.T) {
 		t.Fatalf("budget option = %+v", deepseek.Options[1])
 	}
 
+	scoped, ok := p.Capture().ModelReasoning(
+		ProviderBaseten,
+		"example/Scoped-Reasoning-Test",
+	)
+	if !ok || len(scoped.Options) != 2 ||
+		scoped.Options[0].Type != ReasoningEffort ||
+		scoped.Options[1].Type != ReasoningToggle ||
+		scoped.Options[1].API != ReasoningAPIAnthropicMessages ||
+		scoped.Options[1].DefaultMode != ReasoningDefaultPassthrough {
+		t.Fatalf("scoped reasoning = %+v, found=%t", scoped, ok)
+	}
+
 	emptyOptions, ok := p.Capture().ModelReasoning(
 		ProviderBaseten,
 		"empty-options/Reasoning-Test",
@@ -484,6 +505,41 @@ func TestReasoningEffortTokenValidationIsForwardCompatible(t *testing.T) {
 	}
 }
 
+func TestScopedMessagesToggleDefaultsAreTyped(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		body        string
+		wantDefault ReasoningDefaultMode
+	}{
+		{
+			name: "omitted means passthrough",
+			body: `{"type":"toggle","api":"anthropic_messages"}`,
+		},
+		{
+			name:        "explicit passthrough",
+			body:        `{"type":"toggle","api":"anthropic_messages","default_mode":"passthrough"}`,
+			wantDefault: ReasoningDefaultPassthrough,
+		},
+		{
+			name:        "explicit off",
+			body:        `{"type":"toggle","api":"anthropic_messages","default_mode":"off"}`,
+			wantDefault: ReasoningDefaultOff,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			option, known, err := parseModelsDevReasoningOption([]byte(tc.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !known || option.Type != ReasoningToggle ||
+				option.API != ReasoningAPIAnthropicMessages ||
+				option.DefaultMode != tc.wantDefault {
+				t.Fatalf("option = %+v, known=%t", option, known)
+			}
+		})
+	}
+}
+
 func TestModelsDevMalformedReasoningRetainsLastKnownGood(t *testing.T) {
 	p := New()
 	capturedAt := time.Date(2026, time.July, 26, 12, 0, 0, 0, time.UTC)
@@ -510,6 +566,69 @@ func TestModelsDevMalformedReasoningRetainsLastKnownGood(t *testing.T) {
 	}
 	if p.Capture() != before {
 		t.Fatal("malformed reasoning candidate replaced last-known-good")
+	}
+}
+
+func TestModelsDevRejectsMalformedScopedReasoningWithoutReplacingSnapshot(
+	t *testing.T,
+) {
+	for _, tc := range []struct {
+		name string
+		old  string
+		new  string
+	}{
+		{
+			name: "unknown API",
+			old:  `"api": "anthropic_messages"`,
+			new:  `"api": "future_messages"`,
+		},
+		{
+			name: "unsafe default",
+			old:  `"default_mode": "passthrough"`,
+			new:  `"default_mode": "on"`,
+		},
+		{
+			name: "scope removed but default retained",
+			old:  `, "api": "anthropic_messages"`,
+			new:  ``,
+		},
+		{
+			name: "duplicate scoped toggle",
+			old:  `{"type": "toggle", "api": "anthropic_messages", "default_mode": "passthrough"}`,
+			new: `{"type": "toggle", "api": "anthropic_messages", "default_mode": "passthrough"},
+          {"type": "toggle", "api": "anthropic_messages"}`,
+		},
+		{
+			name: "ambiguous legacy and scoped toggle",
+			old:  `{"type": "toggle", "api": "anthropic_messages", "default_mode": "passthrough"}`,
+			new: `{"type": "toggle"},
+          {"type": "toggle", "api": "anthropic_messages", "default_mode": "passthrough"}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := New()
+			capturedAt := time.Date(
+				2026, time.July, 26, 12, 0, 0, 0, time.UTC,
+			)
+			if err := p.ReplaceModelsDev(
+				[]byte(modelsDevFixture), capturedAt, `"good"`,
+			); err != nil {
+				t.Fatal(err)
+			}
+			before := p.Capture()
+			malformed := strings.Replace(modelsDevFixture, tc.old, tc.new, 1)
+			if malformed == modelsDevFixture {
+				t.Fatal("test mutation did not change fixture")
+			}
+			if err := p.ReplaceModelsDev(
+				[]byte(malformed), capturedAt.Add(time.Hour), `"bad"`,
+			); err == nil {
+				t.Fatal("malformed scoped reasoning was accepted")
+			}
+			if p.Capture() != before {
+				t.Fatal("malformed candidate replaced last-known-good")
+			}
+		})
 	}
 }
 
@@ -904,6 +1023,15 @@ func TestProviderCacheSchema1RoundTripsReasoningAndRejectsOtherSchemas(
 		deepseek.Options[0].Values[1] != nil {
 		t.Fatalf("restored reasoning = %+v, found=%t", deepseek, ok)
 	}
+	scoped, ok := restored.Capture().ModelReasoning(
+		ProviderBaseten,
+		"example/Scoped-Reasoning-Test",
+	)
+	if !ok || len(scoped.Options) != 2 ||
+		scoped.Options[1].API != ReasoningAPIAnthropicMessages ||
+		scoped.Options[1].DefaultMode != ReasoningDefaultPassthrough {
+		t.Fatalf("restored scoped reasoning = %+v, found=%t", scoped, ok)
+	}
 	modalities, ok := restored.Capture().ModelInputModalities(
 		ProviderBaseten,
 		"zai-org/GLM-Test",
@@ -949,6 +1077,60 @@ func TestProviderCacheSchema1RoundTripsReasoningAndRejectsOtherSchemas(
 	target := New()
 	if err := target.ImportProviderCache(invalidBody); err == nil {
 		t.Fatal("schema 1 cache accepted invalid reasoning capability")
+	}
+}
+
+func TestProviderCacheRejectsScopedFieldsThatCouldNormalizeToLegacyToggle(
+	t *testing.T,
+) {
+	live := New()
+	if err := live.ReplaceModelsDev(
+		[]byte(modelsDevFixture),
+		time.Date(2026, time.July, 26, 15, 0, 0, 0, time.UTC),
+		`"reasoning-cache"`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	body, err := live.ExportProviderCache(ProviderBaseten)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name  string
+		field string
+		value any
+	}{
+		{name: "null API", field: "api", value: nil},
+		{name: "empty API", field: "api", value: ""},
+		{name: "whitespace API", field: "api", value: " anthropic_messages"},
+		{name: "non-string API", field: "api", value: true},
+		{name: "null default", field: "default_mode", value: nil},
+		{name: "empty default", field: "default_mode", value: ""},
+		{name: "whitespace default", field: "default_mode", value: " off"},
+		{name: "non-string default", field: "default_mode", value: 1},
+		{name: "unknown field", field: "future_scope", value: "value"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var envelope map[string]any
+			if err := json.Unmarshal(body, &envelope); err != nil {
+				t.Fatal(err)
+			}
+			models := envelope["models"].(map[string]any)
+			model := models["zai-org/GLM-Test"].(map[string]any)
+			reasoning := model["reasoning"].(map[string]any)
+			options := reasoning["options"].([]any)
+			option := options[0].(map[string]any)
+			option[tc.field] = tc.value
+			// Keep the original content hash. It is already the hash an unsafe
+			// typed decoder would compute after erasing a null or empty field.
+			malformed, err := json.Marshal(envelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := New().ImportProviderCache(malformed); err == nil {
+				t.Fatal("provider cache accepted malformed scoped field")
+			}
+		})
 	}
 }
 

@@ -93,7 +93,7 @@ var (
 
 func cmdClaude(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: baseten-switch claude on|off|status|picker <status|enable|list|add|remove|move|sync|disable>|subagents [<model>|on|inherit]|route [<family> <target|default>]|reasoning baseten <model> off|follow-harness|effort <value>|default  (start/stop are aliases for on/off)")
+		fmt.Fprintln(os.Stderr, "usage: baseten-switch claude on|off|status|picker <status|enable|list|add|remove|move|sync|disable>|subagents [<model>|on|inherit]|route [<family> <target|default>]|reasoning baseten <model> on|off|follow-harness|effort <value>|default  (start/stop are aliases for on/off)")
 		return 2
 	}
 	if replayed, rc := preflightClaudeTerminalReplay(args); replayed {

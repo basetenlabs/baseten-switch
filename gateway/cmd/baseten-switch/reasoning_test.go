@@ -41,6 +41,7 @@ func TestParseReasoningPolicy(t *testing.T) {
 		wantDefault bool
 		wantErr     bool
 	}{
+		{args: []string{"baseten", "zai-org/GLM-5.2-Fast", "on"}, want: config.ReasoningPolicy{Mode: config.ReasoningOn}},
 		{args: []string{"baseten", "zai-org/GLM-5.2", "off"}, want: config.ReasoningPolicy{Mode: config.ReasoningOff}},
 		{args: []string{"baseten", "zai-org/GLM-5.2", "follow-harness"}, want: config.ReasoningPolicy{Mode: config.ReasoningFollowHarness}},
 		{args: []string{"baseten", "deepseek-ai/DeepSeek-V4-Pro", "effort", "high"}, want: config.ReasoningPolicy{Mode: config.ReasoningFixed, Effort: "high"}},
@@ -48,6 +49,7 @@ func TestParseReasoningPolicy(t *testing.T) {
 		{args: []string{"openai", "gpt-5", "off"}, wantErr: true},
 		{args: []string{"baseten", "model", "effort"}, wantErr: true},
 		{args: []string{"baseten", "model", "off", "high"}, wantErr: true},
+		{args: []string{"baseten", "model", "on", "medium"}, wantErr: true},
 	}
 	for _, tc := range tests {
 		t.Run(strings.Join(tc.args, "_"), func(t *testing.T) {
@@ -62,7 +64,7 @@ func TestParseReasoningPolicy(t *testing.T) {
 	}
 }
 
-func TestReasoningDefaultIsOfflineSafeAndSkipsPreflight(t *testing.T) {
+func TestReasoningDefaultResetsFastOnOverrideAndSkipsPreflight(t *testing.T) {
 	path := writeSwitchFixture(t, `global:
   routing_enabled: true
 clients:
@@ -70,18 +72,18 @@ clients:
     enabled: true
     bind_addr: 127.0.0.1:18081
     protocol_shape: anthropic
-    default_model: zai-org/GLM-5.2
+    default_model: zai-org/GLM-5.2-Fast
     model_options:
       baseten:
-        "zai-org/GLM-5.2":
+        "zai-org/GLM-5.2-Fast":
           reasoning:
-            mode: follow_harness
+            mode: on
 `)
 	preflight := &failingReasoningPreflight{}
 	installReasoningPreflight(t, preflight)
 	var out strings.Builder
 	rc := runClientReasoning(mutationSurfaceClaude, "claude-code", []string{
-		"baseten", "zai-org/GLM-5.2", "default",
+		"baseten", "zai-org/GLM-5.2-Fast", "default",
 		"--operation-id", "reasoning-default-test",
 	}, &out)
 	if rc != 0 {
@@ -97,7 +99,7 @@ clients:
 	if strings.Contains(string(body), "model_options:") {
 		t.Fatalf("default did not remove the client override:\n%s", body)
 	}
-	if !strings.Contains(out.String(), "claude-code reasoning: baseten/zai-org/GLM-5.2 -> default") {
+	if !strings.Contains(out.String(), "claude-code reasoning: baseten/zai-org/GLM-5.2-Fast -> default") {
 		t.Fatalf("output = %q", out.String())
 	}
 }

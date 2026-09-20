@@ -12,6 +12,7 @@ import (
 
 	"github.com/basetenlabs/baseten-switch/gateway/internal/config"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/pricing"
+	"github.com/basetenlabs/baseten-switch/gateway/internal/reasoning"
 )
 
 const adminReasoningCatalogFixture = `{
@@ -37,6 +38,16 @@ const adminReasoningCatalogFixture = `{
         "reasoning": true,
         "reasoning_options": [{"type": "toggle"}]
       },
+      "zai-org/GLM-5.2-Fast": {
+        "id": "zai-org/GLM-5.2-Fast",
+        "name": "GLM 5.2 Fast",
+        "family": "glm",
+        "reasoning": true,
+        "reasoning_options": [
+          {"type": "effort", "values": ["none", "high", "max"]},
+          {"type": "toggle", "api": "anthropic_messages", "default_mode": "passthrough"}
+        ]
+      },
       "moonshotai/Kimi-K2.7-Code": {
         "id": "moonshotai/Kimi-K2.7-Code",
         "name": "Kimi K2.7 Code",
@@ -55,6 +66,15 @@ const adminReasoningCatalogFixture = `{
         "reasoning": true,
         "reasoning_options": [
           {"type": "effort", "values": ["low", "high"]}
+        ]
+      },
+      "example/Scoped-Reasoning": {
+        "id": "example/Scoped-Reasoning",
+        "name": "Scoped Reasoning",
+        "reasoning": true,
+        "reasoning_options": [
+          {"type": "effort", "values": ["low", "high"]},
+          {"type": "toggle", "api": "anthropic_messages"}
         ]
       },
       "example/No-Control": {
@@ -118,9 +138,10 @@ func TestClientReasoningProjectionDeduplicatesReachableTargets(t *testing.T) {
 		glm.Configured.Mode != "default" ||
 		glm.Effective.Mode != "off" ||
 		glm.Source != "compatibility_default" ||
-		len(glm.AvailableModes) != 2 ||
+		len(glm.AvailableModes) != 3 ||
 		glm.AvailableModes[0] != "off" ||
-		glm.AvailableModes[1] != "follow_harness" ||
+		glm.AvailableModes[1] != "on" ||
+		glm.AvailableModes[2] != "follow_harness" ||
 		!glm.Available ||
 		glm.UnavailableReason != "" ||
 		glm.Error != "" {
@@ -131,9 +152,10 @@ func TestClientReasoningProjectionDeduplicatesReachableTargets(t *testing.T) {
 		kimi.Effective.Mode != "off" ||
 		kimi.Source != "compatibility_default" ||
 		!kimi.Available ||
-		len(kimi.AvailableModes) != 2 ||
+		len(kimi.AvailableModes) != 3 ||
 		kimi.AvailableModes[0] != "off" ||
-		kimi.AvailableModes[1] != "follow_harness" {
+		kimi.AvailableModes[1] != "on" ||
+		kimi.AvailableModes[2] != "follow_harness" {
 		t.Fatalf("Kimi projection = %+v", kimi)
 	}
 	deepseek := models["deepseek-ai/DeepSeek-V4-Pro"].Reasoning
@@ -164,21 +186,28 @@ func TestClientReasoningProjectionDefaultsFromCapabilityAndAdapter(
 			model:      "zai-org/GLM-5.2",
 			wantMode:   "off",
 			wantSource: "compatibility_default",
-			wantModes:  []string{"off", "follow_harness"},
+			wantModes:  []string{"off", "on", "follow_harness"},
 		},
 		{
 			name:       "Kimi toggle",
 			model:      "moonshotai/Kimi-K2.7-Code",
 			wantMode:   "off",
 			wantSource: "compatibility_default",
-			wantModes:  []string{"off", "follow_harness"},
+			wantModes:  []string{"off", "on", "follow_harness"},
 		},
 		{
 			name:       "Nemotron toggle",
 			model:      "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B",
 			wantMode:   "off",
 			wantSource: "compatibility_default",
-			wantModes:  []string{"off", "follow_harness"},
+			wantModes:  []string{"off", "on", "follow_harness"},
+		},
+		{
+			name:       "reviewed Messages binary control defaults exact effort model Off",
+			model:      "zai-org/GLM-5.2-Fast",
+			wantMode:   "off",
+			wantSource: "compatibility_default",
+			wantModes:  []string{"off", "on"},
 		},
 		{
 			name:       "effort only is read-only passthrough",
@@ -186,6 +215,13 @@ func TestClientReasoningProjectionDefaultsFromCapabilityAndAdapter(
 			wantMode:   "passthrough",
 			wantSource: "internal_passthrough",
 			wantModes:  []string{},
+		},
+		{
+			name:       "scoped Messages toggle is editable with passthrough default",
+			model:      "example/Scoped-Reasoning",
+			wantMode:   "passthrough",
+			wantSource: "internal_passthrough",
+			wantModes:  []string{"off", "on"},
 		},
 		{
 			name:       "no controls is read-only passthrough",
@@ -224,6 +260,108 @@ func TestClientReasoningProjectionDefaultsFromCapabilityAndAdapter(
 				t.Fatalf("projection = %+v", status)
 			}
 		})
+	}
+}
+
+func TestClientReasoningProjectionFastExplicitOn(t *testing.T) {
+	snapshot := adminReasoningSnapshot(t, time.Now().UTC())
+	rc := resolvedClientConfig{
+		Name:          "claude-code",
+		ProtocolShape: "anthropic",
+		Route:         "baseten",
+		DefaultModel:  "zai-org/GLM-5.2-Fast",
+	}
+	status := projectClientReasoningPolicy(
+		rc,
+		snapshot,
+		pricing.ProviderBaseten,
+		"zai-org/GLM-5.2-Fast",
+		reasoning.StoredPolicy{Present: true, Mode: reasoning.ModeOn},
+	)
+	if !status.Available ||
+		status.Effective.Mode != "on" ||
+		status.Source != "user_config" ||
+		!slices.Equal(status.AvailableModes, []string{"off", "on"}) ||
+		len(status.AvailableEfforts) != 0 ||
+		status.UnavailableReason != "" ||
+		status.Error != "" {
+		t.Fatalf("projection = %+v", status)
+	}
+}
+
+func TestClientReasoningProjectionWaitsForScopedCatalogDeclaration(
+	t *testing.T,
+) {
+	catalog := pricing.New()
+	withoutScopedToggle := strings.Replace(
+		adminReasoningCatalogFixture,
+		`,
+          {"type": "toggle", "api": "anthropic_messages"}`,
+		``,
+		1,
+	)
+	if withoutScopedToggle == adminReasoningCatalogFixture {
+		t.Fatal("test fixture did not remove scoped toggle")
+	}
+	capturedAt := time.Now().UTC()
+	if err := catalog.ReplaceModelsDev(
+		[]byte(withoutScopedToggle), capturedAt, `"before-scoped-toggle"`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	rc := resolvedClientConfig{
+		Name:          "claude-code",
+		ProtocolShape: "anthropic",
+		Route:         "baseten",
+		DefaultModel:  "example/Scoped-Reasoning",
+	}
+	before := computeClientModelOptions(
+		rc,
+		catalog.Capture(),
+	)[pricing.ProviderBaseten][rc.DefaultModel].Reasoning
+	if before == nil || before.Effective.Mode != "passthrough" ||
+		len(before.AvailableModes) != 0 {
+		t.Fatalf("pre-refresh projection = %+v", before)
+	}
+
+	if err := catalog.ReplaceModelsDev(
+		[]byte(adminReasoningCatalogFixture),
+		capturedAt.Add(time.Minute),
+		`"after-scoped-toggle"`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	after := computeClientModelOptions(
+		rc,
+		catalog.Capture(),
+	)[pricing.ProviderBaseten][rc.DefaultModel].Reasoning
+	if after == nil || after.Effective.Mode != "passthrough" ||
+		after.Source != "internal_passthrough" ||
+		!slices.Equal(after.AvailableModes, []string{"off", "on"}) {
+		t.Fatalf("post-refresh projection = %+v", after)
+	}
+
+	withOffDefault := strings.Replace(
+		adminReasoningCatalogFixture,
+		`{"type": "toggle", "api": "anthropic_messages"}`,
+		`{"type": "toggle", "api": "anthropic_messages", "default_mode": "off"}`,
+		1,
+	)
+	if err := catalog.ReplaceModelsDev(
+		[]byte(withOffDefault),
+		capturedAt.Add(2*time.Minute),
+		`"scoped-toggle-off-default"`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	offDefault := computeClientModelOptions(
+		rc,
+		catalog.Capture(),
+	)[pricing.ProviderBaseten][rc.DefaultModel].Reasoning
+	if offDefault == nil || offDefault.Effective.Mode != "off" ||
+		offDefault.Source != "compatibility_default" ||
+		!slices.Equal(offDefault.AvailableModes, []string{"off", "on"}) {
+		t.Fatalf("scoped Off-default projection = %+v", offDefault)
 	}
 }
 
@@ -311,9 +449,10 @@ func TestClientReasoningProjectionStaleRemainsUsableAndUnknownIsLoud(
 	)[pricing.ProviderBaseten]["zai-org/GLM-5.2"].Reasoning
 	if stale == nil ||
 		!stale.Available ||
-		len(stale.AvailableModes) != 2 ||
+		len(stale.AvailableModes) != 3 ||
 		stale.AvailableModes[0] != "off" ||
-		stale.AvailableModes[1] != "follow_harness" ||
+		stale.AvailableModes[1] != "on" ||
+		stale.AvailableModes[2] != "follow_harness" ||
 		stale.UnavailableReason != "" ||
 		stale.Error != "" {
 		t.Fatalf("stale validated projection = %+v", stale)
@@ -521,9 +660,10 @@ func TestReasoningPreflightChecksOnlyRequestedClient(t *testing.T) {
 		claude.Reachability[0] != "explicit_raw_slug" ||
 		len(claude.FailureBehaviors) != 1 ||
 		claude.FailureBehaviors[0] != "local_error" ||
-		len(claude.AvailableModes) != 2 ||
+		len(claude.AvailableModes) != 3 ||
 		claude.AvailableModes[0] != "off" ||
-		claude.AvailableModes[1] != "follow_harness" ||
+		claude.AvailableModes[1] != "on" ||
+		claude.AvailableModes[2] != "follow_harness" ||
 		claude.UnavailableReason != "" ||
 		claude.Error != "" {
 		t.Fatalf("Claude impact = %+v", claude)
@@ -548,6 +688,11 @@ func TestReasoningPreflightRejectsInvalidPolicyStructure(t *testing.T) {
 		policy string
 		want   string
 	}{
+		{
+			name:   "on with effort",
+			policy: `{"mode":"on","effort":"medium"}`,
+			want:   `mode "on" forbids effort`,
+		},
 		{
 			name:   "off with effort",
 			policy: `{"mode":"off","effort":"high"}`,

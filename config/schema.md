@@ -92,13 +92,14 @@ clients:
       baseten:
         zai-org/GLM-5.2:
           reasoning:
-            mode: follow_harness
+            mode: on
 ```
 
 `reasoning.mode` accepts:
 
 | Mode | Optional fields | Effect |
 |---|---|---|
+| `on` | none | Apply the selected protocol adapter's reviewed On encoding on the Baseten attempt. |
 | `off` | none | Apply the selected protocol adapter's validated Off encoding on the Baseten attempt. |
 | `follow_harness` | none | Preserve or translate the harness's semantic reasoning choice when the active protocol adapter supports it. |
 | `fixed` | `effort` (required) | Force the exact catalog-advertised effort value. |
@@ -111,24 +112,64 @@ projection.
 
 `global.model_options` is not accepted. Model options are client-scoped.
 
-An absent override uses the runtime safe default. Every model whose catalog
-semantic capability and the selected client's protocol adapter intersect on a
-validated Off control defaults to Off. A model without a validated Off control
-defaults to passthrough, which may leave provider reasoning on. Therefore the
-canonical `gateway.example.yaml` intentionally omits `model_options`. Users add
-an override only to follow harness reasoning or choose a catalog-supported
-fixed effort.
+An absent override uses the runtime safe default. An unscoped catalog toggle on the
+reviewed Messages adapter defaults to Off. An exact reviewed compatibility can
+also define an Off default for a known, reasoning-capable model. All other
+models default to passthrough. Therefore the canonical `gateway.example.yaml`
+intentionally omits `model_options`. Users add an override only to enable,
+disable, follow harness reasoning, or choose a catalog-supported fixed effort.
+On Claude Messages, `zai-org/GLM-5.2-Fast` is an exact reviewed compatibility
+and defaults to Off when its catalog metadata reports reasoning support.
 
 Available modes depend on both the selected model's catalog capabilities and
 the client's protocol. The UI exposes only controls that the active
-combination supports. Claude Messages supports Off and `follow_harness` for
-catalog models with a reasoning toggle, but not categorical effort values.
-Other protocols expose exact catalog efforts only when they can encode them.
+combination supports. Claude Messages supports On, Off, and `follow_harness`
+for catalog models with an unscoped reasoning toggle, but not categorical effort values.
+An exact reviewed adapter compatibility may expose On and Off, and may select
+Off as that model's safe default, without changing its catalog metadata. The
+full app offers only projected On and Off choices. Saved legacy
+`follow_harness` and `fixed` policies remain visible and resettable but are not
+new UI choices. Other protocols expose exact catalog efforts only when they can
+encode them.
+
+Switch also recognizes an API-scoped catalog toggle for a Messages-specific
+binary control:
+
+```json
+{
+  "reasoning": true,
+  "reasoning_options": [
+    {"type": "effort", "values": ["low", "high"]},
+    {
+      "type": "toggle",
+      "api": "anthropic_messages",
+      "default_mode": "passthrough"
+    }
+  ]
+}
+```
+
+This is a supported catalog ingestion shape, not a claim that a catalog
+publisher currently emits it for any particular model. `api` accepts only
+`anthropic_messages`. `default_mode` accepts `passthrough` or `off`; omitting
+it means `passthrough`. The scoped toggle adds only On and Off for the reviewed
+same-shape Messages adapter. It does not map categorical effort, and it does not
+enable `follow_harness`. A legacy unscoped `{"type":"toggle"}` keeps its
+existing On, Off, `follow_harness`, and default-Off behavior. Publishers must
+not combine scoped and unscoped toggles for one model.
+
+On and Off replace only the top-level Messages `thinking` object with the
+reviewed enabled or disabled form. Other request fields remain unchanged,
+including Claude Code's separate `output_config.effort` field. Switch does not
+map that field to a provider effort or guarantee distinct effort behavior. See
+the [Claude Code gateway protocol](https://code.claude.com/docs/en/llm-gateway-protocol)
+and the [Baseten Messages reference](https://docs.baseten.co/reference/inference-api/messages).
 
 Resetting a model removes its explicit override and recomputes the safe
 default. The full app labels this action `Reset to Safe Default`. A model with
-no editable control and default passthrough is a valid read-only provider
-default, not a configuration error.
+no editable control and default passthrough is a valid read-only state, not a
+configuration error. The app labels it `Switch does not override reasoning`;
+this does not mean reasoning is disabled.
 
 ## `clients[]`
 
@@ -287,6 +328,7 @@ credential reports `auth_type: api_key` with `signed_in: false` and
 The typed provider/model commands are:
 
 ```sh
+baseten-switch claude reasoning baseten zai-org/GLM-5.2-Fast on
 baseten-switch claude reasoning baseten zai-org/GLM-5.2 off
 baseten-switch claude reasoning baseten zai-org/GLM-5.2 follow-harness
 baseten-switch codex reasoning baseten deepseek-ai/DeepSeek-V4-Pro effort high
@@ -298,7 +340,7 @@ Default: it removes the model-specific override, prunes empty parent mappings,
 and lets the runtime recompute the catalog-and-adapter safe default. It is
 offline-safe because removal needs no catalog lookup.
 
-`off`, `follow-harness`, and `effort` require a healthy router. The gateway
+`on`, `off`, `follow-harness`, and `effort` require a healthy router. The gateway
 validates the choice against one catalog snapshot and the selected client's
 adapter. It does not inspect or warn about another client.
 
