@@ -31,7 +31,7 @@
           src = self;
           modRoot = "gateway";
           subPackages = [ "cmd/baseten-switch" ];
-          vendorHash = "sha256-wOrYrtvL+7qecoaFfH75KdxBOFeba0zG09LEIvLpO5o=";
+          vendorHash = "sha256-+h7ehZEALb5d9R/6qJptsm7JvJY1rUr7tEqS2JyEyVE=";
           ldflags = [ "-X github.com/basetenlabs/baseten-switch/gateway/internal/version.Version=${version}" ];
         };
       });
