@@ -16,7 +16,7 @@ type groupKey struct {
 
 type accumulator struct {
 	requests int
-	tokens   int64
+	tokens   TokenBreakdown
 	cost     float64
 	priced   int
 	unpriced int
@@ -73,8 +73,7 @@ func Build(
 		response.Coverage.LatestCompletedAt = &value
 	}
 
-	costGroups := map[groupKey]*accumulator{}
-	perfGroups := map[groupKey]*accumulator{}
+	groups := map[groupKey]*accumulator{}
 	savingsModels := map[string]*savingsAccumulator{}
 	savingsMappings := map[string]*savingsAccumulator{}
 	var savingsEligibleActual float64
@@ -85,7 +84,7 @@ func Build(
 			continue
 		}
 		response.Coverage.RequestRows++
-		tokens, usageComplete := tokenTotal(event)
+		tokens, usageComplete := tokenBreakdown(event)
 		if !usageComplete {
 			response.Coverage.IncompleteUsageRows++
 		}
@@ -108,33 +107,28 @@ func Build(
 			requestedModel,
 		)
 
-		perf := getAccumulator(perfGroups, groupKey{provider: provider, model: model.ID})
-		perf.requests++
+		group := getAccumulator(groups, groupKey{provider: provider, model: model.ID})
+		group.requests++
 		if usageComplete {
-			perf.tokens += tokens
+			group.tokens.add(tokens)
 			if event.TTFTMS != nil && *event.TTFTMS > 0 {
-				perf.ttft = append(perf.ttft, *event.TTFTMS)
+				group.ttft = append(group.ttft, *event.TTFTMS)
 			}
 			if event.Usage.OutputTokens != nil && *event.Usage.OutputTokens > 0 &&
 				event.TTFTMS != nil && event.DurationMS > *event.TTFTMS {
 				seconds := float64(event.DurationMS-*event.TTFTMS) / 1000
-				perf.tps = append(
-					perf.tps,
+				group.tps = append(
+					group.tps,
 					float64(*event.Usage.OutputTokens)/seconds,
 				)
 			}
 		}
 
 		actualUSD, actualPriced := persistedUSD(event.ActualCost)
-		cost := getAccumulator(costGroups, groupKey{provider: provider, model: model.ID})
-		cost.requests++
-		if usageComplete {
-			cost.tokens += tokens
-		}
 		if actualPriced {
 			response.Coverage.PricedActualCostRows++
-			cost.priced++
-			cost.cost += actualUSD
+			group.priced++
+			group.cost += actualUSD
 			if provider == "Claude" {
 				response.Cost.Summary.ActualClaudeCostUSD += actualUSD
 			} else {
@@ -142,7 +136,7 @@ func Build(
 			}
 		} else {
 			response.Coverage.UnpricedActualCostRows++
-			cost.unpriced++
+			group.unpriced++
 		}
 
 		if provider != "Baseten" {
@@ -192,9 +186,9 @@ func Build(
 		response.Cost.Summary.SavedUSD,
 		response.Cost.Summary.EstimatedNativeCostForBasetenUSD,
 	)
-	response.Cost.Providers, response.Cost.Models = materializeCost(catalog, costGroups)
+	response.Cost.Providers, response.Cost.Models = materializeCost(catalog, groups)
 	response.Performance.Providers, response.Performance.Models =
-		materializePerformance(catalog, perfGroups)
+		materializePerformance(catalog, groups)
 	response.Cost.Savings.ByBasetenModel =
 		materializeSavingsModels(catalog, savingsModels)
 	response.Cost.Savings.Mappings =
@@ -229,20 +223,44 @@ func modelIDFor(event telemetry.EventV1) string {
 	return event.RequestedModel
 }
 
-func tokenTotal(event telemetry.EventV1) (int64, bool) {
+func tokenBreakdown(event telemetry.EventV1) (TokenBreakdown, bool) {
 	if !event.UsageComplete ||
 		event.Usage.InputTokens == nil ||
 		event.Usage.OutputTokens == nil ||
 		event.Usage.CacheReadInputTokens == nil {
-		return 0, false
+		return TokenBreakdown{}, false
 	}
 	hasExactCacheWrites := event.Usage.CacheWrite5mInputTokens != nil &&
 		event.Usage.CacheWrite1hInputTokens != nil
 	if !hasExactCacheWrites &&
 		event.Usage.CacheWriteTotalInputTokens == nil {
-		return 0, false
+		return TokenBreakdown{}, false
 	}
-	return *event.Usage.InputTokens + *event.Usage.OutputTokens, true
+	var cacheWrites int64
+	if hasExactCacheWrites {
+		cacheWrites = *event.Usage.CacheWrite5mInputTokens + *event.Usage.CacheWrite1hInputTokens
+	} else {
+		cacheWrites = *event.Usage.CacheWriteTotalInputTokens
+	}
+	return TokenBreakdown{
+		InputTokens:           *event.Usage.InputTokens,
+		OutputTokens:          *event.Usage.OutputTokens,
+		CacheReadInputTokens:  *event.Usage.CacheReadInputTokens,
+		CacheWriteInputTokens: cacheWrites,
+		CompleteRequests:      1,
+	}, true
+}
+
+func (tokens *TokenBreakdown) add(other TokenBreakdown) {
+	tokens.InputTokens += other.InputTokens
+	tokens.OutputTokens += other.OutputTokens
+	tokens.CacheReadInputTokens += other.CacheReadInputTokens
+	tokens.CacheWriteInputTokens += other.CacheWriteInputTokens
+	tokens.CompleteRequests += other.CompleteRequests
+}
+
+func (tokens TokenBreakdown) total() int64 {
+	return tokens.InputTokens + tokens.OutputTokens + tokens.CacheReadInputTokens + tokens.CacheWriteInputTokens
 }
 
 func persistedUSD(cost telemetry.CostSnapshotV1) (float64, bool) {
@@ -294,7 +312,7 @@ func materializeCost(
 			providerGroups[key.provider] = provider
 		}
 		provider.requests += value.requests
-		provider.tokens += value.tokens
+		provider.tokens.add(value.tokens)
 		provider.cost += value.cost
 		provider.priced += value.priced
 		provider.unpriced += value.unpriced
@@ -302,16 +320,18 @@ func materializeCost(
 		models = append(models, CostGroup{
 			Provider: key.provider, ModelID: model.ID, DisplayName: model.DisplayName,
 			Requests: value.requests,
-			Tokens:   value.tokens, ActualCostUSD: knownCost(value),
-			PricedRows: value.priced, UnpricedRows: value.unpriced,
+			Tokens:   value.tokens.total(), TokenBreakdown: value.tokens,
+			ActualCostUSD: knownCost(value),
+			PricedRows:    value.priced, UnpricedRows: value.unpriced,
 		})
 	}
 	providers := make([]CostGroup, 0, len(providerGroups))
 	for key, value := range providerGroups {
 		providers = append(providers, CostGroup{
-			Provider: key, Requests: value.requests, Tokens: value.tokens,
-			ActualCostUSD: knownCost(value),
-			PricedRows:    value.priced, UnpricedRows: value.unpriced,
+			Provider: key, Requests: value.requests, Tokens: value.tokens.total(),
+			TokenBreakdown: value.tokens,
+			ActualCostUSD:  knownCost(value),
+			PricedRows:     value.priced, UnpricedRows: value.unpriced,
 		})
 	}
 	sortCostGroups(providers)
@@ -340,7 +360,7 @@ func materializePerformance(
 			providerGroups[key.provider] = provider
 		}
 		provider.requests += value.requests
-		provider.tokens += value.tokens
+		provider.tokens.add(value.tokens)
 		provider.ttft = append(provider.ttft, value.ttft...)
 		provider.tps = append(provider.tps, value.tps...)
 		models = append(
@@ -372,7 +392,7 @@ func performanceGroup(
 	}
 	return PerformanceGroup{
 		Provider: provider, ModelID: metadata.ID, DisplayName: metadata.DisplayName,
-		Requests: value.requests, Tokens: value.tokens,
+		Requests: value.requests, Tokens: value.tokens.total(), TokenBreakdown: value.tokens,
 		TTFTSamples: len(value.ttft), MedianTTFTMs: medianInt64(value.ttft),
 		OutputTPSSamples: len(value.tps), MedianOutputTokensPerSecond: medianFloat64(value.tps),
 	}
