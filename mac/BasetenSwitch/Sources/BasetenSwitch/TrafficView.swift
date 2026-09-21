@@ -189,13 +189,13 @@ struct TrafficView: View {
         var parts: [String] = []
         if coverage.unpricedActualCostRows > 0 {
             parts.append(
-                "\(coverage.unpricedActualCostRows) actual-cost \(coverage.unpricedActualCostRows == 1 ? "row is" : "rows are") unpriced")
+                "\(coverage.unpricedActualCostRows) estimated-cost \(coverage.unpricedActualCostRows == 1 ? "row is" : "rows are") unpriced")
         }
         if coverage.savingsUnpricedRows > 0 {
             parts.append(
                 "\(coverage.savingsUnpricedRows) savings \(coverage.savingsUnpricedRows == 1 ? "comparison is" : "comparisons are") unavailable")
         }
-        return parts.joined(separator: "; ") + ". Known spend remains visible."
+        return parts.joined(separator: "; ") + ". Known estimated cost remains visible."
     }
 }
 
@@ -271,18 +271,16 @@ private struct TrafficCostView: View {
                 spacing: 12
             ) {
                 TrafficMetricCard(
-                    title: "Actual Claude spend",
+                    title: "Estimated Claude cost",
                     value: trafficCurrency(
                         snapshot.cost.summary.actualClaudeCostUSD),
-                    detail: trafficTokenCount(
-                        tokens(for: "Claude")),
+                    detail: tokenDescription(for: "Claude"),
                     brand: .claude)
                 TrafficMetricCard(
-                    title: "Actual Baseten spend",
+                    title: "Estimated Baseten cost",
                     value: trafficCurrency(
                         snapshot.cost.summary.actualBasetenCostUSD),
-                    detail: trafficTokenCount(
-                        tokens(for: "Baseten")),
+                    detail: tokenDescription(for: "Baseten"),
                     brand: .baseten)
                 TrafficMetricCard(
                     title: "Estimated savings",
@@ -295,9 +293,9 @@ private struct TrafficCostView: View {
             }
 
             TrafficSectionCard(
-                title: "Actual spend",
+                title: "Estimated cost",
                 description:
-                    "Observed spend for each provider’s own request set."
+                    "Calculated from recorded usage and API rates. Your plan's charges may differ."
             ) {
                 ActualSpendChart(rows: rows)
                 TrafficActualSpendTable(
@@ -308,7 +306,7 @@ private struct TrafficCostView: View {
             TrafficSectionCard(
                 title: "Estimated savings",
                 description:
-                    "Baseten actual cost compared with the estimated Claude cost for the same routed traffic."
+                    "Estimated Baseten usage cost compared with hypothetical Claude cost for the same routed traffic."
             ) {
                 SavingsStackedChart(groups: savingsGroups)
                 TrafficSavingsTable(
@@ -324,10 +322,10 @@ private struct TrafficCostView: View {
         }
     }
 
-    private func tokens(for provider: String) -> Int64 {
+    private func tokenDescription(for provider: String) -> String {
         snapshot.cost.providers.first {
             $0.provider.caseInsensitiveCompare(provider) == .orderedSame
-        }?.tokens ?? 0
+        }?.tokenUsage.cardDescription ?? "Tokens unavailable"
     }
 }
 
@@ -432,10 +430,11 @@ func trafficPerformanceCardContents(
             brand: .baseten,
             detailBrand: .claude),
         TrafficPerformanceCardContent(
-            title: "Baseten token volume",
-            value: trafficTokenCount(baseten?.tokens ?? 0),
-            detail:
-                "Claude \(trafficTokenCount(claude?.tokens ?? 0)) tokens",
+            title: baseten.map { $0.tokenBreakdown == nil } == true
+                ? "Baseten input + output" : "Baseten total tokens",
+            value: (baseten?.tokenUsage.value ?? "Unavailable")
+                + (baseten?.tokenUsage.isPartial == true ? " · partial" : ""),
+            detail: "Claude \(claude?.tokenUsage.cardDescription ?? "tokens unavailable")",
             brand: .baseten,
             detailBrand: .claude),
     ]
@@ -513,7 +512,8 @@ private struct TrafficMetricCard: View {
                 Text(detail)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                    .lineLimit(2)
+                    .help(detail)
             }
         }
         .padding(14)
@@ -579,17 +579,18 @@ private struct TrafficActualSpendTable: View {
                 HStack(spacing: 16) {
                     trafficTableHeader("Provider or model")
                         .frame(maxWidth: .infinity, alignment: .leading)
-                    trafficTableHeader("Tokens")
+                    trafficTableHeader(
+                        rows.allSatisfy { $0.tokenBreakdown == nil }
+                            ? "Input + output" : "Total tokens")
                         .frame(maxWidth: .infinity, alignment: .trailing)
-                    trafficTableHeader("Actual spend")
+                    trafficTableHeader("Estimated cost")
                         .frame(maxWidth: .infinity, alignment: .trailing)
                 }
                 .padding(.vertical, 7)
 
                 Divider()
 
-                ForEach(visibleRows.indices, id: \.self) { index in
-                    let row = visibleRows[index]
+                ForEach(visibleRows) { row in
                     HStack(alignment: .top, spacing: 16) {
                         TrafficProviderLabel(
                             provider: row.provider,
@@ -597,8 +598,7 @@ private struct TrafficActualSpendTable: View {
                             .frame(
                                 maxWidth: .infinity,
                                 alignment: .leading)
-                        Text(trafficTokenCount(row.tokens))
-                            .monospacedDigit()
+                        TrafficTokenCell(usage: row.tokenUsage, label: row.label)
                             .frame(
                                 maxWidth: .infinity,
                                 alignment: .trailing)
@@ -617,11 +617,11 @@ private struct TrafficActualSpendTable: View {
                             alignment: .trailing)
                     }
                     .padding(.vertical, 8)
-                    .accessibilityElement(children: .combine)
+                    .accessibilityElement(children: .contain)
                     .accessibilityLabel(
                         actualSpendAccessibilityLabel(row))
 
-                    if index < visibleRows.count - 1 {
+                    if row.id != visibleRows.last?.id {
                         Divider()
                     }
                 }
@@ -639,8 +639,8 @@ private struct TrafficActualSpendTable: View {
         _ row: TrafficCostRow
     ) -> String {
         var label =
-            "\(row.label), \(trafficTokenCount(row.tokens)) tokens, "
-            + "actual spend \(trafficCurrency(row.actualCostUSD))"
+            "\(row.label), \(row.tokenUsage.accessibilitySummary), "
+            + "estimated cost \(trafficCurrency(row.actualCostUSD))"
         if row.hasPartialCost {
             label += ", partial cost, \(row.unpricedRows) unpriced"
         }
@@ -700,9 +700,9 @@ private struct TrafficSavingsTable: View {
                     .frame(width: 160, alignment: .leading)
                 trafficTableHeader("Requested Claude")
                     .frame(width: 150, alignment: .leading)
-                trafficTableHeader("Baseten actual")
+                trafficTableHeader("Baseten estimate")
                     .frame(width: 110, alignment: .trailing)
-                trafficTableHeader("Native estimate")
+                trafficTableHeader("Claude estimate")
                     .frame(width: 110, alignment: .trailing)
                 trafficTableHeader("Savings")
                     .frame(width: 100, alignment: .trailing)
@@ -770,11 +770,11 @@ private struct TrafficSavingsTable: View {
                             label: "Requested Claude",
                             value: row.requestedClaude)
                         compactSavingsField(
-                            label: "Baseten actual",
+                            label: "Baseten estimate",
                             value: trafficCurrency(
                                 row.actualBasetenCostUSD))
                         compactSavingsField(
-                            label: "Native estimate",
+                            label: "Claude estimate",
                             value: trafficCurrency(
                                 row.estimatedNativeCostUSD))
                         compactSavingsField(
@@ -824,8 +824,8 @@ private struct TrafficSavingsTable: View {
             : savedPercent(row)
         return
             "\(row.label), requested Claude \(row.requestedClaude), "
-            + "Baseten actual \(trafficCurrency(row.actualBasetenCostUSD)), "
-            + "native estimate "
+            + "Estimated Baseten cost \(trafficCurrency(row.actualBasetenCostUSD)), "
+            + "hypothetical Claude cost "
             + "\(trafficCurrency(row.estimatedNativeCostUSD)), "
             + "savings \(trafficCurrency(row.savedUSD)), saved \(saved)"
     }
@@ -850,7 +850,9 @@ private struct TrafficPerformanceTable: View {
                 HStack(spacing: 16) {
                     trafficTableHeader("Provider or model")
                         .frame(maxWidth: .infinity, alignment: .leading)
-                    trafficTableHeader("Tokens")
+                    trafficTableHeader(
+                        rows.allSatisfy { $0.tokenBreakdown == nil }
+                            ? "Input + output" : "Total tokens")
                         .frame(maxWidth: .infinity, alignment: .trailing)
                     trafficTableHeader("Median TTFT")
                         .frame(maxWidth: .infinity, alignment: .trailing)
@@ -861,8 +863,7 @@ private struct TrafficPerformanceTable: View {
 
                 Divider()
 
-                ForEach(visibleRows.indices, id: \.self) { index in
-                    let row = visibleRows[index]
+                ForEach(visibleRows) { row in
                     HStack(alignment: .top, spacing: 16) {
                         TrafficProviderLabel(
                             provider: row.provider,
@@ -870,8 +871,7 @@ private struct TrafficPerformanceTable: View {
                             .frame(
                                 maxWidth: .infinity,
                                 alignment: .leading)
-                        Text(trafficTokenCount(row.tokens))
-                            .monospacedDigit()
+                        TrafficTokenCell(usage: row.tokenUsage, label: row.label)
                             .frame(
                                 maxWidth: .infinity,
                                 alignment: .trailing)
@@ -891,11 +891,11 @@ private struct TrafficPerformanceTable: View {
                                 alignment: .trailing)
                     }
                     .padding(.vertical, 8)
-                    .accessibilityElement(children: .combine)
+                    .accessibilityElement(children: .contain)
                     .accessibilityLabel(
                         performanceAccessibilityLabel(row))
 
-                    if index < visibleRows.count - 1 {
+                    if row.id != visibleRows.last?.id {
                         Divider()
                     }
                 }
@@ -913,11 +913,87 @@ private struct TrafficPerformanceTable: View {
         _ row: TrafficPerformanceRow
     ) -> String {
         return
-            "\(row.label), \(trafficTokenCount(row.tokens)) tokens, "
+            "\(row.label), \(row.tokenUsage.accessibilitySummary), "
             + "median TTFT "
             + "\(trafficMilliseconds(row.measuredMedianTTFTMS)), "
             + "median output speed "
             + "\(trafficTPS(row.measuredMedianOutputTokensPerSecond))"
+    }
+}
+
+private struct TrafficTokenCell: View {
+    let usage: TrafficTokenUsage
+    let label: String
+    @State private var showsDetails = false
+    @FocusState private var detailsFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 2) {
+            HStack(spacing: 5) {
+                Text(usage.value)
+                    .monospacedDigit()
+                    .accessibilityLabel(usage.accessibilitySummary)
+                if let breakdown = usage.breakdown {
+                    Button {
+                        showsDetails.toggle()
+                    } label: {
+                        Image(systemName: "info.circle")
+                    }
+                    .buttonStyle(.borderless)
+                    .focused($detailsFocused)
+                    .help("Show token details")
+                    .accessibilityLabel("Token details for \(label)")
+                    .popover(isPresented: $showsDetails, arrowEdge: .bottom) {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("Token details")
+                                .font(.headline)
+                            Text(label)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Grid(horizontalSpacing: 24, verticalSpacing: 8) {
+                                detailRow("Uncached input", value: breakdown.inputTokens)
+                                detailRow("Output", value: breakdown.outputTokens)
+                                detailRow("Cache reads", value: breakdown.cacheReadInputTokens)
+                                detailRow("Cache writes", value: breakdown.cacheWriteInputTokens)
+                                Divider()
+                                detailRow("Total tokens", value: usage.tokens)
+                                    .fontWeight(.semibold)
+                            }
+                            Text(usage.coverageMessage ?? "")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Button("Done") { showsDetails = false }
+                                .keyboardShortcut(.cancelAction)
+                                .frame(maxWidth: .infinity, alignment: .trailing)
+                        }
+                        .padding(18)
+                        .frame(width: 320)
+                    }
+                    .onChange(of: showsDetails) { isPresented in
+                        if !isPresented { detailsFocused = true }
+                    }
+                }
+            }
+            if usage.isPartial {
+                Text("Partial coverage")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+            } else if usage.breakdown == nil {
+                Text("Input + output")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func detailRow(_ title: String, value: Int64) -> some View {
+        GridRow {
+            Text(title)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text(usage.isUnavailable ? "Unavailable" : value.formatted())
+                .monospacedDigit()
+        }
+        .accessibilityElement(children: .contain)
     }
 }
 

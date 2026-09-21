@@ -73,6 +73,9 @@ func applyBasetenReasoningPolicy(
 		telemetry.catalogRevision = &catalogRevision
 	}
 	switch decision.Mode {
+	case reasoning.ModeOn:
+		enabled := true
+		telemetry.effectiveEnabled = &enabled
 	case reasoning.ModeOff:
 		enabled := false
 		telemetry.effectiveEnabled = &enabled

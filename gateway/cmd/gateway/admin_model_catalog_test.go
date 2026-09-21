@@ -449,6 +449,36 @@ func TestModelCatalogReasoningProjectionUsesExactBasetenRecord(t *testing.T) {
 	}
 }
 
+func TestModelCatalogReasoningProjectionPreservesScopedToggle(t *testing.T) {
+	capturedAt := time.Date(2026, time.July, 26, 12, 0, 0, 0, time.UTC)
+	fixture := strings.Replace(
+		publicCatalogGatewayFixture,
+		`{"type": "toggle"}`,
+		`{"type": "toggle", "api": "anthropic_messages", "default_mode": "passthrough"}`,
+		1,
+	)
+	p := pricing.New()
+	if err := p.ReplaceModelsDev(
+		[]byte(fixture), capturedAt, `"scoped-toggle"`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	projected := modelCatalogModelsFromSnapshot(
+		p.Capture(),
+		[]modelCatalogModel{{Slug: "zai-org/GLM-Test"}},
+	)
+	if len(projected) != 1 || projected[0].Reasoning == nil ||
+		len(projected[0].Reasoning.Options) != 1 {
+		t.Fatalf("projection = %+v", projected)
+	}
+	option := projected[0].Reasoning.Options[0]
+	if option.Type != pricing.ReasoningToggle ||
+		option.API != pricing.ReasoningAPIAnthropicMessages ||
+		option.DefaultMode != pricing.ReasoningDefaultPassthrough {
+		t.Fatalf("scoped option = %+v", option)
+	}
+}
+
 func TestModelContextLimitsIncludeExactModelsAbsentFromLiveAccountCatalog(t *testing.T) {
 	p := pricing.New()
 	capturedAt := time.Date(2026, time.September, 3, 0, 0, 0, 0, time.UTC)

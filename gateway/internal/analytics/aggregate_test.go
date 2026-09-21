@@ -77,9 +77,15 @@ func TestBuildUsesPersistedCostsAndPreservesTrafficContract(t *testing.T) {
 		got.Cost.Providers[1].Provider != "Baseten" {
 		t.Fatalf("providers = %+v", got.Cost.Providers)
 	}
-	if got.Cost.Providers[1].Tokens != 1_100_015 {
-		t.Fatalf("Baseten tokens = %d, want input+output only 1100015",
+	if got.Cost.Providers[1].Tokens != 1_100_065 {
+		t.Fatalf("Baseten tokens = %d, want all token categories 1100065",
 			got.Cost.Providers[1].Tokens)
+	}
+	if got.Cost.Providers[1].TokenBreakdown != (TokenBreakdown{
+		InputTokens: 1_000_010, OutputTokens: 100_005,
+		CacheReadInputTokens: 20, CacheWriteInputTokens: 30, CompleteRequests: 2,
+	}) {
+		t.Fatalf("Baseten token breakdown = %+v", got.Cost.Providers[1].TokenBreakdown)
 	}
 	if len(got.Cost.Savings.ByBasetenModel) != 1 ||
 		got.Cost.Savings.ByBasetenModel[0].ModelID != "zai-org/GLM-5.2" ||
@@ -101,6 +107,148 @@ func TestBuildUsesPersistedCostsAndPreservesTrafficContract(t *testing.T) {
 	if strings.Contains(string(encoded), `"model":`) ||
 		strings.Contains(string(encoded), `"baseten_model":`) {
 		t.Fatalf("response exposes retired model field: %s", encoded)
+	}
+}
+
+func TestBuildIncludesCacheTokensWithoutChangingCostOrOutputSpeed(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		cacheRead  int64
+		write5m    int64
+		write1h    int64
+		totalOnly  bool
+		classified bool
+		wantTokens int64
+	}{
+		{name: "no cache", wantTokens: 2_000},
+		{name: "cache reads", cacheRead: 1_000_000, wantTokens: 1_002_000},
+		{name: "five minute writes", write5m: 1_000_000, wantTokens: 1_002_000},
+		{name: "one hour writes", write1h: 1_000_000, wantTokens: 1_002_000},
+		{name: "all cache categories", cacheRead: 1_000_000, write5m: 1_000_000, write1h: 1_000_000, wantTokens: 3_002_000},
+		{name: "total only writes", write5m: 1_000_000, write1h: 1_000_000, totalOnly: true, wantTokens: 2_002_000},
+		{name: "permission check", cacheRead: 1_000_000, classified: true, wantTokens: 1_002_000},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			event := analyticsEvent(100, "anthropic", "claude-sonnet-4-6", "claude-sonnet-4-6")
+			setUsage(&event, 1_000, 1_000, test.cacheRead, test.write5m)
+			event.Usage.CacheWrite1hInputTokens = int64Pointer(test.write1h)
+			if test.totalOnly {
+				event.Usage.CacheWriteTotalInputTokens = int64Pointer(test.write5m + test.write1h)
+				event.Usage.CacheWrite5mInputTokens = nil
+				event.Usage.CacheWrite1hInputTokens = nil
+			}
+			if test.classified {
+				event.RequestClassification = &telemetry.RequestClassificationV1{
+					Kind:          telemetry.RequestClassificationKindClaudeAutoPermissionCheck,
+					Detector:      telemetry.RequestClassificationDetectorClaudeAutoV1,
+					RoutingAction: telemetry.RequestClassificationRoutingActionNativeAnthropic,
+				}
+			}
+			setActualCost(&event, 103_000_000)
+			setLatency(&event, 200, 1200)
+			got := Build([]telemetry.EventV1{event}, Window{Since: 100, Until: 200}, 200, Snapshot{Complete: true}, true, nil)
+			want := TokenBreakdown{
+				InputTokens: 1_000, OutputTokens: 1_000,
+				CacheReadInputTokens: test.cacheRead, CacheWriteInputTokens: test.write5m + test.write1h,
+				CompleteRequests: 1,
+			}
+			for _, group := range append(got.Cost.Providers, got.Cost.Models...) {
+				if group.Tokens != test.wantTokens || group.TokenBreakdown != want || group.Requests != 1 {
+					t.Errorf("cost token group = %+v, want %d tokens, %+v", group, test.wantTokens, want)
+				}
+				if group.ActualCostUSD == nil || *group.ActualCostUSD != 0.103 {
+					t.Errorf("persisted cost changed: %+v", group)
+				}
+			}
+			for _, group := range append(got.Performance.Providers, got.Performance.Models...) {
+				if group.Tokens != test.wantTokens || group.TokenBreakdown != want || group.Requests != 1 {
+					t.Errorf("performance token group = %+v, want %d tokens, %+v", group, test.wantTokens, want)
+				}
+				if group.TTFTSamples != 1 || group.MedianTTFTMs != 200 || group.OutputTPSSamples != 1 || group.MedianOutputTokensPerSecond != 1_000 {
+					t.Errorf("timing changed: %+v", group)
+				}
+			}
+		})
+	}
+}
+
+func TestBuildTokenCoverageIsIndependentOfPricing(t *testing.T) {
+	complete := analyticsEvent(100, "baseten", "claude-sonnet-4-6", "example/model")
+	setUsage(&complete, 100, 50, 1_000, 200)
+	setLatency(&complete, 200, 1200)
+	setActualCost(&complete, 103_000_000)
+	incomplete := complete
+	incomplete.UsageComplete = false
+	incomplete.ActualCost = telemetry.CostSnapshotV1{}
+	unpriced := complete
+	unpriced.ActualCost = telemetry.CostSnapshotV1{}
+	unknown := incomplete
+	unknown.Usage = telemetry.UsageV1{}
+	zero := complete
+	setUsage(&zero, 0, 0, 0, 0)
+	setActualCost(&zero, 0)
+
+	for _, test := range []struct {
+		name          string
+		events        []telemetry.EventV1
+		wantTokens    int64
+		wantBreakdown TokenBreakdown
+		wantPriced    int
+	}{
+		{
+			name: "partial usage", events: []telemetry.EventV1{complete, incomplete, unknown}, wantTokens: 1_350,
+			wantBreakdown: TokenBreakdown{InputTokens: 100, OutputTokens: 50, CacheReadInputTokens: 1_000, CacheWriteInputTokens: 200, CompleteRequests: 1},
+			wantPriced:    1,
+		},
+		{
+			name: "complete unpriced", events: []telemetry.EventV1{unpriced}, wantTokens: 1_350,
+			wantBreakdown: TokenBreakdown{InputTokens: 100, OutputTokens: 50, CacheReadInputTokens: 1_000, CacheWriteInputTokens: 200, CompleteRequests: 1},
+		},
+		{name: "all unknown", events: []telemetry.EventV1{unknown}},
+		{name: "reported zero", events: []telemetry.EventV1{zero}, wantBreakdown: TokenBreakdown{CompleteRequests: 1}, wantPriced: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := Build(test.events, Window{Since: 100, Until: 200}, 200, Snapshot{Complete: true}, true, nil)
+			for _, group := range append(got.Cost.Providers, got.Cost.Models...) {
+				if group.Tokens != test.wantTokens || group.TokenBreakdown != test.wantBreakdown || group.Requests != len(test.events) {
+					t.Errorf("cost group = %+v", group)
+				}
+				if group.PricedRows != test.wantPriced || group.UnpricedRows != len(test.events)-test.wantPriced || (group.ActualCostUSD == nil) != (test.wantPriced == 0) {
+					t.Errorf("pricing coverage changed: %+v", group)
+				}
+			}
+			for _, group := range append(got.Performance.Providers, got.Performance.Models...) {
+				if group.Tokens != test.wantTokens || group.TokenBreakdown != test.wantBreakdown || group.Requests != len(test.events) || group.TTFTSamples != test.wantBreakdown.CompleteRequests {
+					t.Errorf("performance group = %+v", group)
+				}
+			}
+			if got.Coverage.IncompleteUsageRows != len(test.events)-test.wantBreakdown.CompleteRequests {
+				t.Errorf("incomplete usage rows = %d", got.Coverage.IncompleteUsageRows)
+			}
+		})
+	}
+}
+
+func TestBuildTokenGroupsRespectWindow(t *testing.T) {
+	var events []telemetry.EventV1
+	for index, completedAt := range []int64{99, 100, 101, 200} {
+		event := analyticsEvent(completedAt, "baseten", "claude-sonnet-4-6", fmt.Sprintf("example/model-%d", index))
+		setUsage(&event, 10, 20, 30, 40)
+		events = append(events, event)
+	}
+	got := Build(events, Window{Since: 100, Until: 200}, 200, Snapshot{Complete: true}, true, nil)
+	want := TokenBreakdown{InputTokens: 20, OutputTokens: 40, CacheReadInputTokens: 60, CacheWriteInputTokens: 80, CompleteRequests: 2}
+	if got.Coverage.RequestRows != 2 || len(got.Cost.Models) != 2 || len(got.Performance.Models) != 2 || len(got.Cost.Providers) != 1 || len(got.Performance.Providers) != 1 {
+		t.Fatalf("window groups = %+v", got)
+	}
+	if got.Cost.Providers[0].Tokens != 200 || got.Cost.Providers[0].TokenBreakdown != want || got.Performance.Providers[0].Tokens != 200 || got.Performance.Providers[0].TokenBreakdown != want {
+		t.Fatalf("provider totals = %+v / %+v", got.Cost.Providers, got.Performance.Providers)
+	}
+	for index, cost := range got.Cost.Models {
+		perf := got.Performance.Models[index]
+		if cost.ModelID != fmt.Sprintf("example/model-%d", index+1) || perf.ModelID != cost.ModelID || cost.Tokens != 100 || perf.Tokens != 100 || cost.TokenBreakdown != perf.TokenBreakdown || cost.TokenBreakdown != (TokenBreakdown{InputTokens: 10, OutputTokens: 20, CacheReadInputTokens: 30, CacheWriteInputTokens: 40, CompleteRequests: 1}) {
+			t.Errorf("model totals = %+v / %+v", cost, perf)
+		}
 	}
 }
 

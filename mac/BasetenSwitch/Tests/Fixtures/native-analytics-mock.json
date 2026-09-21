@@ -25,7 +25,14 @@
       {
       "provider": "Claude",
       "requests": 405,
-      "tokens": 18400000,
+      "tokens": 59800000,
+      "token_breakdown": {
+        "input_tokens": 14720000,
+        "output_tokens": 3680000,
+        "cache_read_input_tokens": 36800000,
+        "cache_write_input_tokens": 4600000,
+        "complete_requests": 405
+      },
       "actual_cost_usd": 172.4,
       "priced_rows": 405,
       "unpriced_rows": 0
@@ -33,7 +40,14 @@
       {
       "provider": "Baseten",
       "requests": 779,
-      "tokens": 96300000,
+      "tokens": 312975000,
+      "token_breakdown": {
+        "input_tokens": 77040000,
+        "output_tokens": 19260000,
+        "cache_read_input_tokens": 192600000,
+        "cache_write_input_tokens": 24075000,
+        "complete_requests": 779
+      },
       "actual_cost_usd": 143.5,
       "priced_rows": 779,
       "unpriced_rows": 0
@@ -45,7 +59,14 @@
         "model_id": "fable",
         "display_name": "Fable",
       "requests": 90,
-      "tokens": 4800000,
+      "tokens": 15600000,
+      "token_breakdown": {
+        "input_tokens": 3840000,
+        "output_tokens": 960000,
+        "cache_read_input_tokens": 9600000,
+        "cache_write_input_tokens": 1200000,
+        "complete_requests": 90
+      },
       "actual_cost_usd": 34.48,
       "priced_rows": 90,
       "unpriced_rows": 0
@@ -55,7 +76,14 @@
         "model_id": "opus",
         "display_name": "Opus",
       "requests": 62,
-      "tokens": 3200000,
+      "tokens": 10400000,
+      "token_breakdown": {
+        "input_tokens": 2560000,
+        "output_tokens": 640000,
+        "cache_read_input_tokens": 6400000,
+        "cache_write_input_tokens": 800000,
+        "complete_requests": 62
+      },
       "actual_cost_usd": 62.064,
       "priced_rows": 62,
       "unpriced_rows": 0
@@ -65,7 +93,14 @@
         "model_id": "sonnet",
         "display_name": "Sonnet",
       "requests": 223,
-      "tokens": 8900000,
+      "tokens": 28925000,
+      "token_breakdown": {
+        "input_tokens": 7120000,
+        "output_tokens": 1780000,
+        "cache_read_input_tokens": 17800000,
+        "cache_write_input_tokens": 2225000,
+        "complete_requests": 223
+      },
       "actual_cost_usd": 65.512,
       "priced_rows": 223,
       "unpriced_rows": 0
@@ -75,7 +110,14 @@
         "model_id": "haiku",
         "display_name": "Haiku",
       "requests": 30,
-      "tokens": 1500000,
+      "tokens": 4875000,
+      "token_breakdown": {
+        "input_tokens": 1200000,
+        "output_tokens": 300000,
+        "cache_read_input_tokens": 3000000,
+        "cache_write_input_tokens": 375000,
+        "complete_requests": 30
+      },
       "actual_cost_usd": 10.344,
       "priced_rows": 30,
       "unpriced_rows": 0
@@ -85,7 +127,14 @@
         "model_id": "zai-org/GLM-5.2",
         "display_name": "GLM 5.2",
       "requests": 620,
-      "tokens": 72513900,
+      "tokens": 235670175,
+      "token_breakdown": {
+        "input_tokens": 58011120,
+        "output_tokens": 14502780,
+        "cache_read_input_tokens": 145027800,
+        "cache_write_input_tokens": 18128475,
+        "complete_requests": 620
+      },
       "actual_cost_usd": 112.3,
       "priced_rows": 620,
       "unpriced_rows": 0
@@ -95,7 +144,14 @@
         "model_id": "moonshotai/Kimi-K3",
         "display_name": "Kimi K3",
       "requests": 159,
-      "tokens": 23786100,
+      "tokens": 77304825,
+      "token_breakdown": {
+        "input_tokens": 19028880,
+        "output_tokens": 4757220,
+        "cache_read_input_tokens": 47572200,
+        "cache_write_input_tokens": 5946525,
+        "complete_requests": 159
+      },
       "actual_cost_usd": 31.2,
       "priced_rows": 159,
       "unpriced_rows": 0
@@ -185,7 +241,14 @@
       {
         "provider": "Claude",
         "requests": 405,
-        "tokens": 18400000,
+        "tokens": 59800000,
+        "token_breakdown": {
+          "input_tokens": 14720000,
+          "output_tokens": 3680000,
+          "cache_read_input_tokens": 36800000,
+          "cache_write_input_tokens": 4600000,
+          "complete_requests": 405
+        },
         "ttft_samples": 392,
         "median_ttft_ms": 610,
         "output_tps_samples": 385,
@@ -194,7 +257,14 @@
       {
         "provider": "Baseten",
         "requests": 779,
-        "tokens": 96300000,
+        "tokens": 312975000,
+        "token_breakdown": {
+          "input_tokens": 77040000,
+          "output_tokens": 19260000,
+          "cache_read_input_tokens": 192600000,
+          "cache_write_input_tokens": 24075000,
+          "complete_requests": 779
+        },
         "ttft_samples": 750,
         "median_ttft_ms": 245,
         "output_tps_samples": 742,
@@ -207,7 +277,14 @@
         "model_id": "fable",
         "display_name": "Fable",
         "requests": 90,
-        "tokens": 4800000,
+        "tokens": 15600000,
+        "token_breakdown": {
+          "input_tokens": 3840000,
+          "output_tokens": 960000,
+          "cache_read_input_tokens": 9600000,
+          "cache_write_input_tokens": 1200000,
+          "complete_requests": 90
+        },
         "ttft_samples": 87,
         "median_ttft_ms": 690,
         "output_tps_samples": 84,
@@ -218,7 +295,14 @@
         "model_id": "opus",
         "display_name": "Opus",
         "requests": 62,
-        "tokens": 3200000,
+        "tokens": 10400000,
+        "token_breakdown": {
+          "input_tokens": 2560000,
+          "output_tokens": 640000,
+          "cache_read_input_tokens": 6400000,
+          "cache_write_input_tokens": 800000,
+          "complete_requests": 62
+        },
         "ttft_samples": 59,
         "median_ttft_ms": 650,
         "output_tps_samples": 58,
@@ -229,7 +313,14 @@
         "model_id": "sonnet",
         "display_name": "Sonnet",
         "requests": 223,
-        "tokens": 8900000,
+        "tokens": 28925000,
+        "token_breakdown": {
+          "input_tokens": 7120000,
+          "output_tokens": 1780000,
+          "cache_read_input_tokens": 17800000,
+          "cache_write_input_tokens": 2225000,
+          "complete_requests": 223
+        },
         "ttft_samples": 217,
         "median_ttft_ms": 590,
         "output_tps_samples": 214,
@@ -240,7 +331,14 @@
         "model_id": "haiku",
         "display_name": "Haiku",
         "requests": 30,
-        "tokens": 1500000,
+        "tokens": 4875000,
+        "token_breakdown": {
+          "input_tokens": 1200000,
+          "output_tokens": 300000,
+          "cache_read_input_tokens": 3000000,
+          "cache_write_input_tokens": 375000,
+          "complete_requests": 30
+        },
         "ttft_samples": 29,
         "median_ttft_ms": 420,
         "output_tps_samples": 29,
@@ -251,7 +349,14 @@
         "model_id": "zai-org/GLM-5.2",
         "display_name": "GLM 5.2",
         "requests": 620,
-        "tokens": 72513900,
+        "tokens": 235670175,
+        "token_breakdown": {
+          "input_tokens": 58011120,
+          "output_tokens": 14502780,
+          "cache_read_input_tokens": 145027800,
+          "cache_write_input_tokens": 18128475,
+          "complete_requests": 620
+        },
         "ttft_samples": 598,
         "median_ttft_ms": 232,
         "output_tps_samples": 590,
@@ -262,7 +367,14 @@
         "model_id": "moonshotai/Kimi-K3",
         "display_name": "Kimi K3",
         "requests": 159,
-        "tokens": 23786100,
+        "tokens": 77304825,
+        "token_breakdown": {
+          "input_tokens": 19028880,
+          "output_tokens": 4757220,
+          "cache_read_input_tokens": 47572200,
+          "cache_write_input_tokens": 5946525,
+          "complete_requests": 159
+        },
         "ttft_samples": 152,
         "median_ttft_ms": 268,
         "output_tps_samples": 152,
