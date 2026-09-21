@@ -29,14 +29,23 @@ type CostSummary struct {
 }
 
 type CostGroup struct {
-	Provider      string   `json:"provider"`
-	ModelID       string   `json:"model_id,omitempty"`
-	DisplayName   string   `json:"display_name,omitempty"`
-	Requests      int      `json:"requests"`
-	Tokens        int64    `json:"tokens"`
-	ActualCostUSD *float64 `json:"actual_cost_usd"`
-	PricedRows    int      `json:"priced_rows"`
-	UnpricedRows  int      `json:"unpriced_rows"`
+	Provider       string         `json:"provider"`
+	ModelID        string         `json:"model_id,omitempty"`
+	DisplayName    string         `json:"display_name,omitempty"`
+	Requests       int            `json:"requests"`
+	Tokens         int64          `json:"tokens"`
+	TokenBreakdown TokenBreakdown `json:"token_breakdown"`
+	ActualCostUSD  *float64       `json:"actual_cost_usd"`
+	PricedRows     int            `json:"priced_rows"`
+	UnpricedRows   int            `json:"unpriced_rows"`
+}
+
+type TokenBreakdown struct {
+	InputTokens           int64 `json:"input_tokens"`
+	OutputTokens          int64 `json:"output_tokens"`
+	CacheReadInputTokens  int64 `json:"cache_read_input_tokens"`
+	CacheWriteInputTokens int64 `json:"cache_write_input_tokens"`
+	CompleteRequests      int   `json:"complete_requests"`
 }
 
 type SavingsModel struct {
@@ -69,15 +78,16 @@ type Cost struct {
 }
 
 type PerformanceGroup struct {
-	Provider                    string  `json:"provider"`
-	ModelID                     string  `json:"model_id,omitempty"`
-	DisplayName                 string  `json:"display_name,omitempty"`
-	Requests                    int     `json:"requests"`
-	Tokens                      int64   `json:"tokens"`
-	TTFTSamples                 int     `json:"ttft_samples"`
-	MedianTTFTMs                int64   `json:"median_ttft_ms"`
-	OutputTPSSamples            int     `json:"output_tps_samples"`
-	MedianOutputTokensPerSecond float64 `json:"median_output_tokens_per_second"`
+	Provider                    string         `json:"provider"`
+	ModelID                     string         `json:"model_id,omitempty"`
+	DisplayName                 string         `json:"display_name,omitempty"`
+	Requests                    int            `json:"requests"`
+	Tokens                      int64          `json:"tokens"`
+	TokenBreakdown              TokenBreakdown `json:"token_breakdown"`
+	TTFTSamples                 int            `json:"ttft_samples"`
+	MedianTTFTMs                int64          `json:"median_ttft_ms"`
+	OutputTPSSamples            int            `json:"output_tps_samples"`
+	MedianOutputTokensPerSecond float64        `json:"median_output_tokens_per_second"`
 }
 
 type Performance struct {
