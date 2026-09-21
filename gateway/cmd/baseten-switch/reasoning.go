@@ -14,7 +14,7 @@ import (
 	"github.com/basetenlabs/baseten-switch/gateway/internal/config"
 )
 
-const reasoningUsage = "usage: baseten-switch <claude|codex> reasoning baseten <model> off|follow-harness|effort <value>|default"
+const reasoningUsage = "usage: baseten-switch <claude|codex> reasoning baseten <model> on|off|follow-harness|effort <value>|default"
 
 type reasoningCommandOptions struct {
 	Mutation mutationOptions
@@ -191,6 +191,11 @@ func parseReasoningPolicy(args []string) (string, string, config.ReasoningPolicy
 			return provider, modelID, config.ReasoningPolicy{}, false, fmt.Errorf("default accepts no value")
 		}
 		return provider, modelID, config.ReasoningPolicy{}, true, nil
+	case "on":
+		if len(args) != 3 {
+			return provider, modelID, config.ReasoningPolicy{}, false, fmt.Errorf("on accepts no value")
+		}
+		return provider, modelID, config.ReasoningPolicy{Mode: config.ReasoningOn}, false, nil
 	case "off":
 		if len(args) != 3 {
 			return provider, modelID, config.ReasoningPolicy{}, false, fmt.Errorf("off accepts no value")

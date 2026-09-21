@@ -1916,6 +1916,7 @@ final class BasetenSwitchState: ObservableObject {
         guard canMutateReasoning,
               pendingReasoning == nil,
               policy.mode == .default
+                || policy.mode == .on
                 || policy.mode == .off
                 || policy.mode == .followHarness
                 || policy.mode == .fixed else {
@@ -2552,6 +2553,8 @@ func reasoningDispatchArgs(
     }
     var arguments = [harness, "reasoning", provider, model]
     switch policy.mode {
+    case .on:
+        arguments.append("on")
     case .off:
         arguments.append("off")
     case .followHarness:
@@ -2570,6 +2573,8 @@ func reasoningRequestedTarget(_ policy: ReasoningPolicyValue) -> String {
     switch policy.mode {
     case .default:
         return "default"
+    case .on:
+        return "on"
     case .off:
         return "off"
     case .followHarness:

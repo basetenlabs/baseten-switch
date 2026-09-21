@@ -280,7 +280,13 @@ func catalogReasoningInput(
 	for _, option := range catalogCapability.Options {
 		switch option.Type {
 		case pricing.ReasoningToggle:
-			capability.Toggle = true
+			if option.API == "" {
+				capability.Toggle = true
+			} else if option.API == pricing.ReasoningAPIAnthropicMessages {
+				capability.MessagesExplicitOnOff = true
+				capability.MessagesDefaultOff =
+					option.DefaultMode == pricing.ReasoningDefaultOff
+			}
 		case pricing.ReasoningEffort:
 			for _, value := range option.Values {
 				if value != nil {

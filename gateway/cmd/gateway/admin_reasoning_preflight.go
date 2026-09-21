@@ -196,18 +196,10 @@ func validateReasoningPreflightPolicy(
 		)
 	}
 	switch request.Policy.Mode {
-	case config.ReasoningOff:
-		for _, option := range capability.Options {
-			if option.Type == pricing.ReasoningToggle ||
-				(option.Type == pricing.ReasoningEffort &&
-					catalogEffortHasDisabled(option.Values)) {
-				return nil
-			}
-		}
-		return fmt.Errorf(
-			"model %q does not advertise a reasoning-off control",
-			request.Model,
-		)
+	case config.ReasoningOn, config.ReasoningOff:
+		// The selected client's reviewed adapter projection performs the wire
+		// capability check after this catalog support check.
+		return nil
 	case config.ReasoningFollowHarness:
 		if len(capability.Options) == 0 {
 			return fmt.Errorf(
@@ -238,15 +230,6 @@ func validateReasoningPreflightPolicy(
 			request.Policy.Mode,
 		)
 	}
-}
-
-func catalogEffortHasDisabled(values []*string) bool {
-	for _, value := range values {
-		if value == nil || *value == "none" {
-			return true
-		}
-	}
-	return false
 }
 
 type reasoningPreflightConfiguredClient struct {
