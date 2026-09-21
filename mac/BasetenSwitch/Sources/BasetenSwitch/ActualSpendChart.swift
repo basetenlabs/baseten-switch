@@ -23,14 +23,14 @@ struct ActualSpendChart: View {
     @ViewBuilder
     var body: some View {
         if pricedRows.isEmpty {
-            Text("No priced spend is available for this range.")
+            Text("No estimated cost is available for this range.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, minHeight: 80)
         } else {
             Chart(pricedRows) { row in
                 BarMark(
-                    x: .value("Actual spend", row.actualCostUSD ?? 0),
+                    x: .value("Estimated cost", row.actualCostUSD ?? 0),
                     y: .value("Provider or model", row.label)
                 )
                 .foregroundStyle(
@@ -59,7 +59,7 @@ struct ActualSpendChart: View {
                 TrafficChartMotion.animation(reduceMotion: reduceMotion),
                 value: pricedRows)
             .frame(height: max(110, CGFloat(pricedRows.count) * 38))
-            .accessibilityLabel("Actual spend")
+            .accessibilityLabel("Estimated cost")
             .accessibilityValue(accessibilitySummary)
         }
     }

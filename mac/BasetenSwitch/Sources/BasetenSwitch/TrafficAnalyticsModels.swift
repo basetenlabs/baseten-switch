@@ -50,8 +50,11 @@ struct TrafficAnalyticsSnapshot: Decodable, Equatable, Sendable {
         generatedAt = values.decodeDefault(Int64.self, forKey: .generatedAt)
         window = values.decodeDefault(TrafficAnalyticsWindow.self, forKey: .window)
         coverage = values.decodeDefault(TrafficCoverage.self, forKey: .coverage)
-        cost = values.decodeDefault(TrafficCost.self, forKey: .cost)
-        performance = values.decodeDefault(TrafficPerformance.self, forKey: .performance)
+        cost = try values.decodeIfPresent(TrafficCost.self, forKey: .cost)
+            ?? TrafficCost()
+        performance = try values.decodeIfPresent(
+            TrafficPerformance.self, forKey: .performance)
+            ?? TrafficPerformance()
     }
 
     var isEmpty: Bool {
@@ -149,6 +152,7 @@ struct TrafficCostRow: Decodable, Equatable, Identifiable, Sendable {
     var displayName: String?
     var requests = 0
     var tokens: Int64 = 0
+    var tokenBreakdown: TrafficTokenBreakdown?
     var actualCostUSD: Double?
     var pricedRows = 0
     var unpricedRows = 0
@@ -159,6 +163,7 @@ struct TrafficCostRow: Decodable, Equatable, Identifiable, Sendable {
         case displayName = "display_name"
         case requests
         case tokens
+        case tokenBreakdown = "token_breakdown"
         case actualCostUSD = "actual_cost_usd"
         case pricedRows = "priced_rows"
         case unpricedRows = "unpriced_rows"
@@ -173,6 +178,8 @@ struct TrafficCostRow: Decodable, Equatable, Identifiable, Sendable {
             forKey: .displayName)
         requests = try values.decodeIfPresent(Int.self, forKey: .requests) ?? 0
         tokens = try values.decodeIfPresent(Int64.self, forKey: .tokens) ?? 0
+        tokenBreakdown = try values.decodeIfPresent(
+            TrafficTokenBreakdown.self, forKey: .tokenBreakdown)
         actualCostUSD = try values.decodeIfPresent(
             Double.self,
             forKey: .actualCostUSD)
@@ -193,6 +200,83 @@ struct TrafficCostRow: Decodable, Equatable, Identifiable, Sendable {
     }
     var hasPartialCost: Bool {
         pricedRows > 0 && unpricedRows > 0
+    }
+    var tokenUsage: TrafficTokenUsage {
+        TrafficTokenUsage(
+            tokens: tokens, breakdown: tokenBreakdown, requests: requests)
+    }
+}
+
+struct TrafficTokenBreakdown: Decodable, Equatable, Sendable {
+    let inputTokens: Int64
+    let outputTokens: Int64
+    let cacheReadInputTokens: Int64
+    let cacheWriteInputTokens: Int64
+    let completeRequests: Int
+
+    enum CodingKeys: String, CodingKey {
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case cacheReadInputTokens = "cache_read_input_tokens"
+        case cacheWriteInputTokens = "cache_write_input_tokens"
+        case completeRequests = "complete_requests"
+    }
+}
+
+extension TrafficTokenBreakdown {
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        inputTokens = try values.decode(Int64.self, forKey: .inputTokens)
+        outputTokens = try values.decode(Int64.self, forKey: .outputTokens)
+        cacheReadInputTokens = try values.decode(
+            Int64.self, forKey: .cacheReadInputTokens)
+        cacheWriteInputTokens = try values.decode(
+            Int64.self, forKey: .cacheWriteInputTokens)
+        completeRequests = try values.decode(Int.self, forKey: .completeRequests)
+        guard inputTokens >= 0, outputTokens >= 0,
+              cacheReadInputTokens >= 0, cacheWriteInputTokens >= 0,
+              completeRequests >= 0 else {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: decoder.codingPath,
+                debugDescription: "Token breakdown counters must be nonnegative."))
+        }
+    }
+}
+
+struct TrafficTokenUsage: Equatable {
+    let tokens: Int64
+    let breakdown: TrafficTokenBreakdown?
+    let requests: Int
+
+    var title: String { breakdown == nil ? "Input + output" : "Total tokens" }
+    var isUnavailable: Bool { breakdown?.completeRequests == 0 }
+    var isPartial: Bool {
+        guard let breakdown else { return false }
+        return breakdown.completeRequests > 0 && breakdown.completeRequests < requests
+    }
+    var value: String {
+        isUnavailable ? "Unavailable" : trafficTokenCount(tokens)
+    }
+    var coverageMessage: String? {
+        guard let breakdown else { return nil }
+        return "Usage available for \(breakdown.completeRequests.formatted()) of \(requests.formatted()) requests"
+    }
+    var cardDescription: String {
+        if isUnavailable { return "Tokens unavailable" }
+        let suffix = breakdown == nil ? "input + output" : "total tokens"
+        return "\(isPartial ? "Partial · " : "")\(value) \(suffix)"
+    }
+    var accessibilitySummary: String {
+        guard let breakdown else {
+            return "Input + output \(tokens.formatted())"
+        }
+        let total = isUnavailable ? "Unavailable" : tokens.formatted()
+        let counts = isUnavailable ? "" :
+            ", uncached input \(breakdown.inputTokens.formatted())"
+            + ", output \(breakdown.outputTokens.formatted())"
+            + ", cache reads \(breakdown.cacheReadInputTokens.formatted())"
+            + ", cache writes \(breakdown.cacheWriteInputTokens.formatted())"
+        return "Total tokens \(total)\(counts). \(coverageMessage ?? "")"
     }
 }
 
@@ -272,6 +356,7 @@ struct TrafficPerformanceRow: Decodable, Equatable, Identifiable, Sendable {
     var displayName: String?
     var requests = 0
     var tokens: Int64 = 0
+    var tokenBreakdown: TrafficTokenBreakdown?
     var ttftSamples = 0
     var medianTTFTMS: Double?
     var outputTPSSamples = 0
@@ -283,6 +368,7 @@ struct TrafficPerformanceRow: Decodable, Equatable, Identifiable, Sendable {
         case displayName = "display_name"
         case requests
         case tokens
+        case tokenBreakdown = "token_breakdown"
         case ttftSamples = "ttft_samples"
         case medianTTFTMS = "median_ttft_ms"
         case outputTPSSamples = "output_tps_samples"
@@ -302,6 +388,10 @@ struct TrafficPerformanceRow: Decodable, Equatable, Identifiable, Sendable {
     }
     var measuredMedianOutputTokensPerSecond: Double? {
         outputTPSSamples > 0 ? medianOutputTokensPerSecond : nil
+    }
+    var tokenUsage: TrafficTokenUsage {
+        TrafficTokenUsage(
+            tokens: tokens, breakdown: tokenBreakdown, requests: requests)
     }
 }
 

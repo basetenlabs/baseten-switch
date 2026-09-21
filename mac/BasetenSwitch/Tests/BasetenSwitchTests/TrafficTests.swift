@@ -139,6 +139,162 @@ final class TrafficTests: XCTestCase {
             138)
     }
 
+    func testTokenBreakdownMatchesProviderAndModelTotalsAcrossViews() throws {
+        let snapshot = try approvedFixture()
+        for cost in snapshot.cost.providers + snapshot.cost.models {
+            let breakdown = try XCTUnwrap(cost.tokenBreakdown)
+            XCTAssertEqual(cost.tokens, breakdown.inputTokens + breakdown.outputTokens
+                + breakdown.cacheReadInputTokens + breakdown.cacheWriteInputTokens)
+            XCTAssertEqual(breakdown.completeRequests, cost.requests)
+            XCTAssertEqual(cost.tokenUsage.title, "Total tokens")
+            let performance = try XCTUnwrap(
+                (snapshot.performance.providers + snapshot.performance.models)
+                    .first { $0.id == cost.id })
+            XCTAssertEqual(performance.tokenUsage, cost.tokenUsage)
+        }
+        for provider in snapshot.cost.providers {
+            let models = snapshot.cost.models.filter { $0.provider == provider.provider }
+            XCTAssertEqual(provider.tokens, models.reduce(0) { $0 + $1.tokens })
+        }
+        XCTAssertEqual(snapshot.cost.providers.first?.tokens, 59_800_000)
+        XCTAssertEqual(snapshot.cost.providers.last?.tokens, 312_975_000)
+    }
+
+    func testTokenCoverageDistinguishesPartialUnavailableZeroAndUnpricedUsage() throws {
+        let rows = try JSONDecoder().decode([TrafficCostRow].self, from: Data(
+            #"""
+            [
+              {
+                "provider": "Claude", "requests": 2, "tokens": 1002000,
+                "token_breakdown": {
+                  "input_tokens": 1000, "output_tokens": 1000,
+                  "cache_read_input_tokens": 1000000, "cache_write_input_tokens": 0,
+                  "complete_requests": 1
+                }
+              },
+              {
+                "provider": "Claude", "requests": 1, "tokens": 0,
+                "token_breakdown": {
+                  "input_tokens": 0, "output_tokens": 0,
+                  "cache_read_input_tokens": 0, "cache_write_input_tokens": 0,
+                  "complete_requests": 0
+                }
+              },
+              {
+                "provider": "Claude", "requests": 1, "tokens": 0,
+                "token_breakdown": {
+                  "input_tokens": 0, "output_tokens": 0,
+                  "cache_read_input_tokens": 0, "cache_write_input_tokens": 0,
+                  "complete_requests": 1
+                }
+              }
+            ]
+            """#.utf8))
+
+        let partial = rows[0].tokenUsage
+        XCTAssertNil(rows[0].actualCostUSD)
+        XCTAssertEqual(partial.value, "1M")
+        XCTAssertTrue(partial.isPartial)
+        XCTAssertEqual(partial.cardDescription, "Partial · 1M total tokens")
+        XCTAssertEqual(partial.coverageMessage, "Usage available for 1 of 2 requests")
+        XCTAssertEqual(partial.accessibilitySummary,
+            "Total tokens 1,002,000, uncached input 1,000, output 1,000, cache reads 1,000,000, cache writes 0. Usage available for 1 of 2 requests")
+
+        let unavailable = rows[1].tokenUsage
+        XCTAssertEqual(unavailable.value, "Unavailable")
+        XCTAssertFalse(unavailable.isPartial)
+        XCTAssertEqual(unavailable.cardDescription, "Tokens unavailable")
+        XCTAssertEqual(unavailable.accessibilitySummary,
+            "Total tokens Unavailable. Usage available for 0 of 1 requests")
+
+        let zero = rows[2].tokenUsage
+        XCTAssertEqual(zero.value, "0")
+        XCTAssertFalse(zero.isUnavailable)
+        XCTAssertEqual(zero.cardDescription, "0 total tokens")
+        XCTAssertEqual(zero.coverageMessage, "Usage available for 1 of 1 requests")
+
+        let cards = trafficPerformanceCardContents(
+            claude: nil,
+            baseten: TrafficPerformanceRow(
+                provider: "Baseten", requests: 2, tokens: rows[0].tokens,
+                tokenBreakdown: rows[0].tokenBreakdown))
+        XCTAssertEqual(cards[2].title, "Baseten total tokens")
+        XCTAssertEqual(cards[2].value, "1M · partial")
+        XCTAssertEqual(cards[2].detail, "Claude tokens unavailable")
+        XCTAssertEqual(trafficPerformanceCardContents(claude: nil, baseten: nil)[2].value,
+            "Unavailable")
+    }
+
+    func testLegacySnapshotLabelsInputAndOutputWithoutInventingBreakdown() throws {
+        for legacyValue in [NSNull() as Any, nil] {
+            var fixture = try XCTUnwrap(JSONSerialization.jsonObject(
+                with: Data(contentsOf: approvedFixtureURL())) as? [String: Any])
+            for sectionName in ["cost", "performance"] {
+                var section = try XCTUnwrap(fixture[sectionName] as? [String: Any])
+                for groupName in ["providers", "models"] {
+                    var rows = try XCTUnwrap(section[groupName] as? [[String: Any]])
+                    for index in rows.indices {
+                        rows[index]["token_breakdown"] = legacyValue
+                        rows[index]["tokens"] = 2000
+                    }
+                    section[groupName] = rows
+                }
+                fixture[sectionName] = section
+            }
+            let snapshot = try JSONDecoder().decode(TrafficAnalyticsSnapshot.self,
+                from: JSONSerialization.data(withJSONObject: fixture))
+            let cost = try XCTUnwrap(snapshot.cost.providers.first)
+            let performance = try XCTUnwrap(snapshot.performance.providers.first)
+            XCTAssertNil(cost.tokenBreakdown)
+            XCTAssertNil(performance.tokenBreakdown)
+            XCTAssertEqual(cost.tokenUsage, performance.tokenUsage)
+            XCTAssertEqual(cost.tokenUsage.title, "Input + output")
+            XCTAssertEqual(cost.tokenUsage.cardDescription, "2K input + output")
+            XCTAssertNil(cost.tokenUsage.coverageMessage)
+            XCTAssertEqual(cost.tokenUsage.accessibilitySummary, "Input + output 2,000")
+            let cards = trafficPerformanceCardContents(claude: performance, baseten: performance)
+            XCTAssertEqual(cards[2].title, "Baseten input + output")
+            XCTAssertEqual(cards[2].detail, "Claude 2K input + output")
+        }
+    }
+
+    func testMalformedTokenBreakdownFailsFullSnapshotDecoding() throws {
+        let valid: [String: Any] = [
+            "input_tokens": 1000, "output_tokens": 1000,
+            "cache_read_input_tokens": 1_000_000, "cache_write_input_tokens": 0,
+            "complete_requests": 1,
+        ]
+        var malformed: [Any] = ["invalid object"]
+        for key in valid.keys {
+            var missing = valid
+            missing.removeValue(forKey: key)
+            malformed.append(missing)
+            var wrongType = valid
+            wrongType[key] = "unknown"
+            malformed.append(wrongType)
+            var negative = valid
+            negative[key] = -1
+            malformed.append(negative)
+        }
+        for sectionName in ["cost", "performance"] {
+            for groupName in ["providers", "models"] {
+                for breakdown in malformed {
+                    var fixture = try XCTUnwrap(JSONSerialization.jsonObject(
+                        with: Data(contentsOf: approvedFixtureURL())) as? [String: Any])
+                    var section = try XCTUnwrap(fixture[sectionName] as? [String: Any])
+                    var rows = try XCTUnwrap(section[groupName] as? [[String: Any]])
+                    rows[0]["token_breakdown"] = breakdown
+                    section[groupName] = rows
+                    fixture[sectionName] = section
+                    XCTAssertThrowsError(try JSONDecoder().decode(
+                        TrafficAnalyticsSnapshot.self,
+                        from: JSONSerialization.data(withJSONObject: fixture)),
+                        "Malformed \(sectionName).\(groupName) must not become empty data")
+                }
+            }
+        }
+    }
+
     func testModelContractKeepsIdentitySeparateFromVisibleLabels() throws {
         let costRows = try JSONDecoder().decode(
             [TrafficCostRow].self,
@@ -323,9 +479,9 @@ final class TrafficTests: XCTestCase {
                     brand: .baseten,
                     detailBrand: .claude),
                 TrafficPerformanceCardContent(
-                    title: "Baseten token volume",
-                    value: "96.3M",
-                    detail: "Claude 18.4M tokens",
+                    title: "Baseten total tokens",
+                    value: "313M",
+                    detail: "Claude 59.8M total tokens",
                     brand: .baseten,
                     detailBrand: .claude),
             ])

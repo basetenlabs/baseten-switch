@@ -15,7 +15,7 @@ struct SavingsStackedChart: View {
                 legend(
                     color: .basetenGreen,
                     opacity: 1,
-                    title: "Baseten actual")
+                    title: "Baseten estimate")
                 legend(
                     color: .claudeTerracotta,
                     opacity: 0.42,
@@ -42,7 +42,7 @@ struct SavingsStackedChart: View {
                     if group.estimatedAdditionalClaudeCostUSD > 0 {
                         BarMark(
                             x: .value(
-                                "Additional Claude estimate",
+                                "Additional hypothetical Claude cost",
                                 group.estimatedAdditionalClaudeCostUSD),
                             y: .value("Traffic", group.label),
                             stacking: .standard
@@ -54,7 +54,7 @@ struct SavingsStackedChart: View {
                     if group.hasNegativeSavings {
                         PointMark(
                             x: .value(
-                                "Estimated Claude total",
+                                "Hypothetical Claude total",
                                 group.estimatedNativeCostUSD),
                             y: .value("Traffic", group.label)
                         )
@@ -80,7 +80,7 @@ struct SavingsStackedChart: View {
             }
             .frame(height: max(100, CGFloat(groups.count) * 44))
             .accessibilityLabel(
-                "Actual Baseten cost and estimated additional Claude cost")
+                "Estimated Baseten cost and additional hypothetical Claude cost")
             .accessibilityValue(accessibilitySummary)
 
             ForEach(groups) { group in
@@ -90,13 +90,13 @@ struct SavingsStackedChart: View {
                             .lineLimit(1)
                         Spacer()
                         Text(
-                            "\(trafficCurrency(group.actualBasetenCostUSD)) actual · \(trafficCurrency(group.estimatedNativeCostUSD)) estimated Claude total")
+                            "\(trafficCurrency(group.actualBasetenCostUSD)) estimated Baseten · \(trafficCurrency(group.estimatedNativeCostUSD)) hypothetical Claude total")
                             .font(.caption.monospacedDigit())
                             .foregroundStyle(.secondary)
                     }
                     if group.hasNegativeSavings {
                         Text(
-                            "Baseten cost \(trafficCurrency(group.actualBasetenCostUSD - group.estimatedNativeCostUSD)) more than the Claude estimate.")
+                            "Estimated Baseten cost is \(trafficCurrency(group.actualBasetenCostUSD - group.estimatedNativeCostUSD)) more than the Claude estimate.")
                             .font(.caption)
                             .foregroundStyle(.orange)
                     }
@@ -120,7 +120,7 @@ struct SavingsStackedChart: View {
 
     private var accessibilitySummary: String {
         groups.map {
-            "\($0.label), \(trafficCurrency($0.actualBasetenCostUSD)) actual Baseten, \(trafficCurrency($0.estimatedNativeCostUSD)) estimated Claude total"
+            "\($0.label), \(trafficCurrency($0.actualBasetenCostUSD)) estimated Baseten, \(trafficCurrency($0.estimatedNativeCostUSD)) hypothetical Claude total"
         }.joined(separator: "; ")
     }
 }

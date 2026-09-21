@@ -149,6 +149,9 @@ func TestAdminAnalyticsContractAndDefaultWindow(t *testing.T) {
 	)
 	counterfactual := analyticsAdminCost(12_000_000_000, event.StartedAt)
 	event.NativeCounterfactualCost = &counterfactual
+	*event.Usage.CacheReadInputTokens = 2_000_000
+	*event.Usage.CacheWrite5mInputTokens = 300_000
+	*event.Usage.CacheWrite1hInputTokens = 400_000
 	appendAnalyticsEvent(t, path, event)
 
 	recorder, response := requestAnalytics(t, g, "/v1/admin/analytics", http.MethodGet)
@@ -179,6 +182,42 @@ func TestAdminAnalyticsContractAndDefaultWindow(t *testing.T) {
 	}
 
 	body := recorder.Body.String()
+	// Decode only the two group sections so JSON field names are checked independently.
+	var sections map[string]json.RawMessage
+	if err := json.Unmarshal(recorder.Body.Bytes(), &sections); err != nil {
+		t.Fatal(err)
+	}
+	for _, section := range []string{"cost", "performance"} {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(sections[section], &fields); err != nil {
+			t.Fatal(err)
+		}
+		for _, grouping := range []string{"providers", "models"} {
+			var groups []struct {
+				Tokens         int64            `json:"tokens"`
+				TokenBreakdown map[string]int64 `json:"token_breakdown"`
+			}
+			if err := json.Unmarshal(fields[grouping], &groups); err != nil {
+				t.Fatal(err)
+			}
+			if len(groups) != 1 || groups[0].Tokens != 3_800_000 {
+				t.Fatalf("%s %s token totals = %+v", section, grouping, groups)
+			}
+			want := map[string]int64{
+				"input_tokens": 1_000_000, "output_tokens": 100_000,
+				"cache_read_input_tokens": 2_000_000, "cache_write_input_tokens": 700_000,
+				"complete_requests": 1,
+			}
+			if len(groups[0].TokenBreakdown) != len(want) {
+				t.Fatalf("%s %s token breakdown = %+v", section, grouping, groups[0].TokenBreakdown)
+			}
+			for key, value := range want {
+				if got, ok := groups[0].TokenBreakdown[key]; !ok || got != value {
+					t.Errorf("%s %s %s = %d, present=%t, want %d", section, grouping, key, got, ok, value)
+				}
+			}
+		}
+	}
 	for _, forbidden := range []string{"prompt", "completion", "authorization", "api_key"} {
 		if strings.Contains(strings.ToLower(body), forbidden) {
 			t.Fatalf("analytics response contains forbidden body-content term %q: %s", forbidden, body)
