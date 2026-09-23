@@ -493,6 +493,20 @@ type doctorStoreAuth struct {
 }
 
 func doctorAuthCheck(add addCheck, f *config.File, unresolved []string, envFile map[string]string, envFilePath string, routerAuth doctorRouterAuth, routerAuthKnown bool) doctorStoreAuth {
+	path, _ := resolveConfigPath()
+	key, keyErr := auth.LoadSavedAPIKey(path)
+	if keyErr != nil {
+		add("auth", "signin", docFail, keyErr.Error(), "replace the saved API key or run 'baseten-switch auth api-key remove'")
+		return doctorStoreAuth{authType: "saved Switch API-key"}
+	}
+	if key != "" {
+		add("auth", "signin", docOK, "saved Switch API key is available and takes priority over Baseten CLI authentication", "")
+		return doctorStoreAuth{authType: "saved Switch API-key", ready: true}
+	}
+	if routerAuthKnown && routerAuth.Source == "saved_api_key" {
+		add("auth", "signin", docFail, "router still reports a saved Switch API key, but the saved key is absent", "reload the router with SIGHUP")
+		return doctorStoreAuth{}
+	}
 	profile := doctorEnvValue("BASETEN_SWITCH_OAUTH_PROFILE", envFile)
 	if routerAuthKnown {
 		profile = routerAuth.Profile
@@ -628,6 +642,7 @@ func doctorEnvValue(name string, envFile map[string]string) string {
 type doctorRouterAuth struct {
 	SignedIn         bool   `json:"signed_in"`
 	AuthType         string `json:"auth_type"`
+	Source           string `json:"source"`
 	Profile          string `json:"profile"`
 	Health           string `json:"health"`
 	LastRefreshError string `json:"last_refresh_error"`
@@ -678,6 +693,10 @@ func doctorAuthHealthCheck(add addCheck, routerUp bool, routerAuth doctorRouterA
 	}
 	if !routerAuthKnown {
 		add("auth", "health", docSkip, "admin /v1/admin/status auth projection unavailable; cannot read credential health", "")
+		return
+	}
+	if store.ready && store.authType == "saved Switch API-key" && routerAuth.Source != "saved_api_key" {
+		add("auth", "health", docFail, "a saved Switch API key is available, but the running router is using another credential source", "reload the router with SIGHUP")
 		return
 	}
 	health := routerAuth.Health

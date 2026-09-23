@@ -35,12 +35,16 @@ user launch agents, starts the local gateway, installs Baseten Switch.app in
 sessions to the gateway. The final command checks the complete request path
 with a small live request.
 
-Baseten Switch uses the current
+By default, Baseten Switch uses the current
 [Baseten CLI profile](https://docs.baseten.co/reference/cli/baseten/auth) for
 authentication. Both browser OAuth and API-key profiles created by
 `baseten auth login` work with the gateway. Baseten controls each API key's
 permissions and resource access; Switch treats the key as an opaque
 credential.
+
+To keep Switch authentication independent of CLI account changes, open
+**Overview → Authentication** and save an API key. Switch uses that key until
+you replace or remove it. Removing it restores CLI authentication.
 
 If macOS blocks the app's first launch, open **System Settings → Privacy &
 Security**, scroll to **Security**, and click **Open Anyway**. This control
@@ -191,16 +195,38 @@ Baseten Switch stores configuration, local state, logs, and telemetry under
 ~/.config/baseten-switch/logs/door.log
 ```
 
-Run `baseten-switch auth login` if the Baseten credential expires, is rotated,
+Run `baseten-switch auth login` if the CLI credential expires, is rotated,
 or needs to change. The command delegates authentication to the Baseten CLI,
 reloads the gateway, and prints the current identity. `status` identifies the
 selected profile as OAuth or API key. The gateway also watches the selected
 CLI profile for login, logout, rotation, and profile changes.
 
+A key saved in Switch takes precedence over CLI authentication. Manage it in
+**Overview → Authentication**, or read a key from a local file through stdin:
+
+```bash
+baseten-switch auth api-key set < /path/to/key-file
+baseten-switch auth api-key remove
+```
+
+On macOS, Switch stores the key in Keychain, separately from Baseten CLI
+credentials, with a distinct entry for each configuration path. Existing
+owner-only `.api-key` files migrate to Keychain; Switch verifies the stored key
+before removing the file. Other operating systems retain the owner-only file
+beside the configuration. Keys are never included in gateway YAML or status
+responses.
+
+A saved key works without a CLI login. If Keychain is locked, access is denied,
+or a saved credential cannot be read, Switch reports an error instead of
+substituting CLI credentials. Restore access or replace/remove the saved key to
+recover. Saving checks the key's format; provider permissions are checked when
+it is used.
+
 `BASETEN_API_KEY` is a separate environment fallback, not the selected CLI
 profile. Switch uses it only when `BASETEN_SWITCH_API_KEY_FALLBACK=1` and no
-selected profile credential is available. A selected OAuth or API-key profile
-always takes precedence.
+saved key or selected profile credential is available. A saved key takes
+precedence over a selected OAuth or API-key profile, followed by the explicitly
+enabled environment fallback.
 
 ### Why are Claude Code Auto permission checks failing?
 

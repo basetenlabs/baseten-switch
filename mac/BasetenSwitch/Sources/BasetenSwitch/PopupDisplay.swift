@@ -59,6 +59,9 @@ func versionSkewNote(routerVersion: String, cliVersion: String) -> String? {
 /// (router predates the field) changes nothing.
 func authLineLabel(auth: AuthStatus?) -> String {
     guard let auth else { return "Auth: unknown" }
+    if auth.savedAPIKey {
+        return auth.signedIn ? "Auth: saved Switch API key" : "Auth: saved API key unavailable"
+    }
     if auth.health == "refresh_failed" {
         return "Auth: reauthentication required"
     }

@@ -18,11 +18,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/basetenlabs/baseten-switch/gateway/internal/auth"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/config"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/pricing"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/telemetry"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/version"
 )
+
+func TestMain(m *testing.M) {
+	restoreSavedKeyStore := auth.UseFileSavedAPIKeyStoreForTesting()
+	code := m.Run()
+	restoreSavedKeyStore()
+	os.Exit(code)
+}
 
 func testConfig(t *testing.T, upstreamBaseten, upstreamAnthropic string) Config {
 	t.Helper()

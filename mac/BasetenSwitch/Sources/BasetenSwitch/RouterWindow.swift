@@ -705,6 +705,8 @@ private struct RoutingOverviewView: View {
 
                 liveRequestPath
 
+                SavedAPIKeyView(state: state, isPreview: isPreview)
+
                 if state.routingSnapshot != nil {
                     routingGroup
                     automaticFallbackGroup

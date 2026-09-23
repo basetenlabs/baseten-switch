@@ -12,6 +12,7 @@ mac/BasetenSwitch/dist-preview/
 
 # Local credentials
 .env*
+*.api-key
 
 # OS junk
 .DS_Store
@@ -23,4 +24,5 @@ __pycache__/
 
 # Claude Code session state (agent worktrees, local settings)
 .claude/
+.tasks/
 gateway/baseten-switch

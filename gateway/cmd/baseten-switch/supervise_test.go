@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/basetenlabs/baseten-switch/gateway/internal/auth"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/door"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/launchd"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/version"
@@ -26,6 +27,7 @@ import (
 // ~/Applications copy. Tests that exercise the step re-enable it with
 // t.Setenv("BASETEN_SWITCH_MENUBAR", "") plus the runCmd/HOME/keg fixtures.
 func TestMain(m *testing.M) {
+	restoreSavedKeyStore := auth.UseFileSavedAPIKeyStoreForTesting()
 	dir, err := os.MkdirTemp("", "baseten-launchagents")
 	if err != nil {
 		panic(err)
@@ -33,7 +35,10 @@ func TestMain(m *testing.M) {
 	launchAgentsDir = func() string { return dir }
 	launchdRunner = &fakeLaunchctl{} // empty: every call errors (nothing loaded)
 	os.Setenv("BASETEN_SWITCH_MENUBAR", "off")
+	// Auth tests without a config fixture must not read the user's saved key.
+	os.Setenv("BASETEN_SWITCH_CONFIG_PATH", filepath.Join(dir, "gateway.yaml"))
 	code := m.Run()
+	restoreSavedKeyStore()
 	os.RemoveAll(dir)
 	os.Exit(code)
 }

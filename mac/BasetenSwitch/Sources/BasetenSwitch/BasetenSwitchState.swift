@@ -114,6 +114,7 @@ final class BasetenSwitchState: ObservableObject {
     @Published private(set) var stats: StatsSnapshot?
     @Published private(set) var cliVersion = ""
     @Published private(set) var reauthenticating = false
+    @Published private(set) var savingAPIKey = false
     @Published private(set) var runtimeTrust: RuntimeTrust
     @Published private(set) var pendingGlobalRouting: PendingGlobalRouting?
     @Published private(set) var pendingFallbackPolicy:
@@ -137,6 +138,7 @@ final class BasetenSwitchState: ObservableObject {
 
     private let reader: any AdminStatusReading
     private let authReloader: any AuthReloading
+    private let savedAPIKeyManager: any SavedAPIKeyManaging
     private let modelCatalogReader: any ModelCatalogReading
     private let reasoningPreflightReader: any ReasoningPreflightReading
     private let cliRunner: any CLIRunning
@@ -219,6 +221,7 @@ final class BasetenSwitchState: ObservableObject {
     init(variant: AppVariant = .current(),
          reader: (any AdminStatusReading)? = nil,
          authReloader: (any AuthReloading)? = nil,
+         savedAPIKeyManager: (any SavedAPIKeyManaging)? = nil,
          modelCatalogReader: (any ModelCatalogReading)? = nil,
          reasoningPreflightReader: (any ReasoningPreflightReading)? = nil,
          cliRunner: any CLIRunning = SystemCLIRunner(),
@@ -233,6 +236,7 @@ final class BasetenSwitchState: ObservableObject {
         let apiClient = GatewayAPIClient(runtime: variant.runtime)
         self.reader = reader ?? apiClient
         self.authReloader = authReloader ?? apiClient
+        self.savedAPIKeyManager = savedAPIKeyManager ?? apiClient
         self.modelCatalogReader = modelCatalogReader ?? apiClient
         self.reasoningPreflightReader = reasoningPreflightReader ?? apiClient
         self.cliRunner = cliRunner
@@ -286,6 +290,7 @@ final class BasetenSwitchState: ObservableObject {
         let reader = GatewayAPIClient(runtime: variant.runtime)
         self.reader = reader
         authReloader = reader
+        savedAPIKeyManager = reader
         modelCatalogReader = reader
         reasoningPreflightReader = reader
         cliRunner = SystemCLIRunner()
@@ -839,6 +844,14 @@ final class BasetenSwitchState: ObservableObject {
         previousAuth: AuthStatus?,
         currentAuth: AuthStatus?
     ) {
+        if let previousAuth, let currentAuth,
+           previousAuth.savedAPIKey || currentAuth.savedAPIKey,
+           previousAuth.source != currentAuth.source
+                || previousAuth.revision != currentAuth.revision {
+            invalidateModelCatalog()
+            ensureModelCatalogLoaded()
+            return
+        }
         guard clientPageRefreshTask == nil,
               selectedProfileIsUnavailable(previousAuth),
               selectedProfileIsHealthy(currentAuth) else {
@@ -2075,6 +2088,33 @@ final class BasetenSwitchState: ObservableObject {
     }
 
     // MARK: - Supporting actions
+
+    var canManageAPIKey: Bool {
+        variant.channel == .stable && gatewayUp && !snapshotIsStale
+            && canMutate && !savingAPIKey
+            && routingSnapshot?.capabilities.contains("saved_api_key") == true
+    }
+
+    func updateSavedAPIKey(_ key: String?) async -> String? {
+        guard canManageAPIKey else { return "The gateway is unavailable for authentication changes." }
+        savingAPIKey = true
+        defer { savingAPIKey = false }
+        invalidateModelCatalog()
+        do {
+            let receipt = try await savedAPIKeyManager.updateSavedAPIKey(key)
+            await refreshAfterMutation()
+            ensureModelCatalogLoaded()
+            if receipt.savedAPIKey != (key != nil) || (key != nil && !receipt.signedIn) {
+                return "The saved key could not be loaded. Replace or remove it to continue."
+            }
+            return nil
+        } catch {
+            await refreshAfterMutation()
+            ensureModelCatalogLoaded()
+            return (error as? SavedAPIKeyMutationError)?.message
+                ?? "Could not confirm the API key change. Check the current authentication status and try again."
+        }
+    }
 
     func reauthenticate() async {
         guard !reauthenticating else { return }

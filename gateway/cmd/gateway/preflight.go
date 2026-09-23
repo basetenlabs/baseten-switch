@@ -132,7 +132,12 @@ func runPreflight(cfg *Config, resolved []resolvedClientConfig, out io.Writer) {
 	if len(names) == 0 {
 		return
 	}
-	if hasBasetenCredential(cfg.OAuthProfile, cfg.BasetenKey, cfg.APIKeyFallback) {
+	savedKey, savedErr := auth.LoadSavedAPIKey(cfg.ConfigPath)
+	if savedErr != nil {
+		fmt.Fprintln(out, "[gateway] WARNING: saved API key is unavailable; remove or replace it in Switch settings")
+		return
+	}
+	if savedKey != "" || hasBasetenCredential(cfg.OAuthProfile, cfg.BasetenKey, cfg.APIKeyFallback) {
 		return
 	}
 	warnMissingBasetenCreds(names, cfg.BasetenKey != "" && !cfg.APIKeyFallback, out)

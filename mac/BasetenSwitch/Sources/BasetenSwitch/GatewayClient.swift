@@ -5,6 +5,11 @@ enum GatewayClientError: Error, Equatable {
     case invalidPayload
 }
 
+struct SavedAPIKeyMutationError: LocalizedError, Equatable {
+    let message: String
+    var errorDescription: String? { message }
+}
+
 // MARK: - Immutable routing status
 
 struct RoutingToken: Equatable, Hashable, Sendable {
@@ -700,6 +705,9 @@ struct AuthStatus: Equatable, Sendable {
     var fallbackInUse: Bool
     var health: String
     var lastRefreshError: String
+    var source: String
+    var savedAPIKey: Bool
+    var revision: UInt64
 
     init(dict: [String: Any]) {
         signedIn = dict["signed_in"] as? Bool ?? false
@@ -709,6 +717,9 @@ struct AuthStatus: Equatable, Sendable {
         fallbackInUse = dict["fallback_in_use"] as? Bool ?? false
         health = dict["health"] as? String ?? ""
         lastRefreshError = dict["last_refresh_error"] as? String ?? ""
+        source = dict["source"] as? String ?? ""
+        savedAPIKey = dict["saved_api_key"] as? Bool ?? false
+        revision = (dict["revision"] as? NSNumber)?.uint64Value ?? 0
     }
 }
 
@@ -763,6 +774,10 @@ protocol AuthReloading: Sendable {
     func reloadAuth() async throws -> AuthStatus
 }
 
+protocol SavedAPIKeyManaging: Sendable {
+    func updateSavedAPIKey(_ key: String?) async throws -> AuthStatus
+}
+
 protocol ModelCatalogReading: Sendable {
     func fetchModelCatalog() async throws -> LiveModelCatalogSnapshot
 }
@@ -776,21 +791,23 @@ protocol ReasoningPreflightReading: Sendable {
     ) async throws -> ReasoningPreflightSnapshot
 }
 
-final class GatewayAPIClient: AdminStatusReading, AuthReloading,
+final class GatewayAPIClient: AdminStatusReading, AuthReloading, SavedAPIKeyManaging,
                               ModelCatalogReading,
                               ReasoningPreflightReading,
                               @unchecked Sendable {
     private static let adminRequestTimeout: TimeInterval = 2
     private static let modelCatalogRequestTimeout: TimeInterval = 4
+    private static let savedAPIKeyRequestTimeout: TimeInterval = 30
     private let runtime: RuntimeProfile
     private let session: URLSession
+    private let savedAPIKeySession: URLSession
 
     init(runtime: RuntimeProfile, session: URLSession? = nil) {
         self.runtime = runtime
+        let configuration = session?.configuration ?? URLSessionConfiguration.ephemeral
         if let session {
             self.session = session
         } else {
-            let configuration = URLSessionConfiguration.ephemeral
             configuration.timeoutIntervalForRequest = 2
             configuration.timeoutIntervalForResource = 5
             configuration.waitsForConnectivity = false
@@ -798,6 +815,9 @@ final class GatewayAPIClient: AdminStatusReading, AuthReloading,
             configuration.urlCache = nil
             self.session = URLSession(configuration: configuration)
         }
+        configuration.timeoutIntervalForRequest = Self.savedAPIKeyRequestTimeout
+        configuration.timeoutIntervalForResource = Self.savedAPIKeyRequestTimeout
+        savedAPIKeySession = URLSession(configuration: configuration)
     }
 
     func fetchStatus() async throws -> AdminStatusSnapshot {
@@ -823,6 +843,35 @@ final class GatewayAPIClient: AdminStatusReading, AuthReloading,
     func reloadAuth() async throws -> AuthStatus {
         let object = try await postEmptyJSON("v1/admin/auth/reload")
         guard let dict = object as? [String: Any] else {
+            throw GatewayClientError.invalidPayload
+        }
+        return AuthStatus(dict: dict)
+    }
+
+    func updateSavedAPIKey(_ key: String?) async throws -> AuthStatus {
+        var request = URLRequest(url: adminBaseURL(runtime: runtime)
+            .appendingPathComponent("v1/admin/auth/api-key"))
+        request.timeoutInterval = Self.savedAPIKeyRequestTimeout
+        request.httpMethod = key == nil ? "DELETE" : "PUT"
+        request.setValue("1", forHTTPHeaderField: "X-Baseten-Switch-Admin")
+        if let key {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: ["api_key": key])
+        }
+        let (data, response) = try await savedAPIKeySession.data(for: request)
+        guard let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode) else {
+            if let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let message = body["error"] as? String,
+               !message.isEmpty, message.count <= 512,
+               message.rangeOfCharacter(from: .controlCharacters) == nil,
+               key.map({ !message.contains($0) }) ?? true {
+                throw SavedAPIKeyMutationError(message: message)
+            }
+            throw GatewayClientError.badResponse(
+                (response as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+        guard let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw GatewayClientError.invalidPayload
         }
         return AuthStatus(dict: dict)

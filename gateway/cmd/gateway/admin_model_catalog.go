@@ -16,6 +16,7 @@ import (
 
 	"github.com/basetenlabs/baseten-switch/gateway/internal/modelmeta"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/pricing"
+	"github.com/basetenlabs/baseten-switch/gateway/internal/proxy"
 )
 
 const (
@@ -71,7 +72,7 @@ func (g *Gateway) adminModelCatalog(w http.ResponseWriter, r *http.Request) {
 	}
 	contextLimits := modelContextLimitsFromSnapshot(g.pricing.Capture())
 
-	// The live catalog belongs to the selected Baseten CLI profile. The
+	// The live catalog belongs to the saved key or selected CLI profile. The
 	// environment fallback is intentionally excluded from this account view.
 	selected, ok := g.basetenProfileAuth()
 	if !ok {
@@ -90,7 +91,7 @@ func (g *Gateway) adminModelCatalog(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, errModelCatalogUnauthorized) {
 			reason := modelCatalogSignedOutReasonSessionExpired
-			if selected.source == basetenAuthProfileAPIKey {
+			if selected.mode == proxy.UpstreamModeAPIKey {
 				reason = modelCatalogSignedOutReasonRejected
 			}
 			writeModelCatalogJSON(w, r.Method, modelCatalogResponse{

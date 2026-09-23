@@ -39,12 +39,14 @@ var printLoginIdentity = func() int { return cmdWhoami(nil) }
 
 func cmdAuth(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: baseten-switch auth login")
+		fmt.Fprintln(os.Stderr, "usage: baseten-switch auth login | api-key set | api-key remove")
 		return 2
 	}
 	switch args[0] {
 	case "login":
 		return cmdAuthLogin(args[1:])
+	case "api-key":
+		return cmdAuthAPIKey(args[1:], os.Stdin, os.Stdout, os.Stderr)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown auth subcommand: %s\n", args[0])
 		return 2

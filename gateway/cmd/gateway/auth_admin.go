@@ -26,6 +26,62 @@ func (g *Gateway) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, g.authStatusResponse())
 }
 
+func (g *Gateway) handleSavedAPIKey(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodPut && r.Method != http.MethodDelete {
+		g.reject(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if r.Header.Get(adminMutationHeader) != adminMutationHeaderValue {
+		g.reject(w, http.StatusForbidden, "admin mutation header required")
+		return
+	}
+	var key string
+	if r.Method == http.MethodPut {
+		var body struct {
+			APIKey string `json:"api_key"`
+		}
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&body); err != nil {
+			g.reject(w, http.StatusBadRequest, "invalid API key request")
+			return
+		}
+		if err := dec.Decode(&struct{}{}); err != io.EOF {
+			g.reject(w, http.StatusBadRequest, "invalid API key request")
+			return
+		}
+		var err error
+		key, err = auth.ValidateSavedAPIKey(body.APIKey)
+		if err != nil {
+			g.reject(w, http.StatusBadRequest, "enter a nonempty API key without spaces or control characters")
+			return
+		}
+	} else if r.Body != nil {
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1))
+		if err != nil || len(body) != 0 {
+			g.reject(w, http.StatusBadRequest, "request body must be empty")
+			return
+		}
+	}
+	g.reloadMu.Lock()
+	defer g.reloadMu.Unlock()
+	var err error
+	if r.Method == http.MethodPut {
+		err = auth.SaveSavedAPIKey(g.activeConfigPath(), key)
+	} else {
+		err = auth.RemoveSavedAPIKey(g.activeConfigPath())
+	}
+	// A credential write can succeed before readback or legacy-file cleanup
+	// fails. Reconcile the actual store even when the mutation reports an error.
+	g.refreshAuthLocked()
+	if err != nil {
+		g.reject(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, g.localAuthStatusResponse())
+}
+
 func (g *Gateway) handleAuthReload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		g.reject(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -86,17 +142,35 @@ func (g *Gateway) localAuthStatusResponse() map[string]any {
 	signedIn, authType, fallbackInUse := g.authState()
 	ah := g.authHealth()
 	cfg := g.runtimeConfig()
+	saved, _ := g.savedAPIKeyState()
+	profile := cfg.OAuthProfile
+	if saved {
+		profile = ""
+	}
 	return map[string]any{
 		"signed_in":        signedIn,
 		"auth_type":        authType,
 		"health":           ah.Health,
-		"profile":          cfg.OAuthProfile,
+		"profile":          profile,
+		"source":           g.authSource(),
+		"saved_api_key":    saved,
+		"revision":         g.credentialRevision(),
 		"fallback_enabled": cfg.APIKeyFallback,
 		"fallback_in_use":  fallbackInUse,
 	}
 }
 
+// credentialRevision is an in-process counter, not a credential fingerprint.
+func (g *Gateway) credentialRevision() uint64 {
+	g.authMu.Lock()
+	defer g.authMu.Unlock()
+	return g.authRevision
+}
+
 func (g *Gateway) authEmailAndExpiry() (string, string) {
+	if saved, _ := g.savedAPIKeyState(); saved {
+		return "", ""
+	}
 	cfg := g.runtimeConfig()
 	expiresAt := ""
 	if tok, _, _ := auth.Load(cfg.OAuthProfile); tok != nil {

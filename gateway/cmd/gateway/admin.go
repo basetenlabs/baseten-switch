@@ -56,6 +56,7 @@ func (g *Gateway) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/admin/requests", g.adminRequests)
 	mux.HandleFunc("/v1/admin/auth/reload", g.handleAuthReload)
 	mux.HandleFunc("/v1/admin/auth/status", g.handleAuthStatus)
+	mux.HandleFunc("/v1/admin/auth/api-key", g.handleSavedAPIKey)
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -883,7 +884,7 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 		reloadState = "pending"
 	}
 	globalEnabled := false
-	capabilities := []string{"global_routing", "fallback_policy"}
+	capabilities := []string{"global_routing", "fallback_policy", "saved_api_key"}
 	fallbackPolicy := config.ResolveFallbackPolicy(nil)
 	if state.file != nil {
 		if state.file.Global.RoutingEnabled != nil {
@@ -893,6 +894,11 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	signedIn, authType, fallbackInUse := g.authState()
 	ah := g.authHealth()
+	savedKey, _ := g.savedAPIKeyState()
+	authProfile := runtimeCfg.OAuthProfile
+	if savedKey {
+		authProfile = ""
+	}
 	authUnavailableFallback := g.authUnavailableFallbackStatus()
 	writeJSON(w, 200, map[string]any{
 		"router_pid":          os.Getpid(),
@@ -927,7 +933,10 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 			"last_refresh_error":    ah.LastError,
 			"last_refresh_error_at": rfc3339OrEmpty(ah.LastErrorAt),
 			"last_refresh_ok_at":    rfc3339OrEmpty(ah.LastOKAt),
-			"profile":               runtimeCfg.OAuthProfile,
+			"profile":               authProfile,
+			"source":                g.authSource(),
+			"saved_api_key":         savedKey,
+			"revision":              g.credentialRevision(),
 			"fallback_enabled":      runtimeCfg.APIKeyFallback,
 			"fallback_in_use":       fallbackInUse,
 		},
