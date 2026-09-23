@@ -168,10 +168,15 @@ func (g *Gateway) credentialRevision() uint64 {
 }
 
 func (g *Gateway) authEmailAndExpiry() (string, string) {
-	if saved, _ := g.savedAPIKeyState(); saved {
+	cfg := g.runtimeConfig()
+	g.authMu.Lock()
+	client := g.oauthClient
+	gen := g.authGen
+	saved := g.savedAPIKey != "" || g.savedAPIKeyErr != nil
+	g.authMu.Unlock()
+	if saved || client == nil {
 		return "", ""
 	}
-	cfg := g.runtimeConfig()
 	expiresAt := ""
 	if tok, _, _ := auth.Load(cfg.OAuthProfile); tok != nil {
 		if exp, ok := jwtExpiry(tok.AccessToken); ok {
@@ -179,15 +184,15 @@ func (g *Gateway) authEmailAndExpiry() (string, string) {
 		}
 	}
 	g.authMu.Lock()
-	client := g.oauthClient
-	g.authMu.Unlock()
-	if client == nil {
-		return "", expiresAt
+	if gen != g.authGen {
+		g.authMu.Unlock()
+		return "", ""
 	}
 	g.emailMu.Lock()
 	cached := g.emailCached
 	fetchedAt := g.emailFetchedAt
 	g.emailMu.Unlock()
+	g.authMu.Unlock()
 	if cached != "" && time.Since(fetchedAt) < 60*time.Second {
 		return cached, expiresAt
 	}
@@ -207,6 +212,13 @@ func (g *Gateway) authEmailAndExpiry() (string, string) {
 				email = wa.Email
 			}
 		}
+	}
+	// A request started under an older credential must not repopulate the
+	// identity cache after a reload cleared it for the current account.
+	g.authMu.Lock()
+	defer g.authMu.Unlock()
+	if gen != g.authGen {
+		return "", ""
 	}
 	g.emailMu.Lock()
 	g.emailCached = email

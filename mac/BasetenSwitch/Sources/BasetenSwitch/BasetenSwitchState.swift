@@ -370,6 +370,9 @@ final class BasetenSwitchState: ObservableObject {
         switch event {
         case .snapshot(let snapshot):
             let previousAuth = routingSnapshot?.auth
+            let routerRestarted = routingSnapshot.map {
+                $0.token.routerBootID != snapshot.token.routerBootID
+            } ?? false
             let meaningfulChange = routingSnapshot.map {
                 !routingPresentationEqual($0, snapshot)
             } ?? true
@@ -389,7 +392,8 @@ final class BasetenSwitchState: ObservableObject {
             beginAutomaticMutationRecoveryIfNeeded(snapshot)
             requestAutomaticModelCatalogRecoveryIfNeeded(
                 previousAuth: previousAuth,
-                currentAuth: snapshot.auth)
+                currentAuth: snapshot.auth,
+                routerRestarted: routerRestarted)
         case .unavailable:
             if !snapshotIsStale {
                 snapshotIsStale = true
@@ -842,11 +846,12 @@ final class BasetenSwitchState: ObservableObject {
 
     private func requestAutomaticModelCatalogRecoveryIfNeeded(
         previousAuth: AuthStatus?,
-        currentAuth: AuthStatus?
+        currentAuth: AuthStatus?,
+        routerRestarted: Bool
     ) {
         if let previousAuth, let currentAuth,
            previousAuth.savedAPIKey || currentAuth.savedAPIKey,
-           previousAuth.source != currentAuth.source
+           routerRestarted || previousAuth.source != currentAuth.source
                 || previousAuth.revision != currentAuth.revision {
             invalidateModelCatalog()
             ensureModelCatalogLoaded()

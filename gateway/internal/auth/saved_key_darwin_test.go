@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -64,6 +65,45 @@ func TestNativeSavedAPIKeyKeychain(t *testing.T) {
 	if key, err := store.Load(path + "-other"); key != "" || err != nil {
 		t.Fatal("native Keychain entries crossed config boundaries")
 	}
+	for _, test := range []struct {
+		name string
+		key  string
+	}{
+		{"punctuation", "synthetic-'\"`$();&|<>\\{}[]!?#%:+/=~"},
+		{"UTF-8", "synthetic-café-e\u0301-東京"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := store.Save(path, test.key); err != nil {
+				t.Fatalf("native save failed: %v", err)
+			}
+			if key, err := reopened.Load(path); err != nil || key != test.key {
+				t.Fatal("native Keychain changed the saved key's bytes")
+			}
+		})
+	}
+	t.Run("command-size-boundary", func(t *testing.T) {
+		// security -i accepts at most 4095 command bytes. The test Keychain's
+		// explicit path consumes space that the production default path does not.
+		framing := "add-generic-password -U -s " + savedAPIKeyService + " -a " + savedAPIKeyAccount(path) + " -w " + savedAPIKeyEncoding + " " + strconv.Quote(keychainPath) + "\n"
+		maxKeyBytes := (4095 - len(framing)) / 4 * 3
+		if maxKeyBytes <= 0 || maxKeyBytes >= maxSavedAPIKeySize {
+			t.Fatal("unexpected native command framing size")
+		}
+		boundaryKey := strings.Repeat("x", maxKeyBytes)
+		if err := store.Save(path, boundaryKey); err != nil {
+			t.Fatalf("largest fitting key was rejected: %v", err)
+		}
+		if key, err := reopened.Load(path); err != nil || key != boundaryKey {
+			t.Fatal("largest fitting key did not round-trip")
+		}
+		if err := store.Save(path, boundaryKey+"x"); !errors.Is(err, errSavedAPIKeyTooLong) {
+			t.Fatal("first oversized key did not return the storage limit error")
+		}
+		if key, err := reopened.Load(path); err != nil || key != boundaryKey {
+			t.Fatal("rejected oversized save changed the prior key")
+		}
+		t.Logf("native command boundary passed at %d key bytes; next byte rejected without changing the item", maxKeyBytes)
+	})
 	if err := store.Save(path, "synthetic-native-two"); err != nil {
 		t.Fatal(err)
 	}

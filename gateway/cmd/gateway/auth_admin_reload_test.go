@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -385,6 +386,76 @@ func TestAdminAuthReloadClearsCachedIdentityOnCredentialReplacement(t *testing.T
 	}
 	if whoamiRequests != 2 {
 		t.Fatalf("replacement whoami requests = %d, want 2", whoamiRequests)
+	}
+}
+
+func TestAdminAuthStatusDiscardsIdentityAfterSavedKeyTransition(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/users/me" {
+			t.Errorf("unexpected identity path: %s", r.URL.Path)
+		}
+		switch r.Header.Get("Authorization") {
+		case "Bearer synthetic-access-a":
+			close(started)
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+			_, _ = io.WriteString(w, `{"email":"account-a@example.invalid"}`)
+		case "Bearer synthetic-access-b":
+			_, _ = io.WriteString(w, `{"email":"account-b@example.invalid"}`)
+		default:
+			t.Error("unexpected identity credential")
+		}
+	}))
+	defer upstream.Close()
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	cfg := testConfig(t, upstream.URL, upstream.URL)
+	cfg.ConfigPath = filepath.Join(t.TempDir(), "gateway.yaml")
+	cfg.OAuthProfile = "p"
+	cfg.OAuthHost = upstream.URL
+	writeOAuthProfileWithAccessToken(t, upstream.URL, "synthetic-access-a", "synthetic-refresh-a")
+	g := newAuthReloadTestGateway(t, cfg)
+	oldStatus := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response := httptest.NewRecorder()
+		g.handleAuthStatus(response, httptest.NewRequest(http.MethodGet, "/v1/admin/auth/status", nil))
+		oldStatus <- response
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("old identity request did not start")
+	}
+	if response := savedKeyRequest(g, http.MethodPut, `{"api_key":"synthetic-saved-key"}`, "1"); response.Code != http.StatusOK {
+		t.Fatalf("save status = %d", response.Code)
+	}
+	writeOAuthProfileWithAccessToken(t, upstream.URL, "synthetic-access-b", "synthetic-refresh-b")
+	if response := savedKeyRequest(g, http.MethodDelete, "", "1"); response.Code != http.StatusOK {
+		t.Fatalf("remove status = %d", response.Code)
+	}
+	close(release)
+	select {
+	case response := <-oldStatus:
+		if email := decodeAuthAdminResponse(t, response)["email"]; email != "" {
+			t.Errorf("superseded identity response returned email %q", email)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("old identity request did not finish")
+	}
+	response := httptest.NewRecorder()
+	g.handleAuthStatus(response, httptest.NewRequest(http.MethodGet, "/v1/admin/auth/status", nil))
+	if email := decodeAuthAdminResponse(t, response)["email"]; email != "account-b@example.invalid" {
+		t.Fatalf("current identity = %q, want account B", email)
 	}
 }
 

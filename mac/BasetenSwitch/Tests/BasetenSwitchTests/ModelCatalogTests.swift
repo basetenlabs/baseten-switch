@@ -1137,6 +1137,38 @@ final class ModelCatalogTests: XCTestCase {
     }
 
     @MainActor
+    func testSavedKeyCatalogRefreshesAfterRouterRestartWithSameAuthRevision() async {
+        func status(bootID: String) -> AdminStatusSnapshot {
+            var snapshot = adminSnapshot(signedIn: true, health: "ok")
+            snapshot.token = RoutingToken(routerBootID: bootID, activeGeneration: 1)
+            snapshot.auth = AuthStatus(dict: [
+                "signed_in": true, "health": "ok", "saved_api_key": true,
+                "source": "saved_api_key", "revision": 1,
+            ])
+            return snapshot
+        }
+        let old = catalogSnapshot(state: .ready, models: [liveModel("vendor/old")])
+        let new = catalogSnapshot(state: .ready, models: [liveModel("vendor/new")])
+        let workflow = RecordingAuthWorkflow(
+            statuses: [status(bootID: "boot-a"), status(bootID: "boot-b"), status(bootID: "boot-b")],
+            catalogs: [old, new])
+        let state = makeState(adminReader: workflow, authReloader: workflow, modelCatalogReader: workflow)
+
+        await state.refresh()
+        state.requestModelCatalogRefresh()
+        await state.waitForModelCatalogRefresh()
+        XCTAssertEqual(state.liveModelCatalogState, .ready(old.models))
+
+        await state.refresh()
+        await state.waitForModelCatalogRefresh()
+        XCTAssertEqual(state.liveModelCatalogState, .ready(new.models))
+
+        await state.refresh()
+        let events = await workflow.events
+        XCTAssertEqual(events, ["status", "catalog", "status", "catalog", "status"])
+    }
+
+    @MainActor
     func testSavedKeyReplacementRefreshesHealthyAccountCatalog() async {
         func status(_ revision: Int) -> AdminStatusSnapshot {
             var snapshot = adminSnapshot(signedIn: true, health: "ok")

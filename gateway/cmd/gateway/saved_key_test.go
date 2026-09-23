@@ -197,3 +197,71 @@ func TestSavedAPIKeyMalformedStoreBlocksOtherCredentials(t *testing.T) {
 		t.Fatal("removed key survived malformed CLI store")
 	}
 }
+
+func TestUnreadableSavedAPIKeyPreservesConfiguredNativeFallback(t *testing.T) {
+	for _, fallbackEnabled := range []bool{false, true} {
+		name := "without native fallback"
+		if fallbackEnabled {
+			name = "with native fallback"
+		}
+		t.Run(name, func(t *testing.T) {
+			var basetenHits, nativeHits atomic.Int32
+			baseten := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				basetenHits.Add(1)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer baseten.Close()
+			const body = `{"model":"claude-opus-4-8","messages":[{"role":"user","content":"ping"}]}`
+			native := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				nativeHits.Add(1)
+				if r.URL.Path != "/v1/messages" || r.Header.Get("Authorization") != "Bearer synthetic-native-token" || r.Header.Get("X-Api-Key") != "synthetic-native-key" {
+					t.Error("native fallback did not preserve the harness credentials and endpoint")
+				}
+				gotBody, _ := io.ReadAll(r.Body)
+				if string(gotBody) != body {
+					t.Error("native fallback did not preserve the ingress request")
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"msg_native","type":"message","role":"assistant","content":[],"model":"claude-opus-4-8","usage":{"input_tokens":1,"output_tokens":1}}`)
+			}))
+			defer native.Close()
+			cfg := testConfig(t, baseten.URL, native.URL)
+			cfg.ConfigPath = filepath.Join(t.TempDir(), "gateway.yaml")
+			cfg.OAuthProfile = "p"
+			cfg.BasetenKey = "synthetic-env-key"
+			cfg.APIKeyFallback = true
+			writeAPIKeyProfile(t, "synthetic-cli-key")
+			if err := os.WriteFile(cfg.ConfigPath+".api-key", []byte("invalid key"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			rc := resolvedAnthropicBaseten(t)
+			if fallbackEnabled {
+				rc.FallbackRoute = "anthropic"
+			}
+			g, admin, _ := newGateway(t, cfg, rc)
+			defer admin.Close()
+			stop := start(t, g)
+			defer stop()
+			req, _ := http.NewRequest(http.MethodPost, clientURL(g, rc.Name, "/v1/messages"), strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer synthetic-native-token")
+			req.Header.Set("X-Api-Key", "synthetic-native-key")
+			response, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			_, _ = io.Copy(io.Discard, response.Body)
+			if basetenHits.Load() != 0 || g.authSource() != "saved_api_key" || g.authHealth().Health != "error" {
+				t.Fatal("unreadable saved key did not block CLI and environment credentials")
+			}
+			if fallbackEnabled {
+				if response.StatusCode != http.StatusOK || nativeHits.Load() != 1 || response.Header.Get(authUnavailableFallbackHeader) != fallbackTriggerAuthUnavailable {
+					t.Fatalf("native fallback status=%d hits=%d marker=%q", response.StatusCode, nativeHits.Load(), response.Header.Get(authUnavailableFallbackHeader))
+				}
+			} else if response.StatusCode != http.StatusServiceUnavailable || nativeHits.Load() != 0 {
+				t.Fatalf("unconfigured native fallback status=%d hits=%d", response.StatusCode, nativeHits.Load())
+			}
+		})
+	}
+}
