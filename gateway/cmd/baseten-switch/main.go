@@ -266,6 +266,7 @@ the per-client native target used for Baseten-specific model identities.
 Check for baseten CLI v0.3.0 or newer, verify the current credential and run
 "baseten auth login" interactively when needed, then create the default
 gateway config if it does not exist. Existing config is never overwritten.
+A saved Switch API key skips the Baseten CLI prerequisite and login.
 
 setup does not start daemons or change any coding harness configuration.
 `},
@@ -307,17 +308,27 @@ Package options:
 	{"whoami", "Show the signed-in Baseten identity and token expiry", `Usage: baseten-switch whoami [--profile NAME] [--host URL] [--refresh]
 
 Print the signed-in email, workspace, token expiry, and profile. Authentication
-comes from the credential store written by "baseten auth login".
+uses a saved Switch API key first, then the credential store written by
+"baseten auth login". A saved key reports its source without an identity lookup.
 
   --profile NAME  Select a credential profile
   --host URL      Override the Baseten API host
   --refresh       Force a token refresh before the identity lookup
 `},
-	{"auth", "Re-authenticate with the Baseten CLI", `Usage: baseten-switch auth login
+	{"auth", "Manage the saved API key or sign in with the Baseten CLI", `Usage: baseten-switch auth login
+       baseten-switch auth api-key set < key-file
+       baseten-switch auth api-key remove
 
 Run "baseten auth login" interactively, SIGHUP the running router so it picks
-up the fresh credential, then print the identity. baseten-switch does not write the
-credential store itself.
+up the fresh credential, then print the identity. Switch does not write the
+Baseten CLI credential store.
+
+api-key set reads one API key from stdin and saves it in macOS Keychain, or an
+owner-only file beside the selected gateway config on other platforms.
+The saved key takes priority over Baseten CLI
+authentication. It is never printed or stored in gateway.yaml. api-key remove
+restores CLI authentication when available. Both reload a running router with
+SIGHUP. Login keeps any saved Switch API key in place.
 `},
 	{"doctor", "Diagnose the full request chain and suggest a concrete fix", `Usage: baseten-switch doctor [--json] [--probe] [--verbose] [--fix] [--yes] [--timeout SEC]
 

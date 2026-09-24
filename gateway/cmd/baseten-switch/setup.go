@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/basetenlabs/baseten-switch/gateway/internal/auth"
-	"github.com/basetenlabs/baseten-switch/gateway/internal/config"
 )
 
 const minimumBasetenCLIVersion = "0.3.0"
@@ -34,7 +33,8 @@ func defaultSetupDependencies() setupDependencies {
 		loadCredential: loadCurrentSetupCredential,
 		login:          runBasetenLogin,
 		configPath: func() string {
-			return envDefault("BASETEN_SWITCH_CONFIG_PATH", config.DefaultPath())
+			path, _ := resolveConfigPath()
+			return path
 		},
 		stat:       os.Stat,
 		initConfig: runConfigInit,
@@ -50,41 +50,18 @@ func cmdSetup(args []string) int {
 }
 
 func runSetup(deps setupDependencies, out, errOut io.Writer) int {
-	bin, err := deps.findBaseten()
-	if err != nil {
-		fmt.Fprintf(errOut, "setup: no 'baseten' CLI on PATH. Install it with '%s'.\n", basetenBrewHint)
-		return 1
-	}
-
-	versionOutput := strings.TrimSpace(deps.basetenVersion(bin))
-	version, err := parseSemanticVersion(versionOutput)
-	if err != nil {
-		fmt.Fprintf(errOut, "setup: could not determine a semantic version from '%s --version' output %q; baseten CLI v%s or newer is required.\n", bin, versionOutput, minimumBasetenCLIVersion)
-		return 1
-	}
-	minimum, _ := parseSemanticVersion(minimumBasetenCLIVersion)
-	if version.less(minimum) {
-		fmt.Fprintf(errOut, "setup: baseten CLI v%s is too old; v%s or newer is required. Upgrade it with 'brew upgrade basetenlabs/baseten/baseten'.\n", version, minimum)
-		return 1
-	}
-	fmt.Fprintf(out, "Baseten CLI: %s (v%s)\n", bin, version)
-
-	credential, err := deps.loadCredential()
-	if err != nil {
-		fmt.Fprintf(out, "Baseten credential: unavailable (%v); starting 'baseten auth login'.\n", err)
-		if err := deps.login(bin); err != nil {
-			fmt.Fprintf(errOut, "setup: baseten auth login failed: %v\n", err)
-			return 1
-		}
-		credential, err = deps.loadCredential()
-		if err != nil {
-			fmt.Fprintf(errOut, "setup: baseten auth login completed, but the current credential is still unavailable: %v\n", err)
-			return 1
-		}
-	}
-	fmt.Fprintf(out, "Baseten credential: %s\n", credential)
-
 	path := deps.configPath()
+	key, err := auth.LoadSavedAPIKey(path)
+	if err != nil {
+		fmt.Fprintf(errOut, "setup: %v\n", err)
+		return 1
+	}
+	if key != "" {
+		fmt.Fprintln(out, "Baseten credential: saved Switch API key is available")
+	} else if !setupCLICredential(deps, out, errOut) {
+		return 1
+	}
+
 	if _, err := deps.stat(path); err == nil {
 		fmt.Fprintf(out, "Gateway config: using existing %s\n", path)
 	} else if !os.IsNotExist(err) {
@@ -103,6 +80,44 @@ func runSetup(deps setupDependencies, out, errOut io.Writer) int {
 	fmt.Fprintln(out, "baseten-switch claude on")
 	fmt.Fprintln(out, "baseten-switch doctor --probe")
 	return 0
+}
+
+func setupCLICredential(deps setupDependencies, out, errOut io.Writer) bool {
+	bin, err := deps.findBaseten()
+	if err != nil {
+		fmt.Fprintf(errOut, "setup: no 'baseten' CLI on PATH. Install it with '%s'.\n", basetenBrewHint)
+		return false
+	}
+
+	versionOutput := strings.TrimSpace(deps.basetenVersion(bin))
+	version, err := parseSemanticVersion(versionOutput)
+	if err != nil {
+		fmt.Fprintf(errOut, "setup: could not determine a semantic version from '%s --version' output %q; baseten CLI v%s or newer is required.\n", bin, versionOutput, minimumBasetenCLIVersion)
+		return false
+	}
+	minimum, _ := parseSemanticVersion(minimumBasetenCLIVersion)
+	if version.less(minimum) {
+		fmt.Fprintf(errOut, "setup: baseten CLI v%s is too old; v%s or newer is required. Upgrade it with 'brew upgrade basetenlabs/baseten/baseten'.\n", version, minimum)
+		return false
+	}
+	fmt.Fprintf(out, "Baseten CLI: %s (v%s)\n", bin, version)
+
+	credential, err := deps.loadCredential()
+	if err != nil {
+		fmt.Fprintf(out, "Baseten credential: unavailable (%v); starting 'baseten auth login'.\n", err)
+		if err := deps.login(bin); err != nil {
+			fmt.Fprintf(errOut, "setup: baseten auth login failed: %v\n", err)
+			return false
+		}
+		credential, err = deps.loadCredential()
+		if err != nil {
+			fmt.Fprintf(errOut, "setup: baseten auth login completed, but the current credential is still unavailable: %v\n", err)
+			return false
+		}
+	}
+	fmt.Fprintf(out, "Baseten credential: %s\n", credential)
+
+	return true
 }
 
 func loadCurrentSetupCredential() (string, error) {

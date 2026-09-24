@@ -201,7 +201,7 @@ func TestGlobalRoutingStatusUsesActiveResolverAndExactByteHashes(t *testing.T) {
 		t.Fatalf("hashes active=%v desired=%v", status["active_config_hash"], status["desired_config_hash"])
 	}
 	caps := status["capabilities"].([]any)
-	if len(caps) != 2 || caps[0] != "global_routing" || caps[1] != "fallback_policy" {
+	if len(caps) != 3 || caps[0] != "global_routing" || caps[1] != "fallback_policy" || caps[2] != "saved_api_key" {
 		t.Fatalf("capabilities = %v", caps)
 	}
 	client := status["clients"].([]any)[0].(map[string]any)

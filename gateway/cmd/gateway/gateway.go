@@ -555,6 +555,9 @@ type Gateway struct {
 	// profile. It is profile auth, not the separately enabled environment
 	// fallback. Guarded by authMu.
 	cliProfileAPIKey string
+	savedAPIKey      string
+	savedAPIKeyErr   error
+	authRevision     uint64
 	// Credential-health state (all guarded by authMu). signed_in has
 	// always meant "a credential exists in the store"; these fields
 	// track whether that credential actually WORKS, fed by
@@ -576,7 +579,7 @@ type Gateway struct {
 	// later death must be recorded against the token that actually died.
 	authCredFP string
 	authDeadFP string // authCredFP at the moment the credential went dead
-	// authStoreFP fingerprints the selected CLI credential and its auth type.
+	// authStoreFP fingerprints the selected credential and its auth type.
 	// It is compared in memory to detect profile switches, key rotation, login,
 	// logout, and OAuth/API-key transitions without retaining another secret.
 	authStoreFP string
@@ -871,7 +874,7 @@ func (g *Gateway) refreshAuth() {
 	g.refreshAuthLocked()
 }
 
-// refreshAuthLocked reloads the selected CLI credential while reloadMu is
+// refreshAuthLocked reloads the selected credential while reloadMu is
 // held. Config reload and explicit auth reload both use this path so an auth
 // client built for an old profile cannot publish after a newer runtime config.
 // Credential-store and Keychain reads happen outside authMu, keeping status
@@ -881,11 +884,19 @@ func (g *Gateway) refreshAuthLocked() {
 	cfg := g.runtimeConfig()
 	g.authMu.Lock()
 	previousGen := g.authGen
+	previousSaved := g.savedAPIKey != "" || g.savedAPIKeyErr != nil
 	gen := previousGen + 1
 	g.authMu.Unlock()
 
 	notify := func(fp string, err error) { g.noteAuthRefresh(gen, fp, err) }
-	client, tick, credFP, err := auth.HTTPClientWithNotifyDetailed(context.Background(), cfg.OAuthProfile, cfg.OAuthHost, notify)
+	savedKey, savedErr := auth.LoadSavedAPIKey(cfg.ConfigPath)
+	var client *http.Client
+	var tick func() error
+	var credFP string
+	var err error
+	if savedKey == "" && savedErr == nil {
+		client, tick, credFP, err = auth.HTTPClientWithNotifyDetailed(context.Background(), cfg.OAuthProfile, cfg.OAuthHost, notify)
+	}
 	storeFailure := ""
 	switch {
 	case errors.Is(err, auth.ErrStoreUnreadable):
@@ -893,7 +904,7 @@ func (g *Gateway) refreshAuthLocked() {
 	case errors.Is(err, auth.ErrStoreMalformed):
 		storeFailure = "malformed"
 	}
-	if storeFailure != "" {
+	if storeFailure != "" && !previousSaved {
 		fmt.Fprintf(os.Stderr, "[gateway] auth: credential store %s; preserving current auth: %v\n", storeFailure, err)
 		return
 	}
@@ -910,8 +921,15 @@ func (g *Gateway) refreshAuthLocked() {
 	g.authGen = gen
 	previousStoreFP := g.authStoreFP
 	g.cliProfileAPIKey = ""
+	g.savedAPIKey = savedKey
+	g.savedAPIKeyErr = savedErr
 	g.authStoreFP = ""
 	switch {
+	case savedKey != "" || savedErr != nil:
+		g.oauthClient = nil
+		g.authTick = nil
+		g.oauthProfileErr = nil
+		g.authStoreFP = savedCredentialFingerprint(savedKey, savedErr)
 	case err == nil:
 		g.oauthClient = client
 		g.authTick = tick
@@ -940,6 +958,7 @@ func (g *Gateway) refreshAuthLocked() {
 	}
 	credentialChanged := previousStoreFP != g.authStoreFP
 	if credentialChanged {
+		g.authRevision++
 		// Health belongs to one credential identity. Login, logout, profile
 		// replacement, and auth-type transitions must not inherit a prior
 		// OAuth failure or success timestamp.
@@ -975,7 +994,7 @@ func (g *Gateway) refreshAuthLocked() {
 		g.authLastErrAt = time.Time{}
 	}
 	fmt.Fprintf(os.Stderr, "[gateway] auth: profile=%s signed_in=%t health=%s fallback=%t\n",
-		cfg.OAuthProfile, g.oauthClient != nil || g.cliProfileAPIKey != "", g.authHealthLocked(), cfg.APIKeyFallback)
+		cfg.OAuthProfile, g.oauthClient != nil || g.cliProfileAPIKey != "" || g.savedAPIKey != "", g.authHealthLocked(), cfg.APIKeyFallback)
 	g.kickCatalogRefresh()
 }
 
@@ -1036,7 +1055,7 @@ func (g *Gateway) noteAuthRefresh(gen int, fp string, err error) {
 }
 
 // Background auth-tick cadences. Package vars so tests can shrink them.
-// Every tick first reads the local CLI store so direct profile changes
+// Every tick first reads the saved key and CLI store so credential changes
 // converge within 30 seconds. Healthy OAuth then rides oauth2.ReuseTokenSource,
 // so real refresh traffic remains bounded by the access-token lifetime.
 var (
@@ -1100,9 +1119,9 @@ func (g *Gateway) authTickOnce() {
 	storeFP := g.authStoreFP
 	g.authMu.Unlock()
 
-	observedFP := selectedCredentialStoreFingerprint(profile)
+	observedFP := selectedCredentialStoreFingerprint(cfg.ConfigPath, profile)
 	if observedFP != storeFP {
-		fmt.Fprintf(os.Stderr, "[gateway] auth: selected CLI credential changed; reloading credential (no SIGHUP needed)\n")
+		fmt.Fprintf(os.Stderr, "[gateway] auth: selected credential changed; reloading credential (no SIGHUP needed)\n")
 		g.refreshAuth()
 		return
 	}
@@ -1135,9 +1154,13 @@ func apiKeyStoreFingerprint(profile, apiKey string) string {
 	return "api_key:" + auth.CredFingerprint(profile+"\x00"+apiKey)
 }
 
-// selectedCredentialStoreFingerprint reads only the local CLI credential
-// store. Its output is compared in memory and is never logged or persisted.
-func selectedCredentialStoreFingerprint(profile string) string {
+// selectedCredentialStoreFingerprint follows saved-key precedence before the
+// CLI store. Its output is compared in memory and never logged or persisted.
+func selectedCredentialStoreFingerprint(configPath, profile string) string {
+	key, err := auth.LoadSavedAPIKey(configPath)
+	if key != "" || err != nil {
+		return savedCredentialFingerprint(key, err)
+	}
 	tok, _, err := auth.Load(profile)
 	if err == nil && tok != nil {
 		return oauthStoreFingerprint(auth.CredFingerprint(tok.RefreshToken))
@@ -1149,6 +1172,29 @@ func selectedCredentialStoreFingerprint(profile string) string {
 	return ""
 }
 
+func savedCredentialFingerprint(key string, err error) string {
+	if err != nil {
+		return "saved_api_key:error"
+	}
+	return "saved_api_key:" + auth.CredFingerprint(key)
+}
+
+func (g *Gateway) savedAPIKeyState() (present bool, err error) {
+	g.authMu.Lock()
+	defer g.authMu.Unlock()
+	return g.savedAPIKey != "" || g.savedAPIKeyErr != nil, g.savedAPIKeyErr
+}
+
+func (g *Gateway) authSource() string {
+	if present, _ := g.savedAPIKeyState(); present {
+		return string(basetenAuthSavedAPIKey)
+	}
+	if selected, ok := g.basetenAuth(); ok {
+		return string(selected.source)
+	}
+	return "none"
+}
+
 // authHealthLocked derives the health enum. Caller holds authMu.
 //   - signed_out:     no OAuth credential in the store
 //   - refresh_failed: credential present but the token endpoint rejected
@@ -1157,6 +1203,10 @@ func selectedCredentialStoreFingerprint(profile string) string {
 //   - ok:             credential present, no known problem
 func (g *Gateway) authHealthLocked() string {
 	switch {
+	case g.savedAPIKeyErr != nil:
+		return "error"
+	case g.savedAPIKey != "":
+		return "ok"
 	case g.oauthClient == nil && g.cliProfileAPIKey == "":
 		return "signed_out"
 	case g.authDead:
@@ -1199,8 +1249,10 @@ func (g *Gateway) authState() (signedIn bool, authType string, fallbackInUse boo
 	cfg := g.runtimeConfig()
 	g.authMu.Lock()
 	defer g.authMu.Unlock()
-	signedIn = g.oauthClient != nil || g.cliProfileAPIKey != ""
+	signedIn = g.savedAPIKey != "" || g.oauthClient != nil || g.cliProfileAPIKey != ""
 	switch {
+	case g.savedAPIKey != "":
+		authType = "api_key"
 	case g.oauthClient != nil:
 		authType = "oauth"
 	case g.cliProfileAPIKey != "":
@@ -1208,7 +1260,7 @@ func (g *Gateway) authState() (signedIn bool, authType string, fallbackInUse boo
 	default:
 		authType = "none"
 	}
-	if !signedIn && cfg.APIKeyFallback && cfg.BasetenKey != "" {
+	if !signedIn && g.savedAPIKeyErr == nil && cfg.APIKeyFallback && cfg.BasetenKey != "" {
 		authType = "api_key"
 		fallbackInUse = true
 	}
@@ -1218,6 +1270,7 @@ func (g *Gateway) authState() (signedIn bool, authType string, fallbackInUse boo
 type basetenAuthSource string
 
 const (
+	basetenAuthSavedAPIKey   basetenAuthSource = "saved_api_key"
 	basetenAuthProfileOAuth  basetenAuthSource = "profile_oauth"
 	basetenAuthProfileAPIKey basetenAuthSource = "profile_api_key"
 	basetenAuthEnvFallback   basetenAuthSource = "environment_fallback"
@@ -1237,11 +1290,21 @@ func (s basetenAuthSelection) authorization() string {
 	return ""
 }
 
-// basetenProfileAuth returns only the selected CLI profile. Account-scoped
+// basetenProfileAuth selects the saved key or CLI profile. Account-scoped
 // surfaces use it so an environment fallback cannot silently change identity.
 func (g *Gateway) basetenProfileAuth() (basetenAuthSelection, bool) {
 	g.authMu.Lock()
 	defer g.authMu.Unlock()
+	return g.basetenProfileAuthLocked()
+}
+
+func (g *Gateway) basetenProfileAuthLocked() (basetenAuthSelection, bool) {
+	if g.savedAPIKeyErr != nil {
+		return basetenAuthSelection{}, false
+	}
+	if g.savedAPIKey != "" {
+		return basetenAuthSelection{mode: proxy.UpstreamModeAPIKey, apiKey: g.savedAPIKey, client: g.client, source: basetenAuthSavedAPIKey}, true
+	}
 	if g.oauthClient != nil {
 		return basetenAuthSelection{
 			mode:   proxy.UpstreamModeOAuth,
@@ -1262,10 +1325,15 @@ func (g *Gateway) basetenProfileAuth() (basetenAuthSelection, bool) {
 
 // basetenAuth applies the complete credential precedence rule.
 func (g *Gateway) basetenAuth() (basetenAuthSelection, bool) {
-	if selected, ok := g.basetenProfileAuth(); ok {
+	cfg := g.runtimeConfig()
+	g.authMu.Lock()
+	defer g.authMu.Unlock()
+	if g.savedAPIKeyErr != nil {
+		return basetenAuthSelection{}, false
+	}
+	if selected, ok := g.basetenProfileAuthLocked(); ok {
 		return selected, true
 	}
-	cfg := g.runtimeConfig()
 	if cfg.APIKeyFallback && cfg.BasetenKey != "" {
 		return basetenAuthSelection{
 			mode:   proxy.UpstreamModeAPIKey,

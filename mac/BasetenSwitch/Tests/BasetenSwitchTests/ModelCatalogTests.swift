@@ -229,6 +229,18 @@ private final class ModelCatalogURLProtocol: URLProtocol {
         Self.observedURL = request.url
         Self.observedMethod = request.httpMethod
         Self.observedBody = request.httpBody
+        if Self.observedBody == nil, let stream = request.httpBodyStream {
+            stream.open()
+            defer { stream.close() }
+            var data = Data()
+            var buffer = [UInt8](repeating: 0, count: 1024)
+            while stream.hasBytesAvailable {
+                let count = stream.read(&buffer, maxLength: buffer.count)
+                guard count > 0 else { break }
+                data.append(contentsOf: buffer.prefix(count))
+            }
+            Self.observedBody = data
+        }
         Self.observedAdminHeader = request.value(
             forHTTPHeaderField: "X-Baseten-Switch-Admin")
         Self.observedTimeoutInterval = request.timeoutInterval
@@ -262,7 +274,133 @@ private final class ModelCatalogURLProtocol: URLProtocol {
     }
 }
 
+private struct LostAPIKeyResponse: SavedAPIKeyManaging {
+    func updateSavedAPIKey(_ key: String?) async throws -> AuthStatus {
+        throw URLError(.networkConnectionLost)
+    }
+}
+
 final class ModelCatalogTests: XCTestCase {
+    @MainActor
+    func testAmbiguousSavedKeyMutationDiscardsPreviousCatalog() async {
+        var status = adminSnapshot(signedIn: true, health: "ok")
+        status.capabilities.append("saved_api_key")
+        let old = catalogSnapshot(state: .ready, models: [liveModel("vendor/old")])
+        let new = catalogSnapshot(state: .ready, models: [liveModel("vendor/new")])
+        let workflow = RecordingAuthWorkflow(statuses: [status, status], catalogs: [old, new])
+        let state = BasetenSwitchState(
+            variant: .resolve(infoDictionary: [:], environment: [:]),
+            reader: workflow, authReloader: workflow,
+            savedAPIKeyManager: LostAPIKeyResponse(), modelCatalogReader: workflow,
+            loginItemService: ModelCatalogLoginItemService(), startPolling: false)
+        await state.refresh()
+        state.requestModelCatalogRefresh()
+        await state.waitForModelCatalogRefresh()
+        XCTAssertEqual(state.liveModelCatalogState, .ready(old.models))
+        let error = await state.updateSavedAPIKey("synthetic-new-key")
+        XCTAssertNotNil(error)
+        await state.waitForModelCatalogRefresh()
+        XCTAssertEqual(state.liveModelCatalogState, .ready(new.models))
+    }
+
+    func testSavedAPIKeyUsesProtectedMutationAndSecretFreeReceipt() async throws {
+        ModelCatalogURLProtocol.responseData = Data("""
+        {"signed_in":true,"auth_type":"api_key","source":"saved_api_key","saved_api_key":true,"health":"ok"}
+        """.utf8)
+        ModelCatalogURLProtocol.statusCode = 200
+        ModelCatalogURLProtocol.responseDelay = 0
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ModelCatalogURLProtocol.self]
+        let client = GatewayAPIClient(runtime: .stable(), session: URLSession(configuration: configuration))
+        let status = try await client.updateSavedAPIKey("synthetic-switch-key")
+        XCTAssertTrue(status.savedAPIKey)
+        XCTAssertEqual(status.source, "saved_api_key")
+        XCTAssertEqual(authLineLabel(auth: status), "Auth: saved Switch API key")
+        XCTAssertEqual(ModelCatalogURLProtocol.observedURL?.path, "/v1/admin/auth/api-key")
+        XCTAssertNil(ModelCatalogURLProtocol.observedURL?.query)
+        XCTAssertEqual(ModelCatalogURLProtocol.observedMethod, "PUT")
+        XCTAssertEqual(ModelCatalogURLProtocol.observedAdminHeader, "1")
+        XCTAssertEqual(ModelCatalogURLProtocol.observedTimeoutInterval, 30)
+        let body = try XCTUnwrap(ModelCatalogURLProtocol.observedBody)
+        let payload = try JSONSerialization.jsonObject(with: body) as? [String: String]
+        XCTAssertEqual(payload, ["api_key": "synthetic-switch-key"])
+
+        ModelCatalogURLProtocol.responseData = Data("{\"saved_api_key\":false}".utf8)
+        let removed = try await client.updateSavedAPIKey(nil)
+        XCTAssertFalse(removed.savedAPIKey)
+        XCTAssertEqual(ModelCatalogURLProtocol.observedMethod, "DELETE")
+        XCTAssertEqual(ModelCatalogURLProtocol.observedAdminHeader, "1")
+        XCTAssertEqual(ModelCatalogURLProtocol.observedTimeoutInterval, 30)
+        XCTAssertEqual(ModelCatalogURLProtocol.observedBody?.count ?? 0, 0)
+    }
+
+    func testSavedAPIKeyMutationOutlivesOrdinaryResourceTimeout() async throws {
+        ModelCatalogURLProtocol.responseData = Data("{\"saved_api_key\":true}".utf8)
+        ModelCatalogURLProtocol.statusCode = 200
+        ModelCatalogURLProtocol.responseDelay = 5.2
+        defer { ModelCatalogURLProtocol.responseDelay = 0 }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 2
+        configuration.timeoutIntervalForResource = 5
+        configuration.protocolClasses = [ModelCatalogURLProtocol.self]
+        let client = GatewayAPIClient(
+            runtime: .stable(), session: URLSession(configuration: configuration))
+
+        let status = try await client.updateSavedAPIKey("synthetic-switch-key")
+
+        XCTAssertTrue(status.savedAPIKey)
+        XCTAssertEqual(ModelCatalogURLProtocol.observedTimeoutInterval, 30)
+    }
+
+    @MainActor
+    func testSavedAPIKeyShowsSafeServerFailureAfterRefreshingState() async throws {
+        let message = "could not save API key in macOS Keychain; unlock Keychain and allow access, then retry"
+        ModelCatalogURLProtocol.responseData = try JSONSerialization.data(
+            withJSONObject: ["error": message])
+        ModelCatalogURLProtocol.statusCode = 500
+        ModelCatalogURLProtocol.responseDelay = 0
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ModelCatalogURLProtocol.self]
+        let client = GatewayAPIClient(
+            runtime: .stable(), session: URLSession(configuration: configuration))
+        var status = adminSnapshot(signedIn: true, health: "ok")
+        status.capabilities.append("saved_api_key")
+        let catalog = catalogSnapshot(state: .ready, models: [liveModel("vendor/new")])
+        let workflow = RecordingAuthWorkflow(statuses: [status, status], catalogs: [catalog])
+        let state = BasetenSwitchState(
+            variant: .resolve(infoDictionary: [:], environment: [:]),
+            reader: workflow, authReloader: workflow,
+            savedAPIKeyManager: client, modelCatalogReader: workflow,
+            loginItemService: ModelCatalogLoginItemService(), startPolling: false)
+        await state.refresh()
+
+        let error = await state.updateSavedAPIKey("synthetic-switch-key")
+        await state.waitForModelCatalogRefresh()
+
+        XCTAssertEqual(error, message)
+        XCTAssertEqual(state.liveModelCatalogState, .ready(catalog.models))
+        XCTAssertFalse(state.savingAPIKey)
+    }
+
+    func testSavedAPIKeyDoesNotExposeInvalidServerErrors() async throws {
+        ModelCatalogURLProtocol.statusCode = 500
+        ModelCatalogURLProtocol.responseDelay = 0
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ModelCatalogURLProtocol.self]
+        let client = GatewayAPIClient(
+            runtime: .stable(), session: URLSession(configuration: configuration))
+        for message in ["synthetic-switch-key", "unsafe\nmessage", String(repeating: "x", count: 513)] {
+            ModelCatalogURLProtocol.responseData = try JSONSerialization.data(
+                withJSONObject: ["error": message])
+            do {
+                _ = try await client.updateSavedAPIKey("synthetic-switch-key")
+                XCTFail("Expected the mutation to fail")
+            } catch {
+                XCTAssertEqual(error as? GatewayClientError, .badResponse(500))
+            }
+        }
+    }
+
     func testModelCatalogRequestOutlivesOrdinaryAdminTimeout() async throws {
         ModelCatalogURLProtocol.responseData = Data("""
         {
@@ -996,6 +1134,65 @@ final class ModelCatalogTests: XCTestCase {
             events,
             ["status", "catalog", "status", "catalog", "status"])
         XCTAssertEqual(state.liveModelCatalogState, .ready(ready.models))
+    }
+
+    @MainActor
+    func testSavedKeyCatalogRefreshesAfterRouterRestartWithSameAuthRevision() async {
+        func status(bootID: String) -> AdminStatusSnapshot {
+            var snapshot = adminSnapshot(signedIn: true, health: "ok")
+            snapshot.token = RoutingToken(routerBootID: bootID, activeGeneration: 1)
+            snapshot.auth = AuthStatus(dict: [
+                "signed_in": true, "health": "ok", "saved_api_key": true,
+                "source": "saved_api_key", "revision": 1,
+            ])
+            return snapshot
+        }
+        let old = catalogSnapshot(state: .ready, models: [liveModel("vendor/old")])
+        let new = catalogSnapshot(state: .ready, models: [liveModel("vendor/new")])
+        let workflow = RecordingAuthWorkflow(
+            statuses: [status(bootID: "boot-a"), status(bootID: "boot-b"), status(bootID: "boot-b")],
+            catalogs: [old, new])
+        let state = makeState(adminReader: workflow, authReloader: workflow, modelCatalogReader: workflow)
+
+        await state.refresh()
+        state.requestModelCatalogRefresh()
+        await state.waitForModelCatalogRefresh()
+        XCTAssertEqual(state.liveModelCatalogState, .ready(old.models))
+
+        await state.refresh()
+        await state.waitForModelCatalogRefresh()
+        XCTAssertEqual(state.liveModelCatalogState, .ready(new.models))
+
+        await state.refresh()
+        let events = await workflow.events
+        XCTAssertEqual(events, ["status", "catalog", "status", "catalog", "status"])
+    }
+
+    @MainActor
+    func testSavedKeyReplacementRefreshesHealthyAccountCatalog() async {
+        func status(_ revision: Int) -> AdminStatusSnapshot {
+            var snapshot = adminSnapshot(signedIn: true, health: "ok")
+            snapshot.auth = AuthStatus(dict: [
+                "signed_in": true, "health": "ok", "saved_api_key": true,
+                "source": "saved_api_key", "revision": revision,
+            ])
+            return snapshot
+        }
+        let old = catalogSnapshot(state: .ready, models: [liveModel("vendor/old")])
+        let new = catalogSnapshot(state: .ready, models: [liveModel("vendor/new")])
+        let workflow = RecordingAuthWorkflow(
+            statuses: [status(1), status(2), status(2)], catalogs: [old, new])
+        let state = makeState(adminReader: workflow, authReloader: workflow, modelCatalogReader: workflow)
+        await state.refresh()
+        state.requestModelCatalogRefresh()
+        await state.waitForModelCatalogRefresh()
+        XCTAssertEqual(state.liveModelCatalogState, .ready(old.models))
+        await state.refresh()
+        await state.waitForModelCatalogRefresh()
+        XCTAssertEqual(state.liveModelCatalogState, .ready(new.models))
+        await state.refresh()
+        let events = await workflow.events
+        XCTAssertEqual(events, ["status", "catalog", "status", "catalog", "status"])
     }
 
     @MainActor

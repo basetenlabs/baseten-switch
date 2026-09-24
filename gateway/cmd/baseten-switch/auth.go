@@ -54,6 +54,17 @@ func cmdWhoami(args []string) int {
 			host = strings.TrimRight(strings.TrimPrefix(args[i], "--host="), "/")
 		}
 	}
+	configPath, _ := resolveConfigPath()
+	key, err := auth.LoadSavedAPIKey(configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "whoami: %v\n", err)
+		return 1
+	}
+	if key != "" {
+		fmt.Println("Using saved Switch API key (prioritized over Baseten CLI authentication).")
+		fmt.Println("Identity lookup requires OAuth; use 'baseten-switch doctor --probe' to check routing. Remove the saved key with 'baseten-switch auth api-key remove' to use Baseten CLI authentication.")
+		return 0
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	buildClient := auth.HTTPClient

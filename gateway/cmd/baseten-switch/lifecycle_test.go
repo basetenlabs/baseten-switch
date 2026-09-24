@@ -307,6 +307,8 @@ func TestAuthLineCredentialLabels(t *testing.T) {
 	}{
 		{"oauth profile", `{"signed_in":true,"auth_type":"oauth","profile":"example-profile"}`, "example-profile OAuth"},
 		{"api key profile", `{"signed_in":true,"auth_type":"api_key","profile":"example-profile"}`, "example-profile API key"},
+		{"saved key", `{"signed_in":true,"auth_type":"api_key","source":"saved_api_key"}`, "saved Switch API key"},
+		{"unreadable saved key", `{"signed_in":false,"source":"saved_api_key"}`, "saved Switch API key unavailable"},
 		{"environment fallback", `{"signed_in":false,"auth_type":"api_key","fallback_in_use":true}`, "API-key fallback in use"},
 		{"signed out", `{"signed_in":false,"auth_type":"none"}`, "not signed in"},
 		{"older router defaults to oauth", `{"signed_in":true,"profile":"example-profile"}`, "example-profile OAuth"},

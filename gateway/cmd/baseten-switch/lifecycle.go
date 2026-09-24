@@ -871,6 +871,7 @@ func authLine(adminAddr string, routerUp bool) string {
 	var a struct {
 		SignedIn       bool   `json:"signed_in"`
 		AuthType       string `json:"auth_type"`
+		Source         string `json:"source"`
 		Profile        string `json:"profile"`
 		Email          string `json:"email"`
 		FallbackInUse  bool   `json:"fallback_in_use"`
@@ -880,6 +881,10 @@ func authLine(adminAddr string, routerUp bool) string {
 		return fmt.Sprintf("unknown (auth status unavailable: %v)", err)
 	}
 	switch {
+	case a.Source == "saved_api_key" && a.SignedIn:
+		return "saved Switch API key"
+	case a.Source == "saved_api_key":
+		return "saved Switch API key unavailable"
 	case a.SignedIn && a.AuthType == "api_key" && a.Profile != "":
 		return a.Profile + " API key"
 	case a.SignedIn && a.AuthType == "api_key":
