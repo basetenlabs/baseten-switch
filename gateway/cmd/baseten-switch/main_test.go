@@ -18,6 +18,35 @@ func writeFile(t *testing.T, path, content string) {
 	}
 }
 
+// denyWrites makes dir reject new files for the rest of the test, and skips
+// when this process can write to it anyway. Mode bits do not deny every
+// writer: a process with uid 0 or CAP_DAC_OVERRIDE (root in a container, CI
+// running as root, a rootless-mapped uid) bypasses them, as do filesystems
+// that do not enforce the permission bits at all. A test that proves a
+// failure path by making the backup destination unwritable would then observe
+// a successful write and report a safety regression that has not happened, so
+// the denial is probed rather than assumed.
+func denyWrites(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	probe := filepath.Join(dir, ".denywrites-probe")
+	f, err := os.OpenFile(probe, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err == nil {
+		_ = f.Close()
+		_ = os.Remove(probe)
+		t.Skipf("%s is still writable at mode 0500 (privileged writer or "+
+			"permissive filesystem); run the suite unprivileged to exercise "+
+			"the unwritable-backup path", dir)
+	}
+}
+
 func TestStickyConfigPath(t *testing.T) {
 	dir := t.TempDir()
 	cfgReal := filepath.Join(dir, "gateway.yaml")
