@@ -316,6 +316,7 @@ uses a saved Switch API key first, then the credential store written by
   --refresh       Force a token refresh before the identity lookup
 `},
 	{"auth", "Manage the saved API key or sign in with the Baseten CLI", `Usage: baseten-switch auth login
+       baseten-switch auth api-key set
        baseten-switch auth api-key set < key-file
        baseten-switch auth api-key remove
 
@@ -323,7 +324,8 @@ Run "baseten auth login" interactively, SIGHUP the running router so it picks
 up the fresh credential, then print the identity. Switch does not write the
 Baseten CLI credential store.
 
-api-key set reads one API key from stdin and saves it in macOS Keychain, or an
+api-key set prompts for a hidden API key in a terminal; press Enter to save.
+It also accepts a key piped or redirected through stdin. It saves in macOS Keychain, or an
 owner-only file beside the selected gateway config on other platforms.
 The saved key takes priority over Baseten CLI
 authentication. It is never printed or stored in gateway.yaml. api-key remove
