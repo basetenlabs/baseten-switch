@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"os"
 	"strings"
 
 	"github.com/basetenlabs/baseten-switch/gateway/internal/auth"
@@ -17,7 +18,17 @@ func cmdAuthAPIKey(args []string, input io.Reader, out, errOut io.Writer) int {
 	var mutationErr error
 	if args[0] == "set" {
 		const maxInput = 4096
-		raw, err := io.ReadAll(io.LimitReader(input, maxInput+1))
+		var raw []byte
+		var err error
+		if file, ok := input.(*os.File); ok && isTerminal(file) {
+			raw, err = readAPIKeyTerminal(file, errOut, maxInput)
+			if err != nil {
+				fmt.Fprintf(errOut, "auth api-key: %v\n", err)
+				return 1
+			}
+		} else {
+			raw, err = io.ReadAll(io.LimitReader(input, maxInput+1))
+		}
 		if err != nil || len(raw) > maxInput {
 			fmt.Fprintln(errOut, "auth api-key: could not read API key from stdin (maximum 4096 bytes)")
 			return 1
