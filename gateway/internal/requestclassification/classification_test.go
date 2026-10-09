@@ -194,14 +194,25 @@ func TestClassifyClaudeMessagesNegativeRequestFamilies(t *testing.T) {
 
 func TestClassifyClaudeMessagesSystemTextLimit(t *testing.T) {
 	matching := "Auto mode permission classifier for a tool call."
-	atLimit := matching + strings.Repeat("x", maxSystemTextBytes-len(matching))
-	if got := ClassifyClaudeMessages(
-		validContext(),
-		messageBody(t, false, textSystem(atLimit), "hello"),
-	); got == nil {
-		t.Fatal("classification at limit = nil, want positive")
+	for _, tc := range []struct {
+		name string
+		size int
+	}{
+		{"above previous limit", (128 << 10) + 1},
+		{"large classifier", 160 << 10},
+		{"at new limit", 256 << 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			text := matching + strings.Repeat("x", tc.size-len(matching))
+			if got := ClassifyClaudeMessages(
+				validContext(),
+				messageBody(t, false, textSystem(text), "hello"),
+			); got == nil {
+				t.Fatal("classification = nil, want positive")
+			}
+		})
 	}
-	overLimit := atLimit + "x"
+	overLimit := matching + strings.Repeat("x", (256<<10)+1-len(matching))
 	if got := ClassifyClaudeMessages(
 		validContext(),
 		messageBody(t, false, textSystem(overLimit), "hello"),
