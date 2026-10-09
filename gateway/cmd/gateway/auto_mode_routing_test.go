@@ -47,6 +47,9 @@ func TestAutoPermissionCheckRoutesOnceToAnthropicUnchanged(t *testing.T) {
 	defer stop()
 
 	original := syntheticAutoPermissionBody("claude-baseten-example")
+	// Keep a classifier above 128 KiB on the unchanged native route.
+	original = bytes.Replace(original, []byte("In Auto mode,"),
+		append([]byte("In Auto mode,"), bytes.Repeat([]byte("x"), 160<<10)...), 1)
 	req, err := http.NewRequest(
 		http.MethodPost,
 		clientURL(g, "claude-code", "/v1/messages?beta=true"),

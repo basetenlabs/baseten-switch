@@ -15,7 +15,7 @@ const (
 	DetectorClaudeAutoV1          = "claude_auto_v1"
 	RoutingActionNativeAnthropic  = "native_anthropic"
 
-	maxSystemTextBytes = 128 << 10
+	maxSystemTextBytes = 256 << 10
 )
 
 // RequestContext contains the request facts that are safe and necessary for
