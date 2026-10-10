@@ -163,6 +163,7 @@ final class BasetenSwitchState: ObservableObject {
     private var unsupportedRecoveryRuntime: String?
     private(set) var menuVisible = false
     let variant: AppVariant
+    let updates: UpdateStore
 
     var clients: [ClientStatus] { routingSnapshot?.clients ?? [] }
     var gatewayUp: Bool {
@@ -225,6 +226,7 @@ final class BasetenSwitchState: ObservableObject {
          modelCatalogReader: (any ModelCatalogReading)? = nil,
          reasoningPreflightReader: (any ReasoningPreflightReading)? = nil,
          cliRunner: any CLIRunning = SystemCLIRunner(),
+         updates: UpdateStore? = nil,
          clock: any RuntimeClock = SystemRuntimeClock(),
          loginItemService: (any LoginItemServicing)? = nil,
          previewRuntimeValidator: @escaping (RuntimeProfile) -> String? = {
@@ -233,6 +235,8 @@ final class BasetenSwitchState: ObservableObject {
          startPolling: Bool = true,
          automaticMutationRecoveryEnabled: Bool? = nil) {
         self.variant = variant
+        self.updates = updates ?? UpdateStore(
+            variant: variant, runner: cliRunner, clock: clock)
         let apiClient = GatewayAPIClient(runtime: variant.runtime)
         self.reader = reader ?? apiClient
         self.authReloader = authReloader ?? apiClient
@@ -273,6 +277,7 @@ final class BasetenSwitchState: ObservableObject {
         }
 
         if startPolling {
+            self.updates.start()
             Task {
                 await poll.start { [weak self] event in
                     self?.apply(event)
@@ -285,8 +290,14 @@ final class BasetenSwitchState: ObservableObject {
     /// Fixture initializer remains side-effect free: no login item, localhost,
     /// timer, URLSession, or child-process work.
     init(preview fixture: PopupPreviewFixture,
-         variant: AppVariant = .current()) {
+         variant: AppVariant = .current(),
+         updates: UpdateStore? = nil) {
         self.variant = variant
+        self.updates = updates ?? UpdateStore(
+            variant: variant,
+            appVersion: fixture.updateSnapshot?.currentVersion,
+            snapshot: fixture.updateSnapshot,
+            enabled: false)
         let reader = GatewayAPIClient(runtime: variant.runtime)
         self.reader = reader
         authReloader = reader
@@ -333,6 +344,7 @@ final class BasetenSwitchState: ObservableObject {
 #endif
 
     func stop() {
+        updates.stop()
         for timer in reconcileTimers.values {
             timer.cancel()
         }

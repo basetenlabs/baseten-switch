@@ -12,9 +12,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let isPreview: Bool
     private let openConfiguration: (String?) -> Void
     private let openTraffic: () -> Void
+    private let openUpdates: () -> Void
     private let statusItem: NSStatusItem
     private let menu = NSMenu()
     private var stateSink: AnyCancellable?
+    private var updateSink: AnyCancellable?
+    private var releaseMarker: ReleaseUpdateMarkerView?
     private var menuIsOpen = false
     private var menuNeedsRebuild = true
     private var displayedIconState: MenubarIconState?
@@ -24,12 +27,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
          variant: AppVariant = .current(),
          isPreview: Bool = false,
          openConfiguration: @escaping (String?) -> Void = { _ in },
-         openTraffic: @escaping () -> Void = {}) {
+         openTraffic: @escaping () -> Void = {},
+         openUpdates: @escaping () -> Void = {}) {
         self.state = state
         self.variant = variant
         self.isPreview = isPreview
         self.openConfiguration = openConfiguration
         self.openTraffic = openTraffic
+        self.openUpdates = openUpdates
         statusItem = NSStatusBar.system.statusItem(
             withLength: NSStatusItem.squareLength)
         super.init()
@@ -41,6 +46,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         statusItem.button?.setAccessibilityLabel(variant.displayName)
 
         menu.autoenablesItems = false
+        // Share the item-image column with the login checkmark.
+        menu.showsStateColumn = false
         menu.delegate = self
         statusItem.menu = menu
 
@@ -59,7 +66,20 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 }
             }
 
+        updateSink = state.updates.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    // Keep tracked menu rows stable; their next presentation
+                    // projects the new release state. The marker can change now.
+                    self.menuNeedsRebuild = true
+                    self.updateReleaseMarker()
+                }
+            }
+
         updateIconIfNeeded()
+        updateReleaseMarker()
         rebuildMenu()
     }
 
@@ -99,8 +119,21 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         displayedIconState
     }
 
+    var releaseMarkerVisibleForTesting: Bool {
+        releaseMarker?.isHidden == false
+    }
+
     var menuItemTitlesForTesting: [String] {
         menu.items.map(\.title)
+    }
+
+    @discardableResult
+    func performMenuItemForTesting(titled title: String) -> Bool {
+        guard let index = menu.items.firstIndex(where: { $0.title == title }) else {
+            return false
+        }
+        menu.performActionForItem(at: index)
+        return true
     }
 
     func menuWillOpenForTesting() {
@@ -164,6 +197,18 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
         menu.addItem(trafficMenuItem())
         menu.addItem(.separator())
+        if let version = state.updates.availableVersion {
+            let available = actionItem(
+                "Update Available: \(releaseVersionLabel(version))…",
+                action: #selector(openUpdateInstructions))
+            available.image = symbol("arrow.up.circle")
+            menu.addItem(available)
+        }
+        let check = actionItem(
+            "Check for Updates…",
+            action: #selector(checkForUpdates))
+        check.isEnabled = !state.updates.isChecking && state.updates.canCheck
+        menu.addItem(check)
         menu.addItem(actionItem(
             "Open \(variant.displayName)",
             action: #selector(openConfigurationWindow(_:))))
@@ -172,7 +217,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             let login = actionItem(
                 startAtLoginTitle,
                 action: #selector(toggleStartAtLogin))
-            login.state = state.loginItemStatus == .enabled ? .on : .off
+            // An on-state item forces a separate checkmark gutter in AppKit.
+            let enabled = state.loginItemStatus == .enabled
+            login.image = enabled ? symbol("checkmark") : nil
+            login.setAccessibilityValue(NSNumber(value: enabled))
+            login.setAccessibilityLabel("\(startAtLoginTitle), \(enabled ? "On" : "Off")")
             menu.addItem(login)
         }
 
@@ -414,6 +463,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         state.retryMutationCleanup()
     }
 
+    @objc private func openUpdateInstructions() {
+        openUpdates()
+    }
+
+    @objc private func checkForUpdates() {
+        state.updates.check(force: true)
+        openUpdates()
+    }
+
     @objc private func openNativeTraffic() {
         openTraffic()
     }
@@ -434,6 +492,27 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     // MARK: - Status icon
 
+    private func updateReleaseMarker() {
+        guard let button = statusItem.button else { return }
+        if releaseMarker == nil {
+            let marker = ReleaseUpdateMarkerView(frame: .zero)
+            marker.setAccessibilityElement(false)
+            button.addSubview(marker)
+            releaseMarker = marker
+        }
+        let layout = releaseUpdateMarkerLayout(
+            in: button.bounds, isFlipped: button.isFlipped)
+        releaseMarker?.frame = layout.frame
+        releaseMarker?.autoresizingMask = layout.autoresizingMask
+        let available = state.updates.availableVersion
+        releaseMarker?.isHidden = available == nil
+        let description = available.map {
+            "\(variant.displayName) · Update available: \(releaseVersionLabel($0))"
+        } ?? variant.displayName
+        button.toolTip = description
+        button.setAccessibilityLabel(description)
+    }
+
     private func updateIconIfNeeded() {
         let projected = menubarIconState(
             gatewayUp: state.gatewayUp,
@@ -446,6 +525,31 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             for: variant,
             state: projected)
     }
+}
+
+func releaseUpdateMarkerLayout(in bounds: NSRect, isFlipped: Bool)
+    -> (frame: NSRect, autoresizingMask: NSView.AutoresizingMask) {
+    let frame = NSRect(
+        x: bounds.maxX - 7,
+        y: isFlipped ? bounds.minY + 3 : bounds.maxY - 7,
+        width: 4,
+        height: 4)
+    let mask: NSView.AutoresizingMask = isFlipped
+        ? [.minXMargin, .maxYMargin]
+        : [.minXMargin, .minYMargin]
+    return (frame, mask)
+}
+
+/// A separate upper-right marker preserves the logo's native template tint
+/// and the lower-right Preview identity. It never intercepts status-item clicks.
+@MainActor
+private final class ReleaseUpdateMarkerView: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.systemBlue.setFill()
+        NSBezierPath(ovalIn: bounds).fill()
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
 @MainActor

@@ -235,8 +235,38 @@ Run `baseten-switch doctor`. If it reports disabled attribution, run
 
 ## Upgrade
 
+Packaged releases check for a newer version once a day. The Mac app shows an
+update notice in its main window and a blue marker with an **Update Available**
+action in its menu bar. **How to Update** opens release notes and copyable
+installation instructions. Updates are installed manually; checking never
+restarts the gateway or changes routing.
+
+The CLI can check explicitly, including when the gateway is stopped:
+
 ```sh
-brew upgrade baseten-switch
+baseten-switch update check
+baseten-switch update check --refresh
+baseten-switch update check --json
+baseten-switch update automatic off
+baseten-switch update automatic on
+```
+
+Checks use the public Homebrew formula version and confirm its matching
+published GitHub release, including numeric beta releases. They require no
+GitHub or Baseten credentials. Successful results are cached for 24 hours;
+failed checks preserve the last confirmed release and back off before retrying.
+`--refresh` forces a manual check, even when automatic checks are off.
+
+Interactive `status`, `up`, and `doctor` commands can show a short update hint
+on stderr. Piped output, JSON, help, and version output stay unchanged. Automatic
+checks do not run for development builds or the separate Preview app/runtime.
+Versions shipped before release discovery was added need one normal upgrade
+before they can discover subsequent releases.
+
+For Homebrew installations:
+
+```sh
+brew update && brew upgrade baseten-switch
 baseten-switch up
 baseten-switch doctor
 ```
@@ -244,6 +274,11 @@ baseten-switch doctor
 `up` leaves healthy current components alone and moves stale components to the
 new binary and app. Homebrew remains the canonical public install and upgrade
 channel.
+
+Finish active coding requests before running `up` to adopt newly installed
+components. The update window detects a Homebrew or Nix CLI installation before
+showing package-manager commands; other installations use the release's
+installation guidance.
 
 ## Uninstall
 

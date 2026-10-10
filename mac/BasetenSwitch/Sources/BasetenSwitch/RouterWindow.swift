@@ -46,6 +46,7 @@ final class RouterWindowController: NSObject, NSWindowDelegate, NSToolbarDelegat
     private let variant: AppVariant
     private let isPreview: Bool
     private let windowOpenChanged: (Bool) -> Void
+    private let openUpdates: () -> Void
     private let navigation = RouterWindowNavigation()
     private let trafficStore: TrafficStore
     private let requestsStore: RequestsStore
@@ -57,11 +58,13 @@ final class RouterWindowController: NSObject, NSWindowDelegate, NSToolbarDelegat
          variant: AppVariant = .current(),
          isPreview: Bool = false,
          doorReader: (any DoorStatusReading)? = nil,
+         openUpdates: @escaping () -> Void = {},
          windowOpenChanged: @escaping (Bool) -> Void = { _ in }) {
         self.state = state
         self.variant = variant
         self.isPreview = isPreview
         self.windowOpenChanged = windowOpenChanged
+        self.openUpdates = openUpdates
         trafficStore = TrafficStore(
             reader: TrafficAPIClient(runtime: variant.runtime))
         requestsStore = RequestsStore(
@@ -128,7 +131,8 @@ final class RouterWindowController: NSObject, NSWindowDelegate, NSToolbarDelegat
                 doorStore: doorStore,
                 navigation: navigation,
                 variant: variant,
-                isPreview: isPreview))
+                isPreview: isPreview,
+                openUpdates: openUpdates))
         }
 #else
         let root = RouterConfigurationView(
@@ -138,7 +142,8 @@ final class RouterWindowController: NSObject, NSWindowDelegate, NSToolbarDelegat
             doorStore: doorStore,
             navigation: navigation,
             variant: variant,
-            isPreview: isPreview)
+            isPreview: isPreview,
+            openUpdates: openUpdates)
         let controller = NSHostingController(rootView: root)
 #endif
         let window = NSWindow(
@@ -569,6 +574,7 @@ private struct RouterConfigurationView: View {
     @ObservedObject var navigation: RouterWindowNavigation
     let variant: AppVariant
     let isPreview: Bool
+    let openUpdates: () -> Void
 
     var body: some View {
         NavigationSplitView {
@@ -604,8 +610,11 @@ private struct RouterConfigurationView: View {
                 ideal: 200,
                 max: 240)
         } detail: {
-            detail
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            VStack(spacing: 0) {
+                UpdateNoticeView(updates: state.updates, openUpdates: openUpdates)
+                detail
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
         }
         .frame(minWidth: 680, minHeight: 480)
         .onAppear {
