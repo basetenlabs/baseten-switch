@@ -68,10 +68,12 @@ func dispatch(args []string) int {
 		return doorcli.Run(args[1:])
 	}
 	switch args[0] {
+	case "update":
+		return cmdUpdate(args[1:])
 	case "gateway":
 		return cmdGateway(args[1:])
 	case "up":
-		return cmdUp(args[1:])
+		return withUpdateNotice(args, cmdUp(args[1:]))
 	case "down":
 		return cmdDown(args[1:])
 	case "uninstall":
@@ -89,7 +91,7 @@ func dispatch(args []string) int {
 	case "setup":
 		return cmdSetup(args[1:])
 	case "status":
-		return cmdStatus(args[1:])
+		return withUpdateNotice(args, cmdStatus(args[1:]))
 	case "spend":
 		return cmdSpend(args[1:])
 	case "traces":
@@ -101,7 +103,7 @@ func dispatch(args []string) int {
 	case "auth":
 		return cmdAuth(args[1:])
 	case "doctor":
-		return cmdDoctor(args[1:])
+		return withUpdateNotice(args, cmdDoctor(args[1:]))
 	case "claude":
 		return cmdClaude(args[1:])
 	case "codex":
@@ -124,6 +126,14 @@ type commandHelp struct {
 }
 
 var commandHelpEntries = []commandHelp{
+	{"update", "Check for published releases without installing or restarting", `Usage:
+  baseten-switch update check [--json] [--refresh]
+  baseten-switch update automatic on|off [--json]
+
+Checks anonymous public release metadata and caches confirmed results for 24 hours.
+--refresh forces a manual check, including when automatic checks are off.
+No software is installed and no running components are restarted.
+`},
 	{"up", "Start the door and router, adopting the current binary", `Usage: baseten-switch up [--install | --uninstall]
 
 Validate the config, then start the door and router as detached daemons.

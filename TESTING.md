@@ -53,6 +53,21 @@ request coalescing, and navigation. Nothing drives live AppKit behavior
 Release validation also covers the packaged app, accessibility, and
 performance.
 
+Release discovery tests use hermetic HTTP servers and temporary cache roots to
+exercise the canonical formula/release agreement, numeric versions, daily
+caching, explicit refresh, failure/rate-limit backoff, bounded responses, and
+credential-free requests. CLI tests protect human versus machine output and
+the automatic-check preference. Swift update tests exercise the same JSON
+contract, stale app versus upgraded CLI detection, single-flight checks,
+cancellation, scheduling, install instructions, and tracked-menu stability.
+
+The existing side-effect-free native fixtures include `update-available` and
+`update-current` for both the main window and menu. They demonstrate synthetic
+release states without network requests or installation; use an isolated
+macOS QA environment to inspect native layout, focus, copy actions, and the
+shared instructions window. Fixture appearance does not establish a live
+public-feed check or a packaged daily check.
+
 ## Layer 2: the `check.sh` gate
 
 ```sh

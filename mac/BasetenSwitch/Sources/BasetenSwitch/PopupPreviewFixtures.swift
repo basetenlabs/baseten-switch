@@ -46,6 +46,8 @@ struct PopupPreviewFixture: Identifiable {
 
     static let all: [PopupPreviewFixture] = [
         .healthy,
+        .updateAvailable,
+        .updateCurrent,
         .nativeOnly,
         .mixed,
         .fallback,
@@ -53,6 +55,43 @@ struct PopupPreviewFixture: Identifiable {
         .actionFailure,
         .gatewayDown,
     ]
+
+    /// Release examples use static synthetic metadata. They perform no checks.
+    var updateSnapshot: ReleaseUpdateSnapshot? {
+        switch id {
+        case "update-available", "update-current":
+            let available = id == "update-available"
+            return ReleaseUpdateSnapshot(
+                currentVersion: "v0.6.0",
+                availableVersion: available ? "v0.6.1" : "v0.6.0",
+                checkedAt: Date(timeIntervalSince1970: 1_800_000_000),
+                automaticCheck: true,
+                installSource: "homebrew",
+                status: available ? "available" : "current")
+        default:
+            return nil
+        }
+    }
+
+    static let updateAvailable = releaseFixture(
+        id: "update-available", name: "Update Available")
+    static let updateCurrent = releaseFixture(
+        id: "update-current", name: "Up to Date")
+
+    private static func releaseFixture(id: String, name: String) -> PopupPreviewFixture {
+        PopupPreviewFixture(
+            id: id,
+            name: name,
+            gatewayUp: healthy.gatewayUp,
+            uptimeSeconds: healthy.uptimeSeconds,
+            clients: healthy.clients,
+            routerVersion: "v0.6.0",
+            cliVersion: "v0.6.0",
+            auth: healthy.auth,
+            stats: healthy.stats,
+            loginItemStatus: healthy.loginItemStatus,
+            lastError: nil)
+    }
 
     static var requested: PopupPreviewFixture? {
         guard let id = ProcessInfo.processInfo.environment[environmentKey] else {

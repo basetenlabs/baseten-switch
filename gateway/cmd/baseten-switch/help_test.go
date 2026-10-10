@@ -10,6 +10,7 @@ import (
 )
 
 var expectedAdvertisedCommands = []string{
+	"update",
 	"up",
 	"down",
 	"uninstall",

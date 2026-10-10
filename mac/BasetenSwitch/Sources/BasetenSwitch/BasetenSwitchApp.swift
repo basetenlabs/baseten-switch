@@ -169,6 +169,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var state: BasetenSwitchState?
     private var statusController: StatusItemController?
     private var routerWindowController: RouterWindowController?
+    private var updateWindowController: UpdateWindowController?
+    private var routerWindowIsOpen = false
+    private var updateWindowIsOpen = false
 #if DEBUG
     private var previewController: StatusItemController?
     private var previewRouterWindowController: RouterWindowController?
@@ -192,19 +195,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // .app sets LSUIElement; this covers bare `swift run` too.
         NSApp.setActivationPolicy(.accessory)
         let state = BasetenSwitchState(variant: variant)
+        let updateWindowController = UpdateWindowController(
+            updates: state.updates,
+            variant: variant,
+            windowOpenChanged: { [weak self] isOpen in
+                self?.updateWindowIsOpen = isOpen
+                self?.updateActivationPolicy()
+            })
         let routerWindowController = RouterWindowController(
             state: state,
             variant: variant,
-            windowOpenChanged: { isOpen in
-                let policy: NSApplication.ActivationPolicy = isOpen ? .regular : .accessory
-                if !NSApp.setActivationPolicy(policy) {
-                    FileHandle.standardError.write(Data(
-                        "[BasetenSwitch] failed to set activation policy to \(policy.rawValue)\n".utf8))
-                }
-                if isOpen { NSApp.activate(ignoringOtherApps: true) }
+            openUpdates: { [weak updateWindowController] in
+                updateWindowController?.show()
+            },
+            windowOpenChanged: { [weak self] isOpen in
+                self?.routerWindowIsOpen = isOpen
+                self?.updateActivationPolicy()
             })
         self.state = state
         self.routerWindowController = routerWindowController
+        self.updateWindowController = updateWindowController
         self.statusController = StatusItemController(
             state: state,
             variant: variant,
@@ -213,7 +223,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             openTraffic: { [weak routerWindowController] in
                 routerWindowController?.show(destination: .traffic)
+            },
+            openUpdates: { [weak updateWindowController] in
+                updateWindowController?.show()
             })
+    }
+
+    private func updateActivationPolicy() {
+        let hasWindow = routerWindowIsOpen || updateWindowIsOpen
+        let policy: NSApplication.ActivationPolicy = hasWindow ? .regular : .accessory
+        if !NSApp.setActivationPolicy(policy) {
+            FileHandle.standardError.write(Data(
+                "[BasetenSwitch] failed to set activation policy to \(policy.rawValue)\n".utf8))
+        }
+        if hasWindow { NSApp.activate(ignoringOtherApps: true) }
     }
 
     /// Opening the already-running LSUIElement app from Finder or `open`
@@ -242,8 +265,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let variant = AppVariant.current()
         let state = BasetenSwitchState(preview: fixture, variant: variant)
+        let updates = UpdateWindowController(
+            updates: state.updates,
+            variant: variant,
+            windowOpenChanged: { [weak self] isOpen in
+                self?.updateWindowIsOpen = isOpen
+                self?.updateActivationPolicy()
+            })
+        updateWindowController = updates
         let controller = StatusItemController(
-            state: state, variant: variant, isPreview: true)
+            state: state, variant: variant, isPreview: true,
+            openUpdates: { [weak updates] in updates?.show() })
         self.state = state
         previewController = controller
         let hasHostWindow =
@@ -278,11 +310,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let variant = AppVariant.current()
         let state = BasetenSwitchState(preview: fixture, variant: variant)
+        let updates = UpdateWindowController(updates: state.updates, variant: variant)
+        updateWindowController = updates
         let controller = RouterWindowController(
-            state: state, variant: variant, isPreview: true)
+            state: state, variant: variant, isPreview: true,
+            openUpdates: { [weak updates] in updates?.show() })
         self.state = state
         previewRouterWindowController = controller
-        controller.show(clientName: fixture.clients.first?.name)
+        if fixture.updateSnapshot != nil {
+            controller.show(destination: .overview)
+        } else {
+            controller.show(clientName: fixture.clients.first?.name)
+        }
     }
 #endif
 }
