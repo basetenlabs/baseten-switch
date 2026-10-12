@@ -3,7 +3,7 @@ package main
 // auth login verb tests. Hermetic: the baseten CLI is a fixture-written
 // shell script on a PATH confined to a temp dir (so the real exec path,
 // including inherited stdio and exit-code passthrough, is exercised
-// without any host binary), the SIGHUP goes through the signalRouter
+// without any host binary), the confirmed reload goes through its test
 // seam, and the identity print goes through printLoginIdentity so no
 // network call ever happens.
 
@@ -42,16 +42,20 @@ exit 64
 	return p
 }
 
-// setAuthLoginSeams replaces the SIGHUP and identity-print seams with
+// setAuthLoginSeams replaces the reload and identity-print seams with
 // recorders and returns pointers to what they saw.
 func setAuthLoginSeams(t *testing.T) (signaled *[]int, identityCalls *int) {
 	t.Helper()
 	pids := &[]int{}
 	calls := new(int)
-	oldSignal := signalRouter
-	signalRouter = func(pid int) error {
+	oldReload := reloadRouterAuth
+	reloadRouterAuth = func(string) (bool, error) {
+		state, pid := classifyPidfile(gatewayPidfilePath())
+		if state != pidfileAlive {
+			return false, nil
+		}
 		*pids = append(*pids, pid)
-		return nil
+		return true, nil
 	}
 	oldIdentity := printLoginIdentity
 	printLoginIdentity = func() int {
@@ -59,13 +63,13 @@ func setAuthLoginSeams(t *testing.T) (signaled *[]int, identityCalls *int) {
 		return 0
 	}
 	t.Cleanup(func() {
-		signalRouter = oldSignal
+		reloadRouterAuth = oldReload
 		printLoginIdentity = oldIdentity
 	})
 	return pids, calls
 }
 
-func TestAuthLoginSuccessSighupsRouterAndPrintsIdentity(t *testing.T) {
+func TestAuthLoginSuccessConfirmsRouterAndPrintsIdentity(t *testing.T) {
 	fakeBasetenCLI(t, 0)
 	pids, calls := setAuthLoginSeams(t)
 	pf := filepath.Join(t.TempDir(), "gw.pid")
@@ -85,8 +89,8 @@ func TestAuthLoginSuccessSighupsRouterAndPrintsIdentity(t *testing.T) {
 	if *calls != 1 {
 		t.Errorf("identity printed %d times, want 1", *calls)
 	}
-	if !strings.Contains(errOut, "router reloaded (SIGHUP") {
-		t.Errorf("stderr missing the SIGHUP confirmation:\n%s", errOut)
+	if !strings.Contains(errOut, "router credentials reloaded and confirmed") {
+		t.Errorf("stderr missing the reload confirmation:\n%s", errOut)
 	}
 	// The verb names the binary and version that wrote the store (the
 	// two-binary hazard).
@@ -123,7 +127,7 @@ func TestAuthLoginFailurePassesExitCodeThrough(t *testing.T) {
 		t.Fatalf("cmdAuth login = %d, want the CLI's exit code 3", rc)
 	}
 	if len(*pids) != 0 {
-		t.Errorf("failed login must not SIGHUP the router; signals = %v", *pids)
+		t.Errorf("failed login must not reload the router; signals = %v", *pids)
 	}
 	if *calls != 0 {
 		t.Errorf("failed login must not print an identity; calls = %d", *calls)
@@ -158,5 +162,16 @@ func TestAuthUsage(t *testing.T) {
 		if rc != 2 {
 			t.Errorf("cmdAuth(%v) = %d, want usage error 2", args, rc)
 		}
+	}
+}
+
+func TestAuthLoginUnconfirmedRuntimeDoesNotPrintIdentity(t *testing.T) {
+	fakeBasetenCLI(t, 0)
+	_, calls := setAuthLoginSeams(t)
+	reloadRouterAuth = func(string) (bool, error) { return true, fmt.Errorf("reload unconfirmed") }
+	var rc int
+	text := captureStderr(t, func() { rc = cmdAuth([]string{"login"}) })
+	if rc != 1 || *calls != 0 || !strings.Contains(text, "Login completed; runtime credential application unconfirmed") {
+		t.Fatalf("login=%d, identity calls=%d, output=%s", rc, *calls, text)
 	}
 }

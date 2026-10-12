@@ -197,9 +197,15 @@ Baseten Switch stores configuration, local state, logs, and telemetry under
 
 Run `baseten-switch auth login` if the CLI credential expires, is rotated,
 or needs to change. The command delegates authentication to the Baseten CLI,
-reloads the gateway, and prints the current identity. `status` identifies the
-selected profile as OAuth or API key. The gateway also watches the selected
-CLI profile for login, logout, rotation, and profile changes.
+confirms the gateway has loaded the stored credential, and prints the current
+identity. `status` identifies the selected profile as OAuth or API key. Use
+`baseten-switch auth reload` to apply a credential change without repeating
+sign-in. Auth commands return nonzero if runtime application cannot be confirmed;
+the stored credential remains in place. Confirmation validates local loading,
+not access to a hosted model.
+
+The gateway also watches the selected CLI profile for login, logout, rotation,
+and profile changes.
 
 A key saved in Switch takes precedence over CLI authentication. Manage it in
 **Overview → Authentication**, or read a key from a local file through stdin:

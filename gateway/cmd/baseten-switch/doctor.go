@@ -93,7 +93,7 @@ type doctorOpts struct {
 func cmdDoctor(args []string) int {
 	fs := newSimpleFlagSet()
 	fs.bool("json", "", false, "emit the check array as JSON")
-	fs.bool("probe", "", false, "fire a 1-token real request through each healthy door port (incurs cost)")
+	fs.bool("probe", "", false, fmt.Sprintf("fire a %d-token real request through each healthy door port (incurs cost)", doctorProbeMaxTokens))
 	fs.bool("fix", "", false, "interactive repair: confirm-and-apply automatable fixes, re-running the chain after each")
 	fs.bool("yes", "", false, "auto-confirm every prompt (--probe consent and --fix prompts; for scripts/CI)")
 	fs.bool("verbose", "", false, "print every passing check instead of compressing all-ok sections")
@@ -504,7 +504,7 @@ func doctorAuthCheck(add addCheck, f *config.File, unresolved []string, envFile 
 		return doctorStoreAuth{authType: "saved Switch API-key", ready: true}
 	}
 	if routerAuthKnown && routerAuth.Source == "saved_api_key" {
-		add("auth", "signin", docFail, "router still reports a saved Switch API key, but the saved key is absent", "reload the router with SIGHUP")
+		add("auth", "signin", docFail, "router still reports a saved Switch API key, but the saved key is absent; credential change pending; stored: no saved Switch API key; active router: saved Switch API key", "baseten-switch auth reload")
 		return doctorStoreAuth{}
 	}
 	profile := doctorEnvValue("BASETEN_SWITCH_OAUTH_PROFILE", envFile)
@@ -696,7 +696,9 @@ func doctorAuthHealthCheck(add addCheck, routerUp bool, routerAuth doctorRouterA
 		return
 	}
 	if store.ready && store.authType == "saved Switch API-key" && routerAuth.Source != "saved_api_key" {
-		add("auth", "health", docFail, "a saved Switch API key is available, but the running router is using another credential source", "reload the router with SIGHUP")
+		add("auth", "health", docFail,
+			"a saved Switch API key is available, but the running router is using another credential source; credential change pending; stored: saved Switch API key; active router: "+doctorActiveAuthDescription(routerAuth),
+			"baseten-switch auth reload")
 		return
 	}
 	health := routerAuth.Health
@@ -721,8 +723,28 @@ func doctorAuthHealthCheck(add addCheck, routerUp bool, routerAuth doctorRouterA
 		}
 		add("auth", "health", docFail,
 			fmt.Sprintf("the credential store has readable %s, but the running router reports signed out", storedCredential),
-			"baseten-switch up   (adopt the current router binary and reload the selected profile)")
+			"baseten-switch auth reload")
 		return
+	}
+	if store.ready {
+		var expectedType, expectedSource, storedCredential string
+		switch store.authType {
+		case "saved Switch API-key":
+			expectedType, expectedSource, storedCredential = "api_key", "saved_api_key", "saved Switch API key"
+		case "API-key":
+			expectedType, expectedSource, storedCredential = "api_key", "profile_api_key", "CLI API key"
+		case "OAuth":
+			expectedType, expectedSource, storedCredential = "oauth", "profile_oauth", "CLI OAuth"
+		}
+		if expectedType != "" && ((routerAuth.AuthType != "" && routerAuth.AuthType != expectedType) || (routerAuth.Source != "" && routerAuth.Source != expectedSource)) {
+			if store.profile != "" {
+				storedCredential += fmt.Sprintf(" (profile %q)", store.profile)
+			}
+			add("auth", "health", docFail,
+				fmt.Sprintf("credential change pending; stored: %s; active router: %s", storedCredential, doctorActiveAuthDescription(routerAuth)),
+				"baseten-switch auth reload")
+			return
+		}
 	}
 	switch health {
 	case "refresh_failed":
@@ -735,7 +757,7 @@ func doctorAuthHealthCheck(add addCheck, routerUp bool, routerAuth doctorRouterA
 		}
 		add("auth", "health", docFail,
 			"the router's Baseten credential is dead: the token endpoint rejects its refresh token"+detail+"; baseten-routed requests fail (or silently fall back) until reauth",
-			"baseten-switch auth login   (or 'baseten auth login', then SIGHUP the router)")
+			"baseten-switch auth login   (or 'baseten auth login', then 'baseten-switch auth reload')")
 	case "error":
 		detail := ""
 		if lastErr != "" {
@@ -749,6 +771,33 @@ func doctorAuthHealthCheck(add addCheck, routerUp bool, routerAuth doctorRouterA
 	default:
 		add("auth", "health", docOK, "router reports credential health "+health, "")
 	}
+}
+
+func doctorActiveAuthDescription(routerAuth doctorRouterAuth) string {
+	var description string
+	switch routerAuth.Source {
+	case "saved_api_key":
+		return "saved Switch API key"
+	case "profile_api_key":
+		description = "CLI API key"
+	case "profile_oauth":
+		description = "CLI OAuth"
+	case "environment_fallback":
+		return "environment API-key fallback"
+	default:
+		switch routerAuth.AuthType {
+		case "api_key":
+			description = "API key"
+		case "oauth":
+			description = "OAuth"
+		default:
+			return "no identified credential"
+		}
+	}
+	if routerAuth.Profile != "" {
+		description += fmt.Sprintf(" (profile %q)", sanitizeAdminText(routerAuth.Profile, 100))
+	}
+	return description
 }
 
 // sanitizeAdminText makes a server-influenced admin-payload string safe
@@ -1793,14 +1842,14 @@ func doctorE2EChecks(add addCheck, o doctorOpts, doorSpecs []door.Config, doorUp
 		p := doctorProbeClient(httpC, t)
 		if doctorProbeOK(p) && p.FallbackTrigger == "auth_unavailable" {
 			add("e2e", "probe:"+port, docFail,
-				fmt.Sprintf("1-token request succeeded through native fallback because Baseten auth was unavailable (status %d, %dms, model %s%s)", p.Status, p.LatencyMs, orDash(p.Model), doctorProbeResponseSuffix(p)),
+				fmt.Sprintf("%d-token request succeeded through native fallback because Baseten auth was unavailable (status %d, %dms, model %s%s)", doctorProbeMaxTokens, p.Status, p.LatencyMs, orDash(p.Model), doctorProbeResponseSuffix(p)),
 				"configure a usable Baseten credential, then rerun the probe")
 		} else if doctorProbeOK(p) {
 			add("e2e", "probe:"+port, docOK,
-				fmt.Sprintf("1-token request through the door succeeded (status %d, %dms, model %s%s)", p.Status, p.LatencyMs, orDash(p.Model), doctorProbeResponseSuffix(p)), "")
+				fmt.Sprintf("%d-token request through the door succeeded (status %d, %dms, model %s%s)", doctorProbeMaxTokens, p.Status, p.LatencyMs, orDash(p.Model), doctorProbeResponseSuffix(p)), "")
 		} else {
 			add("e2e", "probe:"+port, docFail,
-				fmt.Sprintf("1-token request through the door failed (status %d%s): %s", p.Status, doctorProbeResponseSuffix(p), orDash(p.Error)),
+				fmt.Sprintf("%d-token request through the door failed (status %d%s): %s", doctorProbeMaxTokens, p.Status, doctorProbeResponseSuffix(p), orDash(p.Error)),
 				"baseten-switch status   (then check the router and door logs)")
 		}
 		doctorProbeRouteCheck(add, port, p, probeStart, f, routerTargets[t.BindAddr], t.ProtocolShape, telPath)
