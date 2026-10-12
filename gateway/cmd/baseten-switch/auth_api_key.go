@@ -46,12 +46,13 @@ func cmdAuthAPIKey(args []string, input io.Reader, out, errOut io.Writer) int {
 	if mutationErr != nil {
 		fmt.Fprintf(errOut, "auth api-key: %v\n", mutationErr)
 	}
-	if state, pid := classifyPidfile(gatewayPidfilePath()); state == pidfileAlive {
-		if err := signalRouter(pid); err != nil {
-			fmt.Fprintln(errOut, "The router could not be reloaded. Send SIGHUP to reconcile its API key setting.")
-			return 1
-		}
-		fmt.Fprintln(out, "Router reloaded (SIGHUP).")
+	running, reloadErr := reloadRouterAuth(path)
+	if reloadErr != nil {
+		fmt.Fprintf(errOut, "Stored credential result above; runtime application unconfirmed: %v. Retry 'baseten-switch auth reload'.\n", reloadErr)
+		return 1
+	}
+	if running {
+		fmt.Fprintln(out, "Router credentials reloaded and confirmed.")
 	} else if mutationErr == nil {
 		fmt.Fprintln(out, "Router not running; the setting applies on the next start.")
 	}

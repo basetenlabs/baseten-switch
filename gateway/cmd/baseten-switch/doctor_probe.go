@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+const doctorProbeMaxTokens = 2
+
 type doctorProbeTarget struct {
 	ProtocolShape string
 	BindAddr      string
@@ -49,10 +51,10 @@ func doctorProbeClient(c *http.Client, target doctorProbeTarget) *doctorProbeRes
 	switch shape {
 	case "anthropic":
 		url += "/v1/messages"
-		body = []byte(fmt.Sprintf(`{"model":%q,"max_tokens":1,"messages":[{"role":"user","content":"ping"}]}`, doctorProbeRequestModel(shape)))
+		body = []byte(fmt.Sprintf(`{"model":%q,"max_tokens":%d,"messages":[{"role":"user","content":"ping"}]}`, doctorProbeRequestModel(shape), doctorProbeMaxTokens))
 	case "openai":
 		url += "/v1/chat/completions"
-		body = []byte(fmt.Sprintf(`{"model":%q,"max_tokens":1,"messages":[{"role":"user","content":"ping"}]}`, doctorProbeRequestModel(shape)))
+		body = []byte(fmt.Sprintf(`{"model":%q,"max_tokens":%d,"messages":[{"role":"user","content":"ping"}]}`, doctorProbeRequestModel(shape), doctorProbeMaxTokens))
 	case "monitor":
 		return &doctorProbeResult{Error: "monitor shape has no probe"}
 	default:
@@ -114,7 +116,7 @@ func confirmDoctorProbes(targets []doctorProbeTarget) (bool, error) {
 	if count == 0 {
 		return true, nil
 	}
-	fmt.Fprintf(os.Stderr, "About to fire %d real 1-token inference request(s) through the gateway.\n", count)
+	fmt.Fprintf(os.Stderr, "About to fire %d real %d-token inference request(s) through the gateway.\n", count, doctorProbeMaxTokens)
 	fmt.Fprintln(os.Stderr, "Each request may cost a fraction of a cent on the upstream provider (baseten/anthropic/openai).")
 	fmt.Fprint(os.Stderr, "Proceed? [y/N] ")
 	var response string

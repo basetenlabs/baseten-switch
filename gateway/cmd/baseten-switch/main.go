@@ -326,12 +326,13 @@ uses a saved Switch API key first, then the credential store written by
   --refresh       Force a token refresh before the identity lookup
 `},
 	{"auth", "Manage the saved API key or sign in with the Baseten CLI", `Usage: baseten-switch auth login
+       baseten-switch auth reload
        baseten-switch auth api-key set
        baseten-switch auth api-key set < key-file
        baseten-switch auth api-key remove
 
-Run "baseten auth login" interactively, SIGHUP the running router so it picks
-up the fresh credential, then print the identity. Switch does not write the
+Run "baseten auth login" interactively, confirm the running router has loaded
+the stored credential, then print the identity. Switch does not write the
 Baseten CLI credential store.
 
 api-key set prompts for a hidden API key in a terminal; press Enter to save.
@@ -339,8 +340,11 @@ It also accepts a key piped or redirected through stdin. It saves in macOS Keych
 owner-only file beside the selected gateway config on other platforms.
 The saved key takes priority over Baseten CLI
 authentication. It is never printed or stored in gateway.yaml. api-key remove
-restores CLI authentication when available. Both reload a running router with
-SIGHUP. Login keeps any saved Switch API key in place.
+restores CLI authentication when available. Both confirm a running router has
+loaded the stored credential. Login keeps any saved Switch API key in place.
+Use auth reload to apply a
+credential change from the Baseten CLI without signing in again. A failed
+confirmation returns nonzero while preserving the stored credential.
 `},
 	{"doctor", "Diagnose the full request chain and suggest a concrete fix", `Usage: baseten-switch doctor [--json] [--probe] [--verbose] [--fix] [--yes] [--timeout SEC]
 
@@ -350,7 +354,7 @@ order. Exit 0 when nothing fails, 1 on a failed check, and 2 on usage error.
 The diagnosis names the first failure and its concrete fix.
 
   --json     Emit the check array as JSON
-  --probe    Add live 1-token requests through healthy door ports
+  --probe    Add live 2-token requests through healthy door ports
   --verbose  Expand passing sections
   --fix      Confirm and apply automatable fixes, re-running after each
   --yes      Auto-confirm probe cost and fix prompts

@@ -1,6 +1,5 @@
-// auth_login.go implements `baseten-switch auth login`: shell out to the
-// baseten CLI's device flow, then SIGHUP the running router so it
-// rebuilds its oauth client from the fresh credential. Shelling out
+// auth_login.go delegates sign-in to the Baseten CLI, then confirms the
+// running router has reloaded its local credential selection. Shelling out
 // keeps the CLI the single writer of credential-store formats
 // (the credential-refresh contract, "Triggering reauth"); baseten-switch
 // deliberately never writes auth.json or the keyring.
@@ -39,12 +38,14 @@ var printLoginIdentity = func() int { return cmdWhoami(nil) }
 
 func cmdAuth(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: baseten-switch auth login | api-key set | api-key remove")
+		fmt.Fprintln(os.Stderr, "usage: baseten-switch auth login | auth reload | api-key set | api-key remove")
 		return 2
 	}
 	switch args[0] {
 	case "login":
 		return cmdAuthLogin(args[1:])
+	case "reload":
+		return cmdAuthReload(args[1:])
 	case "api-key":
 		return cmdAuthAPIKey(args[1:], os.Stdin, os.Stdout, os.Stderr)
 	default:
@@ -81,19 +82,16 @@ func cmdAuthLogin(args []string) int {
 		fmt.Fprintf(os.Stderr, "auth login: %v\n", err)
 		return 1
 	}
-	// Reload the running router now. The router also self-heals (its
-	// dead- and signed-out-state store watches converge within ~30s),
-	// but a SIGHUP closes the window where baseten-routed requests keep
-	// replaying the dead token.
-	switch state, pid := classifyPidfile(gatewayPidfilePath()); state {
-	case pidfileAlive:
-		if err := signalRouter(pid); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not SIGHUP router pid %d: %v; it reloads the credential on its own within ~30s, or run 'baseten-switch restart'\n", pid, err)
-		} else {
-			fmt.Fprintf(os.Stderr, "router reloaded (SIGHUP pid %d)\n", pid)
-		}
-	default:
-		fmt.Fprintln(os.Stderr, "router not running (per its pidfile); the new credential loads at the next start (a router that is in fact running picks it up on its own within ~30s)")
+	path, _ := resolveConfigPath()
+	running, reloadErr := reloadRouterAuth(path)
+	if reloadErr != nil {
+		fmt.Fprintf(os.Stderr, "Login completed; runtime credential application unconfirmed: %v. Retry 'baseten-switch auth reload'.\n", reloadErr)
+		return 1
+	}
+	if running {
+		fmt.Fprintln(os.Stderr, "router credentials reloaded and confirmed")
+	} else {
+		fmt.Fprintln(os.Stderr, "router not running; stored credentials apply on the next start")
 	}
 	return printLoginIdentity()
 }
