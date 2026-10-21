@@ -152,6 +152,11 @@ lipo -create -output "$stage/bin/baseten-switch" \
 chmod 0755 "$stage/bin/baseten-switch"
 codesign --force --sign - "$stage/bin/baseten-switch"
 verify_adhoc_signature "$stage/bin/baseten-switch"
+for arch in arm64 x86_64; do
+  slice="$stage_root/packaged-$arch"
+  lipo "$stage/bin/baseten-switch" -thin "$arch" -output "$slice"
+  "$SCRIPT_DIR/verify-go-build.sh" "$slice"
+done
 [[ "$("$stage/bin/baseten-switch" --version)" == "baseten-switch $release_tag" ]] \
   || fail "CLI version does not match $release_tag"
 
