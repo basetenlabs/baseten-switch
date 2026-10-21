@@ -16,6 +16,8 @@ fail() {
   exit 1
 }
 
+"$SCRIPT_DIR/test-verify-go-build.sh"
+
 bash -n \
   "$REPO_DIR/scripts/build-menubar.sh" \
   "$PACKAGER"

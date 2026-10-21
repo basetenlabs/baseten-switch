@@ -20,20 +20,34 @@
       version = self.shortRev or self.dirtyShortRev or "dev";
     in
     {
-      packages = forAllSystems (pkgs: rec {
-        default = baseten-switch;
-        baseten-switch = pkgs.buildGoModule {
-          pname = "baseten-switch";
-          inherit version;
-          # The Go module lives in gateway/, but its tests read the
-          # repo-level config/gateway.example.yaml (byte-equality pin with
-          # the embedded init template), so the whole repo is the source.
-          src = self;
-          modRoot = "gateway";
-          subPackages = [ "cmd/baseten-switch" ];
-          vendorHash = "sha256-q/aZk0k/kRb+7mO0iD9vKHcchybS++zYix7dgiyZjKA=";
-          ldflags = [ "-X github.com/basetenlabs/baseten-switch/gateway/internal/version.Version=${version}" ];
-        };
-      });
+      packages = forAllSystems (
+        pkgs:
+        let
+          # Keep Nix builds on the same compiler as go.mod.
+          go = pkgs.go_1_26.overrideAttrs (finalAttrs: _: {
+            version = "1.26.10";
+            src = pkgs.fetchurl {
+              url = "https://go.dev/dl/go${finalAttrs.version}.src.tar.gz";
+              hash = "sha256-/WPog7ovK/ypPBZGsx6+9j4rHk0rMXyXidl2po2B828=";
+            };
+          });
+          buildGoModule = pkgs.buildGoModule.override { inherit go; };
+        in
+        rec {
+          default = baseten-switch;
+          baseten-switch = buildGoModule {
+            pname = "baseten-switch";
+            inherit version;
+            # The Go module lives in gateway/, but its tests read the
+            # repo-level config/gateway.example.yaml (byte-equality pin with
+            # the embedded init template), so the whole repo is the source.
+            src = self;
+            modRoot = "gateway";
+            subPackages = [ "cmd/baseten-switch" ];
+            vendorHash = "sha256-q/aZk0k/kRb+7mO0iD9vKHcchybS++zYix7dgiyZjKA=";
+            ldflags = [ "-X github.com/basetenlabs/baseten-switch/gateway/internal/version.Version=${version}" ];
+          };
+        }
+      );
     };
 }
