@@ -36,6 +36,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -322,7 +323,7 @@ func loadGatewayConfigForAdapter() (*config.File, string, error) {
 	}
 	f, err := config.Load(path)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil, "", fmt.Errorf("%s", config.MissingConfigMessage(path))
 		}
 		return nil, "", fmt.Errorf("%s", config.MalformedConfigMessage(path, err))
