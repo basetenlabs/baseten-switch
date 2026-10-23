@@ -106,6 +106,10 @@ type Client struct {
 	ProtocolShape string     `yaml:"protocol_shape,omitempty" json:"protocol_shape,omitempty"`
 	AuthToken     *AuthToken `yaml:"auth_token,omitempty" json:"auth_token,omitempty"`
 	DefaultModel  string     `yaml:"default_model,omitempty" json:"default_model,omitempty"`
+	// AllowNative defaults to true. False makes this an independent Baseten
+	// gateway: only enabled model_picker aliases may route, including while
+	// global routing is Off. Discovery stays local and native attempts fail.
+	AllowNative *bool `yaml:"allow_native,omitempty" json:"allow_native,omitempty"`
 	// ModelAliases maps stable picker and request model ids to Baseten slugs.
 	// The gateway also publishes them through Claude Code gateway discovery for
 	// compatibility with older clients (the model-discovery contract).
@@ -113,12 +117,13 @@ type Client struct {
 	// or "anthropic" (the picker drops everything else before caching)
 	// and must not shadow real Anthropic model names;
 	// violations are config-load errors. While global routing is On, a
-	// request naming an alias is an explicit Baseten choice. While Off,
-	// the request fails locally without consulting Baseten.
+	// request naming an alias is an explicit Baseten choice. Native-capable
+	// clients reject aliases while Off; allow_native false stays independent.
 	ModelAliases map[string]string `yaml:"model_aliases,omitempty" json:"model_aliases,omitempty"`
 	// ModelPicker is the ordered set of configured aliases that Switch projects
 	// into Claude Code's user-level modelPicker setting. It is presentation
-	// state only: model_aliases remains the routing contract. A nil pointer means
+	// state for native-capable clients. With allow_native false, only its enabled
+	// rows may route and discovery uses this exact order. A nil pointer means
 	// the integration has not been configured; a present disabled or empty block
 	// remains explicit saved intent.
 	ModelPicker *ModelPicker `yaml:"model_picker,omitempty" json:"model_picker,omitempty"`
@@ -466,6 +471,9 @@ func ValidateRoutingPolicy(f *File) error {
 		); err != nil {
 			return err
 		}
+		if err := validateNativePolicy(f, c); err != nil {
+			return err
+		}
 		if err := validateModelPicker(c); err != nil {
 			return err
 		}
@@ -486,12 +494,62 @@ func ValidateRoutingPolicy(f *File) error {
 		if err := ValidateNativeFallbackModel(c); err != nil {
 			return err
 		}
-		if !c.Enabled {
+		if !c.Enabled || !IsNativeAllowed(c) {
 			continue
 		}
 		target := c.DefaultModel
 		if target == "" || !strings.Contains(target, "/") {
 			return fmt.Errorf("routing policy: enabled client %q requires a Baseten default_model target", c.Name)
+		}
+	}
+	return nil
+}
+
+// IsNativeAllowed preserves native routing for clients that omit the policy.
+func IsNativeAllowed(c Client) bool {
+	return c.AllowNative == nil || *c.AllowNative
+}
+
+func validateNativePolicy(f *File, c Client) error {
+	if IsNativeAllowed(c) {
+		return nil
+	}
+	if err := validateDesktopBindAddress(c.BindAddr); err != nil {
+		return fmt.Errorf("client %q: %w", c.Name, err)
+	}
+	if c.ProtocolShape != "anthropic" {
+		return fmt.Errorf("client %q: allow_native false requires protocol_shape anthropic", c.Name)
+	}
+	if c.FallbackRoute != "" || c.NativeFallbackModel != "" {
+		return fmt.Errorf("client %q: allow_native false forbids fallback_route and native_fallback_model", c.Name)
+	}
+	if c.SubagentModel != "" || c.SubagentRouting != "" || len(c.ModelRoutes) > 0 {
+		return fmt.Errorf("client %q: allow_native false forbids subagent routing and model_routes; select an exact model_picker alias", c.Name)
+	}
+	if c.UpstreamShape != "" && c.UpstreamShape != "anthropic" && c.UpstreamShape != "openai" {
+		return fmt.Errorf("client %q: allow_native false requires upstream_shape anthropic or openai when set", c.Name)
+	}
+	for alias, target := range c.ModelAliases {
+		if target != strings.TrimSpace(target) || !strings.Contains(target, "/") {
+			return fmt.Errorf("client %q: allow_native false requires a Baseten slug for model_aliases[%q]", c.Name, alias)
+		}
+	}
+	if c.Enabled {
+		sharing := 0
+		for _, other := range f.Clients {
+			if other.Enabled && normalizedLoopbackEndpoint(other.BindAddr) == normalizedLoopbackEndpoint(c.BindAddr) {
+				sharing++
+			}
+		}
+		if sharing > 1 {
+			return fmt.Errorf("client %q: allow_native false requires a dedicated bind_addr", c.Name)
+		}
+	}
+	if f.Door != nil {
+		for _, port := range f.Door.Ports {
+			if normalizedLoopbackEndpoint(port.RouterAddr) == normalizedLoopbackEndpoint(c.BindAddr) {
+				return fmt.Errorf("client %q: allow_native false cannot use a door port with native fallback", c.Name)
+			}
 		}
 	}
 	return nil
@@ -754,10 +812,9 @@ func validateRawNativeFallbackModelNodes(root *yaml.Node) error {
 	return nil
 }
 
-// validateRawModelPickerNodes preserves the distinction between an absent
-// model_picker and an explicitly null value. yaml.v3 otherwise decodes both
-// into a nil *ModelPicker, which would turn malformed saved intent into a
-// silent no-op.
+// validateRawModelPickerNodes preserves absence versus explicit null for
+// model_picker and allow_native. yaml.v3 otherwise decodes both
+// into nil pointers, silently discarding malformed saved policy.
 func validateRawModelPickerNodes(data []byte) error {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(data, &doc); err != nil {
@@ -771,6 +828,10 @@ func validateRawModelPickerNodes(data []byte) error {
 		return nil
 	}
 	for i, client := range clients.Content {
+		_, native := mappingEntry(client, "allow_native")
+		if native != nil && native.Kind == yaml.ScalarNode && native.Tag == "!!null" {
+			return fmt.Errorf("clients[%d].allow_native must be true or false, not null", i)
+		}
 		_, picker := mappingEntry(client, "model_picker")
 		if picker == nil {
 			continue

@@ -111,3 +111,41 @@ func TestEnvFilePathHonorsExplicitOverride(t *testing.T) {
 		t.Fatalf("EnvFilePath() = %q, want %q", got, want)
 	}
 }
+
+func TestPreviewKeepsSelectedModelGatewayOutsideNativeDoor(t *testing.T) {
+	disabled := false
+	source := &File{
+		Global: Global{RoutingEnabled: &disabled},
+		Clients: []Client{
+			{Name: "claude-code", Enabled: true, BindAddr: "127.0.0.1:45272", ProtocolShape: "anthropic", DefaultModel: "zai-org/GLM-5.2"},
+			{Name: "claude-desktop", Enabled: true, BindAddr: "127.0.0.1:45274", ProtocolShape: "anthropic", AllowNative: &disabled, ModelPicker: &ModelPicker{Enabled: true}},
+		},
+	}
+	policy := previewPolicyForTest(t.TempDir())
+	preview, err := BuildPreviewConfig(source, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := preview.Clients[1].BindAddr; got != "127.0.0.1:45374" {
+		t.Fatalf("Desktop bind = %q", got)
+	}
+	if preview.Clients[0].BindAddr != policy.RouterAddr || preview.Door.Ports[0].RouterAddr != policy.RouterAddr {
+		t.Fatal("legacy Preview router/door changed")
+	}
+	if source.Clients[1].BindAddr != "127.0.0.1:45274" {
+		t.Fatal("Stable source was mutated")
+	}
+	preview.Clients[1].BindAddr = policy.RouterAddr
+	if err := ValidatePreviewConfig(preview, policy); err == nil || !strings.Contains(err.Error(), "bind_addr") {
+		t.Fatalf("collapsed Desktop listener was accepted: %v", err)
+	}
+	preview.Clients[1].BindAddr = policy.desktopAddress()
+	policy.DesktopAddr = policy.DoorAddr
+	if err := ValidatePreviewConfig(preview, policy); err == nil {
+		t.Fatal("Desktop address collision was accepted")
+	}
+	policy.DesktopAddr = "0.0.0.0:45374"
+	if err := ValidatePreviewConfig(preview, policy); err == nil {
+		t.Fatal("non-loopback Desktop address was accepted")
+	}
+}

@@ -133,6 +133,12 @@ final class BasetenSwitchState: ObservableObject {
         ClaudeModelPickerDiagnostics?
     @Published private(set) var claudeModelPickerDiagnosticsLoading = false
     @Published private(set) var claudeModelPickerDiagnosticsError: String?
+    let claudeDesktopRestart: ClaudeDesktopRestart
+    private var desktopModelEditStartedAt: Date?
+    @Published private(set) var claudeDesktopStatus: ClaudeDesktopStatus?
+    @Published private(set) var claudeDesktopStatusError: String?
+    @Published private(set) var pendingClaudeDesktop: PendingClaudeDesktopMutation?
+    @Published private(set) var claudeDesktopNotice: String?
     @Published private(set) var reasoningWarnings: [String: String] = [:]
     @Published private(set) var mutationRecoveryState: MutationRecoveryState
 
@@ -155,6 +161,7 @@ final class BasetenSwitchState: ObservableObject {
     private var clientPageRefreshPending = false
     private var modelCatalogTask: Task<Void, Never>?
     private var claudeModelPickerDiagnosticsTask: Task<Void, Never>?
+    private var claudeDesktopStatusTask: Task<Void, Never>?
     private var modelCatalogGeneration: UInt64 = 0
     private var refreshingModelCatalog: [LiveModelCatalogEntry]?
     private var automaticCatalogRecoveryGeneration: UInt64?
@@ -214,6 +221,7 @@ final class BasetenSwitchState: ObservableObject {
             || !pendingSubagents.isEmpty
             || pendingReasoning != nil
             || pendingClaudeModelPicker != nil
+            || pendingClaudeDesktop != nil
     }
     var hasFallback: Bool {
         clients.contains { $0.enabled && $0.fallbackActive }
@@ -233,8 +241,13 @@ final class BasetenSwitchState: ObservableObject {
              previewRuntimeFilesystemError(runtime: $0)
          },
          startPolling: Bool = true,
-         automaticMutationRecoveryEnabled: Bool? = nil) {
+         automaticMutationRecoveryEnabled: Bool? = nil,
+         desktopRestartDefaults: UserDefaults? = nil) {
         self.variant = variant
+        claudeDesktopRestart = ClaudeDesktopRestart(
+            defaults: desktopRestartDefaults ?? .standard,
+            key: "\(variant.bundleIdentifier).claudeDesktopModels.\(variant.runtime.adminBaseURL.absoluteString)",
+            persists: startPolling || desktopRestartDefaults != nil)
         self.updates = updates ?? UpdateStore(
             variant: variant, runner: cliRunner, clock: clock)
         let apiClient = GatewayAPIClient(runtime: variant.runtime)
@@ -293,6 +306,7 @@ final class BasetenSwitchState: ObservableObject {
          variant: AppVariant = .current(),
          updates: UpdateStore? = nil) {
         self.variant = variant
+        claudeDesktopRestart = ClaudeDesktopRestart(key: "preview-fixture.desktopModels", persists: false)
         self.updates = updates ?? UpdateStore(
             variant: variant,
             appVersion: fixture.updateSnapshot?.currentVersion,
@@ -358,6 +372,8 @@ final class BasetenSwitchState: ObservableObject {
         invalidateModelCatalog()
         claudeModelPickerDiagnosticsTask?.cancel()
         claudeModelPickerDiagnosticsTask = nil
+        claudeDesktopStatusTask?.cancel()
+        claudeDesktopStatusTask = nil
         mutationRecoveryTask?.cancel()
         mutationRecoveryTask = nil
         Task { await pollCoordinator?.stop() }
@@ -720,7 +736,8 @@ final class BasetenSwitchState: ObservableObject {
 
     func ensureClaudeModelPickerDiagnosticsLoaded() {
         guard claudeModelPickerDiagnostics == nil,
-              !claudeModelPickerDiagnosticsLoading else { return }
+            !claudeModelPickerDiagnosticsLoading
+        else { return }
         requestClaudeModelPickerDiagnosticsRefresh()
     }
 
@@ -738,16 +755,51 @@ final class BasetenSwitchState: ObservableObject {
         await claudeModelPickerDiagnosticsTask?.value
     }
 
+    func requestClaudeDesktopStatusRefresh() {
+        guard claudeDesktopStatusTask == nil else { return }
+        claudeDesktopStatusTask = Task { [weak self] in
+            await self?.refreshClaudeDesktopStatus()
+            self?.claudeDesktopStatusTask = nil
+        }
+    }
+
+    func waitForClaudeDesktopStatusRefresh() async {
+        await claudeDesktopStatusTask?.value
+    }
+
+    private func refreshClaudeDesktopStatus() async {
+        let result = await executeCLI(
+            ["claude-desktop", "status", "--json"],
+            timeout: 10,
+            allowWhenPreviewDown: true)
+        guard result.succeeded,
+            let status = ClaudeDesktopStatus(json: result.standardOutput)
+        else {
+            claudeDesktopStatusError =
+                result.timedOut
+                ? "Checking the Claude Desktop gateway timed out. Showing saved models."
+                : "Switch could not read Claude Desktop gateway status. Showing saved models."
+            return
+        }
+        claudeDesktopStatus = status
+        claudeDesktopStatusError = nil
+        claudeDesktopRestart.observe(
+            status, isCurrent: gatewayUp && routingSnapshot?.desiredMatchesActive == true,
+            changedSince: desktopModelEditStartedAt)
+    }
+
     private func refreshClaudeModelPickerDiagnostics() async {
         let result = await executeCLI(
             ["claude", "picker", "status", "--json"],
             timeout: 10)
         guard !result.timedOut,
-              result.status == 0 || result.status == 3,
-              let diagnostics = ClaudeModelPickerDiagnostics(
-                json: result.standardOutput) else {
+            result.status == 0 || result.status == 3,
+            let diagnostics = ClaudeModelPickerDiagnostics(
+                json: result.standardOutput)
+        else {
             claudeModelPickerDiagnosticsLoading = false
-            claudeModelPickerDiagnosticsError = result.timedOut
+            claudeModelPickerDiagnosticsError =
+                result.timedOut
                 ? "Checking the Claude picker status timed out."
                 : "Switch could not read the Claude picker status."
             return
@@ -772,8 +824,9 @@ final class BasetenSwitchState: ObservableObject {
             do {
                 let snapshot = try await reader.fetchModelCatalog()
                 guard let self,
-                      !Task.isCancelled,
-                      self.modelCatalogGeneration == generation else {
+                    !Task.isCancelled,
+                    self.modelCatalogGeneration == generation
+                else {
                     return
                 }
                 self.modelCatalogTask = nil
@@ -782,17 +835,18 @@ final class BasetenSwitchState: ObservableObject {
                 return
             } catch {
                 guard let self,
-                      !Task.isCancelled,
-                      self.modelCatalogGeneration == generation else {
+                    !Task.isCancelled,
+                    self.modelCatalogGeneration == generation
+                else {
                     return
                 }
-                if self.automaticCatalogRecoveryGeneration == generation {
-                    self.automaticCatalogRecoveryGeneration = nil
-                }
+                let shouldRecover = self.automaticCatalogRecoveryGeneration == generation
+                self.automaticCatalogRecoveryGeneration = nil
                 self.refreshingModelCatalog = nil
                 self.liveModelCatalogState = .error(
                     "Live model availability could not be loaded.")
                 self.modelCatalogTask = nil
+                if shouldRecover { self.requestModelCatalogRefresh() }
             }
         }
     }
@@ -804,10 +858,12 @@ final class BasetenSwitchState: ObservableObject {
     }
 
     func modelCatalogProjection(for client: ClientStatus)
-        -> ModelCatalogProjection {
+        -> ModelCatalogProjection
+    {
         let projectionState: LiveModelCatalogLoadState
         if case .loading = liveModelCatalogState,
-           let refreshingModelCatalog {
+            let refreshingModelCatalog
+        {
             projectionState = .ready(refreshingModelCatalog)
         } else {
             projectionState = liveModelCatalogState
@@ -815,6 +871,18 @@ final class BasetenSwitchState: ObservableObject {
         return projectModelCatalog(
             configured: client.modelCatalog,
             liveState: projectionState)
+    }
+
+    var displayedModelCatalogState: LiveModelCatalogLoadState {
+        if case .loading = liveModelCatalogState, let refreshingModelCatalog {
+            return .ready(refreshingModelCatalog)
+        }
+        return liveModelCatalogState
+    }
+
+    var modelCatalogIsRefreshing: Bool {
+        if case .loading = liveModelCatalogState { return true }
+        return false
     }
 
     var modelCatalogAllowsMutation: Bool {
@@ -850,8 +918,8 @@ final class BasetenSwitchState: ObservableObject {
             return
         }
         automaticCatalogRecoveryGeneration = nil
-        if snapshot.state == .signedOut,
-           snapshot.signedOutReason == .notSignedIn {
+        if snapshot.state == .error || (snapshot.state == .signedOut
+            && snapshot.signedOutReason == .notSignedIn) {
             requestModelCatalogRefresh()
         }
     }
@@ -862,24 +930,26 @@ final class BasetenSwitchState: ObservableObject {
         routerRestarted: Bool
     ) {
         if let previousAuth, let currentAuth,
-           previousAuth.savedAPIKey || currentAuth.savedAPIKey,
-           routerRestarted || previousAuth.source != currentAuth.source
-                || previousAuth.revision != currentAuth.revision {
+            previousAuth.savedAPIKey || currentAuth.savedAPIKey,
+            routerRestarted || previousAuth.source != currentAuth.source
+                || previousAuth.revision != currentAuth.revision
+        {
             invalidateModelCatalog()
             ensureModelCatalogLoaded()
             return
         }
         guard clientPageRefreshTask == nil,
-              selectedProfileIsUnavailable(previousAuth),
-              selectedProfileIsHealthy(currentAuth) else {
+            selectedProfileIsUnavailable(previousAuth),
+            selectedProfileIsHealthy(currentAuth)
+        else {
             return
         }
         switch liveModelCatalogState {
-        case .signedOut(.notSignedIn):
+        case .idle, .ready, .error, .signedOut(.notSignedIn):
             requestModelCatalogRefresh()
         case .loading:
             automaticCatalogRecoveryGeneration = modelCatalogGeneration
-        case .idle, .ready, .signedOut, .error:
+        case .signedOut:
             break
         }
     }
@@ -1891,6 +1961,113 @@ final class BasetenSwitchState: ObservableObject {
         pendingClaudeModelPicker = nil
     }
 
+    // MARK: - Claude Desktop gateway
+
+    var canMutateClaudeDesktop: Bool {
+        canMutateClaudeModelPicker && !hasAnyConfigMutation
+    }
+
+    func previewClaudeDesktopAdd(
+        slug: String,
+        alias: String? = nil
+    ) async -> ClaudeModelPickerAddPreviewOutcome? {
+        guard canMutateClaudeDesktop, modelCatalogAllowsMutation else { return nil }
+        let arguments = ClaudeDesktopMutation.add(slug: slug, alias: alias).command
+            + ["--dry-run", "--json"]
+        let result = await executeCLI(arguments, timeout: 10)
+        if !result.timedOut,
+           let failure = ClaudeModelPickerContextMinimumFailure(
+               json: result.standardOutput, status: result.status) {
+            lastError = failure.message
+            return nil
+        }
+        guard !result.timedOut,
+              let outcome = ClaudeModelPickerAddPreviewOutcome(
+                json: result.standardOutput,
+                status: result.status,
+                explicitAlias: alias) else {
+            lastError = "Switch could not generate an exact Claude Desktop model preview."
+            return nil
+        }
+        if case .preview(let preview, _) = outcome, preview.slug != slug {
+            lastError = "Switch returned a preview for a different model."
+            return nil
+        }
+        lastError = nil
+        return outcome
+    }
+
+    func requestClaudeDesktop(_ kind: ClaudeDesktopMutation) {
+        guard beginClaudeDesktopMutation(kind) else { return }
+        Task { await finishClaudeDesktopMutation(kind) }
+    }
+
+    func setClaudeDesktop(_ kind: ClaudeDesktopMutation) async {
+        guard beginClaudeDesktopMutation(kind) else { return }
+        await finishClaudeDesktopMutation(kind)
+    }
+
+    private func beginClaudeDesktopMutation(_ kind: ClaudeDesktopMutation) -> Bool {
+        guard canMutateClaudeDesktop else { return false }
+        if case .add = kind, !modelCatalogAllowsMutation {
+            lastError = "Refresh the Baseten model catalog before adding a model."
+            return false
+        }
+        let operationID = UUID().uuidString.lowercased()
+        desktopModelEditStartedAt = kind == .setup ? nil : Date()
+        pendingClaudeDesktop = PendingClaudeDesktopMutation(
+            operationID: operationID, kind: kind, phase: .applying)
+        claudeDesktopNotice = nil
+        scheduleReconciling(key: "claude-desktop", operationID: operationID)
+        return true
+    }
+
+    private func finishClaudeDesktopMutation(_ kind: ClaudeDesktopMutation) async {
+        guard let pending = pendingClaudeDesktop, pending.kind == kind,
+              let snapshot = routingSnapshot else { return }
+        let attempt = await executePolicyMutation(
+            mutationArguments(
+                operationID: pending.operationID,
+                snapshot: snapshot,
+                command: kind.command),
+            operationID: pending.operationID,
+            requestIdentity: PolicyMutationRequestIdentity(
+                operation: kind.operation,
+                client: "claude-desktop",
+                key: kind.key,
+                requestedTarget: kind.requestedTarget))
+        await refreshAfterMutation()
+        // Wait for any earlier read, then establish a fresh status after apply.
+        await waitForClaudeDesktopStatusRefresh()
+        await refreshClaudeDesktopStatus()
+        let receipt = attempt.receipt
+        let identityMatches = receipt?.operationID == pending.operationID
+            && receipt?.operation == kind.operation
+            && receipt?.client == "claude-desktop"
+            && receipt?.key == kind.key
+            && receipt?.requestedTarget == kind.requestedTarget
+        let confirmed = attempt.result.succeeded
+            && receipt?.ok == true && receipt?.applied == true
+            && receipt?.reconciliationRequired == false
+            && identityMatches && hashesConfirm(receipt)
+            && claudeDesktopStatusError == nil
+            && kind.isConfirmed(by: claudeDesktopStatus)
+        if confirmed {
+            lastError = nil
+            claudeDesktopNotice = kind == .setup
+                ? "Local gateway is ready. Connect Claude Desktop to finish setup."
+                : nil
+        } else {
+            claudeDesktopNotice = nil
+            lastError = mutationFailureMessage(
+                receipt,
+                fallback: "The Claude Desktop change was not confirmed in the active gateway. Your saved models remain visible.")
+        }
+        clearPending(key: "claude-desktop", operationID: pending.operationID)
+        pendingClaudeDesktop = nil
+        desktopModelEditStartedAt = nil
+    }
+
     // MARK: - Client reasoning configuration
 
     var canMutateReasoning: Bool {
@@ -2375,6 +2552,9 @@ final class BasetenSwitchState: ObservableObject {
         if pendingClaudeModelPicker?.operationID == operationID {
             pendingClaudeModelPicker?.phase = .reconciling
         }
+        if pendingClaudeDesktop?.operationID == operationID {
+            pendingClaudeDesktop?.phase = .reconciling
+        }
     }
 
     private func mutationFailureMessage(
@@ -2555,6 +2735,9 @@ final class BasetenSwitchState: ObservableObject {
             } else if key == "claude-model-picker",
                       self.pendingClaudeModelPicker?.operationID == operationID {
                 self.pendingClaudeModelPicker?.phase = .reconciling
+            } else if key == "claude-desktop",
+                      self.pendingClaudeDesktop?.operationID == operationID {
+                self.pendingClaudeDesktop?.phase = .reconciling
             }
         }
     }
@@ -2804,6 +2987,7 @@ func cliEnvironmentOverrides(configPath: String,
     let coordinationKeys = [
         "BASETEN_SWITCH_ADMIN_ADDR",
         "BASETEN_SWITCH_GATEWAY_PIDFILE",
+        "BASETEN_SWITCH_CLAUDE_DESKTOP_ADDR",
     ]
     var overrides = variant.runtime.environment.filter {
         coordinationKeys.contains($0.key)

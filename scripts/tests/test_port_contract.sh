@@ -25,6 +25,7 @@ public_shipping_files=(
     config/schema.md
     gateway/README.md
     gateway/cmd/baseten-switch/claude_adapter.go
+    gateway/cmd/baseten-switch/claude_desktop.go
     gateway/cmd/baseten-switch/codex_adapter.go
     gateway/cmd/baseten-switch/doctor.go
     gateway/cmd/baseten-switch/main.go
@@ -47,6 +48,9 @@ public_shipping_files=(
 
 shipping_files=("${public_shipping_files[@]}")
 
+require_text gateway/cmd/baseten-switch/claude_desktop.go 'claudeDesktopDefaultAddr = "127.0.0.1:45274"'
+require_text mac/BasetenSwitch/Sources/BasetenSwitch/AppVariant.swift \
+    '"BASETEN_SWITCH_CLAUDE_DESKTOP_ADDR": "127.0.0.1:45374"'
 require_text gateway/cmd/gateway/gateway.go 'DefaultPort         = 45273'
 require_text gateway/cmd/gateway/gateway.go 'DefaultAdminAddr    = "127.0.0.1:45273"'
 require_text config/gateway.example.yaml 'bind_addr: 127.0.0.1:45271'

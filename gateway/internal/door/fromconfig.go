@@ -68,6 +68,9 @@ func SpecsFromConfig(f *config.File, opts SpecsOptions) ([]Config, error) {
 			if !c.Enabled || c.BindAddr != p.RouterAddr {
 				continue
 			}
+			if !config.IsNativeAllowed(c) {
+				return nil, fmt.Errorf("door.ports: client %q has allow_native false and cannot use native fallback", c.Name)
+			}
 			switch Shape(c.ProtocolShape) {
 			case ShapeAnthropic, "":
 				hasA = true

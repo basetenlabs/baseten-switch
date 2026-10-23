@@ -28,6 +28,7 @@ import (
 	"github.com/basetenlabs/baseten-switch/gateway/internal/analytics"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/auth"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/config"
+	"github.com/basetenlabs/baseten-switch/gateway/internal/modelmeta"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/pidfile"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/pricing"
 	"github.com/basetenlabs/baseten-switch/gateway/internal/proxy"
@@ -161,6 +162,7 @@ type resolvedClientConfig struct {
 	// GlobalRoutingEnabled carries the sole config routing gate into the
 	// immutable live resolver. Route is the derived effective base route:
 	// Baseten while On, and the protocol's native provider while Off.
+	// NativeDisabled clients stay on Baseten independently of that gate.
 	// HasGlobalRoutingGate is true for every client resolved from the
 	// clean gateway.yaml schema. Direct in-process embedders may provide
 	// an already-resolved Route without a backing config gate.
@@ -168,6 +170,10 @@ type resolvedClientConfig struct {
 	GlobalRoutingEnabled bool
 	DefaultModel         string
 	ModelAliases         map[string]string // anthropic shape only; alias id -> baseten slug
+	// NativeDisabled is explicit opt-in so zero-value embedded clients keep
+	// their existing behavior. SelectedModelAliases is the enabled picker order.
+	NativeDisabled       bool
+	SelectedModelAliases []string
 	// SubagentModel is the rewrite target for sidechain (subagent)
 	// requests carrying x-claude-code-agent-id: a gateway alias, a raw
 	// Baseten slug, or a native claude-*/anthropic-* id. Empty = no
@@ -232,7 +238,7 @@ func cloneModelOptions(options config.ModelOptions) config.ModelOptions {
 // route, sanitize_history, fallback_route, upstream_shape,
 // ttft_timeout, default_model, model_aliases, subagent_model, subagent_routing,
 // model_routes, responses_strip_tool_types, responses_compatibility, and the
-// global routing gate.
+// global routing gate, native policy, and selected alias order.
 // Listener identity (name) is compared separately when diffing the set.
 func (r resolvedClientConfig) hash() string {
 	h := sha256.New()
@@ -241,6 +247,8 @@ func (r resolvedClientConfig) hash() string {
 	fmt.Fprintln(h, r.Route)
 	fmt.Fprintln(h, r.HasGlobalRoutingGate)
 	fmt.Fprintln(h, r.GlobalRoutingEnabled)
+	fmt.Fprintln(h, r.NativeDisabled)
+	fmt.Fprintln(h, strings.Join(r.SelectedModelAliases, "\x00"))
 	fmt.Fprintln(h, r.SanitizeHistory)
 	fmt.Fprintln(h, r.FallbackRoute)
 	fmt.Fprintln(h, r.FallbackPolicy.OnBaseten429)
@@ -311,7 +319,7 @@ func (r resolvedClientConfig) subagentEnabled() bool {
 }
 
 func (r resolvedClientConfig) usesGlobalRouting() bool {
-	return r.HasGlobalRoutingGate && r.Route != "monitor"
+	return r.HasGlobalRoutingGate && !r.NativeDisabled && r.Route != "monitor"
 }
 
 func (r resolvedClientConfig) globalRoutingOff() bool {
@@ -629,12 +637,13 @@ type Gateway struct {
 
 	// Active routing snapshot. Admin status reads this exact accepted
 	// configuration instead of independently parsing gateway.yaml.
-	stateMu          sync.RWMutex
-	routerBootID     string
-	activeGeneration uint64
-	activeConfigHash string
-	activeConfigFile *config.File
-	reloadError      string
+	stateMu               sync.RWMutex
+	routerBootID          string
+	activeGeneration      uint64
+	activeConfigHash      string
+	activeConfigFile      *config.File
+	reloadError           string
+	desktopModelDiscovery *desktopModelDiscovery
 
 	wg  sync.WaitGroup
 	ctx context.Context
@@ -808,6 +817,7 @@ func (g *Gateway) activateConfigSnapshot(f *config.File, raw []byte) {
 	g.activeConfigFile = &immutable
 	g.activeConfigHash = exactConfigHash(raw)
 	g.activeGeneration++
+	g.desktopModelDiscovery = nil
 	g.reloadError = ""
 }
 
@@ -1601,12 +1611,14 @@ func (g *Gateway) healthzClient(cl *clientListener, w http.ResponseWriter, r *ht
 	upstreamModel := g.upstreamModelFor(cl.cfg)
 	signedIn, _, _ := g.authState()
 	body, _ := json.Marshal(map[string]any{
-		"status":          "ok",
-		"client":          cl.cfg.Name,
-		"protocol_shape":  cl.cfg.ProtocolShape,
-		"effective_route": rt,
-		"upstream_model":  upstreamModel,
-		"signed_in":       signedIn,
+		"status":              "ok",
+		"client":              cl.cfg.Name,
+		"protocol_shape":      cl.cfg.ProtocolShape,
+		"effective_route":     rt,
+		"upstream_model":      upstreamModel,
+		"signed_in":           signedIn,
+		"allow_native":        !cl.cfg.NativeDisabled,
+		"uses_global_routing": cl.cfg.usesGlobalRouting(),
 	})
 	h := w.Header()
 	h.Set("Content-Type", "application/json")
@@ -1627,6 +1639,10 @@ func (g *Gateway) upstreamModelFor(rc resolvedClientConfig) string {
 }
 
 func (g *Gateway) forwardModelsGet(cl *clientListener, w http.ResponseWriter, r *http.Request) {
+	if cl.cfg.NativeDisabled {
+		g.aliasModelsGet(cl, w, r)
+		return
+	}
 	cfg := g.runtimeConfig()
 	if cl.cfg.ProtocolShape == "anthropic" && len(cl.cfg.ModelAliases) > 0 {
 		g.aliasModelsGet(cl, w, r)
@@ -1709,19 +1725,17 @@ func aliasModelEntries(aliases map[string]string) []map[string]any {
 	}
 	out := make([]map[string]any, 0, len(ids))
 	for _, id := range sortedKeys(ids) {
-		slug := aliases[id]
-		short := slug
-		if i := strings.LastIndex(slug, "/"); i >= 0 {
-			short = slug[i+1:]
-		}
-		out = append(out, map[string]any{
-			"type":         "model",
-			"id":           id,
-			"display_name": short + " via Baseten",
-			"created_at":   aliasModelCreatedAt,
-		})
+		out = append(out, aliasModelEntry(id, aliases[id]))
 	}
 	return out
+}
+
+func aliasModelEntry(id, slug string) map[string]any {
+	short := modelmeta.ResolveBaseten(slug).DisplayName
+	return map[string]any{
+		"type": "model", "id": id,
+		"display_name": short + " via Baseten", "created_at": aliasModelCreatedAt,
+	}
 }
 
 // catalogAnthropicModelEntries projects catalog-ready provider-public models
@@ -1757,17 +1771,36 @@ func (g *Gateway) catalogAnthropicModelEntries() []map[string]any {
 // (switch OFF) the native list is additionally proxied with a short
 // deadline and appended after the aliases, keeping the native escape
 // hatch visible; a failed native fetch degrades to aliases-only
-// rather than failing discovery.
+// rather than failing discovery. Native-disabled listeners publish only the
+// enabled picker rows in saved order and never consult the native catalog.
 func (g *Gateway) aliasModelsGet(cl *clientListener, w http.ResponseWriter, r *http.Request) {
+	generation := g.activeRoutingState().generation
 	entries := make([]any, 0, len(cl.cfg.ModelAliases))
 	seen := map[string]bool{}
-	for _, e := range aliasModelEntries(cl.cfg.ModelAliases) {
+	aliasEntries := aliasModelEntries(cl.cfg.ModelAliases)
+	if cl.cfg.NativeDisabled {
+		aliasEntries = make([]map[string]any, 0, len(cl.cfg.SelectedModelAliases))
+		for _, alias := range cl.cfg.SelectedModelAliases {
+			if slug, ok := cl.cfg.ModelAliases[alias]; ok {
+				id := alias
+				if cl.cfg.Name == config.ClaudeDesktopClientName {
+					id = desktopModelID(alias, slug)
+				}
+				aliasEntries = append(aliasEntries, aliasModelEntry(id, slug))
+			}
+		}
+	}
+	for _, e := range aliasEntries {
 		entries = append(entries, e)
 		if id, ok := e["id"].(string); ok {
 			seen[id] = true
 		}
 	}
-	for _, e := range g.catalogAnthropicModelEntries() {
+	var nativeCatalog []map[string]any
+	if !cl.cfg.NativeDisabled {
+		nativeCatalog = g.catalogAnthropicModelEntries()
+	}
+	for _, e := range nativeCatalog {
 		if id, ok := e["id"].(string); ok && seen[id] {
 			continue
 		}
@@ -1776,7 +1809,7 @@ func (g *Gateway) aliasModelsGet(cl *clientListener, w http.ResponseWriter, r *h
 			seen[id] = true
 		}
 	}
-	if cl.cfg.Route == "anthropic" {
+	if !cl.cfg.NativeDisabled && cl.cfg.Route == "anthropic" {
 		for _, e := range g.nativeModelEntries(r) {
 			if id, ok := e["id"].(string); ok && seen[id] {
 				continue
@@ -1784,6 +1817,7 @@ func (g *Gateway) aliasModelsGet(cl *clientListener, w http.ResponseWriter, r *h
 			entries = append(entries, e)
 		}
 	}
+	fullCount := len(entries)
 	entries, hasMore, paginationErr := paginateAnthropicModelEntries(
 		entries,
 		r.URL.Query(),
@@ -1807,7 +1841,9 @@ func (g *Gateway) aliasModelsGet(cl *clientListener, w http.ResponseWriter, r *h
 	h.Set("Content-Type", "application/json")
 	h.Set("Content-Length", itoa(len(body)))
 	w.WriteHeader(200)
-	_, _ = w.Write(body)
+	if n, err := w.Write(body); err == nil && n == len(body) && r.Method == http.MethodGet && cl.cfg.Name == config.ClaudeDesktopClientName && !hasMore && len(entries) == fullCount {
+		g.recordDesktopModelDiscovery(cl, generation, len(entries))
+	}
 }
 
 func paginateAnthropicModelEntries(
@@ -2650,6 +2686,9 @@ func (g *Gateway) buildAttemptTargetWithSnapshot(
 	forced bool,
 	preserveIngressBody bool,
 ) (upstreamAttempt, error) {
+	if cl.cfg.NativeDisabled && rt != "baseten" {
+		return upstreamAttempt{}, fmt.Errorf("client %q does not allow native provider routing", cl.cfg.Name)
+	}
 	upShape := upstreamShapeFor(cl.cfg, rt)
 	needsTranslate := kind == "messages" && upShape == "openai"
 	if kind == "messages" && !preserveIngressBody {
@@ -2716,6 +2755,13 @@ func (g *Gateway) buildAttemptTargetWithSnapshot(
 	mode, basetenKey, upClient, ok := g.buildUpstreamClient(rt)
 	if !ok {
 		return upstreamAttempt{}, errNeedsLogin
+	}
+	if cl.cfg.NativeDisabled {
+		client := *upClient
+		client.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return errors.New("upstream redirects are disabled for this client")
+		}
+		upClient = &client
 	}
 	headers, err := proxy.BuildUpstreamHeaders(r.Header, mode, basetenKey)
 	if err != nil {
@@ -2842,7 +2888,7 @@ type fallbackPlan struct {
 }
 
 func resolveFallbackPlan(cl *clientListener, body []byte) fallbackPlan {
-	if cl == nil || cl.cfg.globalRoutingOff() || cl.cfg.FallbackRoute == "" {
+	if cl == nil || cl.cfg.NativeDisabled || cl.cfg.globalRoutingOff() || cl.cfg.FallbackRoute == "" {
 		return fallbackPlan{}
 	}
 	requested := proxy.RewriteModelInBody(body, "").RequestedModel
@@ -3039,7 +3085,7 @@ func (g *Gateway) resolveAttemptsWithRequestedReasoning(
 ) ([]upstreamAttempt, error) {
 	snapshot := g.pricing.Capture()
 	profile := requestprofile.Inspect(body)
-	if classification != nil {
+	if classification != nil && !cl.cfg.NativeDisabled {
 		at, err := g.buildAttemptWithSnapshot(
 			snapshot,
 			requested,
@@ -3064,7 +3110,7 @@ func (g *Gateway) resolveAttemptsWithRequestedReasoning(
 	isSubagent := false
 	origRequested := ""
 	subagentModel := ""
-	if cl.cfg.ProtocolShape == "anthropic" && !cl.cfg.globalRoutingOff() {
+	if cl.cfg.ProtocolShape == "anthropic" && !cl.cfg.NativeDisabled && !cl.cfg.globalRoutingOff() {
 		isSubagent = r.Header.Get(subagentAgentIDHeader) != ""
 		if cl.cfg.subagentEnabled() && isSubagent {
 			if res := proxy.RewriteModelInBody(body, ""); res.Parsed {
@@ -3150,6 +3196,35 @@ func (g *Gateway) resolveAttemptsLadderWithPlan(
 ) ([]upstreamAttempt, error) {
 	requested := proxy.RewriteModelInBody(body, "").RequestedModel
 	canonicalRequested := normalizeModelID(requested)
+	if cl.cfg.NativeDisabled {
+		// Bind the exact selected identity before classifier, family, subagent,
+		// default, or fallback policy can change its target.
+		selectedTarget := ""
+		for _, alias := range cl.cfg.SelectedModelAliases {
+			target, ok := cl.cfg.ModelAliases[alias]
+			if !ok || target == "" {
+				continue
+			}
+			if requested != alias && (cl.cfg.Name != config.ClaudeDesktopClientName || requested != desktopModelID(alias, target)) {
+				continue
+			}
+			if selectedTarget != "" {
+				return nil, fmt.Errorf("model %q matches multiple selected identities for client %q", requested, cl.cfg.Name)
+			}
+			selectedTarget = target
+		}
+		if selectedTarget == "" {
+			return nil, fmt.Errorf("model %q is not selected for client %q; select a configured gateway model", requested, cl.cfg.Name)
+		}
+		at, err := g.buildAttemptTargetWithSnapshot(
+			snapshot, requestedReasoning, requestedObserved, cl, r,
+			body, "baseten", kind, selectedTarget, true, false,
+		)
+		if err != nil {
+			return nil, err
+		}
+		return []upstreamAttempt{at}, nil
+	}
 	if cl.cfg.globalRoutingOff() {
 		// The global routing gate is terminal. Inspect the requested model only
 		// to reject explicit Baseten choices clearly; otherwise build one
@@ -3421,6 +3496,9 @@ func resolveNativeModelPolicyWithFamily(
 	requestedID string,
 	catalogFamily string,
 ) modelPolicyDecision {
+	if rc.NativeDisabled {
+		return modelPolicyDecision{source: "not_selected"}
+	}
 	if rc.globalRoutingOff() {
 		return modelPolicyDecision{
 			route:  config.NativeRoute(rc.ProtocolShape),
@@ -3578,6 +3656,9 @@ func routeEffective(cl *clientListener, at upstreamAttempt) string {
 // telemetry route_effective value alone cannot tell the two apart. An
 // empty requestedID matches no pin and yields the Baseten default.
 func ExpectedPrimaryRoute(c config.Client, globalRoutingEnabled bool, requestedID string) string {
+	if !config.IsNativeAllowed(c) {
+		return "baseten"
+	}
 	shape := c.ProtocolShape
 	rt := "baseten"
 	if !globalRoutingEnabled {
@@ -4799,7 +4880,7 @@ func resolveFromFile(f *config.File) ([]resolvedClientConfig, error) {
 			claimed[k] = c.Name
 		}
 		rt := "baseten"
-		if !*f.Global.RoutingEnabled {
+		if !*f.Global.RoutingEnabled && config.IsNativeAllowed(c) {
 			rt = config.NativeRoute(shape)
 		}
 		if err := validateModelAliases(c, shape); err != nil {
@@ -4856,6 +4937,8 @@ func resolveFromFile(f *config.File) ([]resolvedClientConfig, error) {
 			GlobalRoutingEnabled:    *f.Global.RoutingEnabled,
 			DefaultModel:            c.DefaultModel,
 			ModelAliases:            c.ModelAliases,
+			NativeDisabled:          !config.IsNativeAllowed(c),
+			SelectedModelAliases:    selectedModelAliases(c),
 			SubagentModel:           c.SubagentModel,
 			SubagentRouting:         c.SubagentRouting,
 			ModelRoutes:             c.ModelRoutes,
@@ -4872,6 +4955,17 @@ func resolveFromFile(f *config.File) ([]resolvedClientConfig, error) {
 		})
 	}
 	return out, nil
+}
+
+func selectedModelAliases(c config.Client) []string {
+	if config.IsNativeAllowed(c) || c.ModelPicker == nil || !c.ModelPicker.Enabled {
+		return nil
+	}
+	aliases := make([]string, 0, len(c.ModelPicker.Models))
+	for _, model := range c.ModelPicker.Models {
+		aliases = append(aliases, model.Alias)
+	}
+	return aliases
 }
 
 // discoveryPrefixOK mirrors Claude Code's gateway model discovery

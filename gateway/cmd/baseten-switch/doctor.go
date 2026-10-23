@@ -93,7 +93,7 @@ type doctorOpts struct {
 func cmdDoctor(args []string) int {
 	fs := newSimpleFlagSet()
 	fs.bool("json", "", false, "emit the check array as JSON")
-	fs.bool("probe", "", false, fmt.Sprintf("fire a %d-token real request through each healthy door port (incurs cost)", doctorProbeMaxTokens))
+	fs.bool("probe", "", false, fmt.Sprintf("fire a %d-token real request through each healthy client endpoint with a selected model (incurs cost)", doctorProbeMaxTokens))
 	fs.bool("fix", "", false, "interactive repair: confirm-and-apply automatable fixes, re-running the chain after each")
 	fs.bool("yes", "", false, "auto-confirm every prompt (--probe consent and --fix prompts; for scripts/CI)")
 	fs.bool("verbose", "", false, "print every passing check instead of compressing all-ok sections")
@@ -436,9 +436,13 @@ func doctorConfigChecks(add addCheck, cfgPath string, cfgErr error, f *config.Fi
 	}
 
 	enabled := 0
+	directOnly := true
 	for _, c := range f.Clients {
 		if c.Enabled {
 			enabled++
+			if config.IsNativeAllowed(c) {
+				directOnly = false
+			}
 		}
 	}
 	if enabled == 0 {
@@ -449,6 +453,8 @@ func doctorConfigChecks(add addCheck, cfgPath string, cfgErr error, f *config.Fi
 	}
 
 	switch {
+	case enabled > 0 && directOnly && (f.Door == nil || len(f.Door.Ports) == 0):
+		add("config", "door", docSkip, "independent clients use their direct listeners; no door is required", "")
 	case f.Door == nil || len(f.Door.Ports) == 0:
 		add("config", "door", docFail, "no door: section (or no door.ports) in "+cfgPath,
 			"add a door: section mapping a bind_addr to each client listener (reference: config/gateway.example.yaml)")
@@ -618,7 +624,7 @@ func doctorAuthCheck(add addCheck, f *config.File, unresolved []string, envFile 
 	}
 	if names := doctorBasetenRouted(f); len(names) > 0 {
 		add("auth", "signin", docFail,
-			"not signed in (no OAuth, no API key); these clients cannot use Baseten, and a configured native fallback may serve their requests instead: "+strings.Join(names, ", "),
+			"not signed in (no OAuth, no API key); these clients cannot use Baseten: "+strings.Join(names, ", "),
 			bothFixes)
 		return doctorStoreAuth{}
 	}
@@ -880,7 +886,7 @@ func doctorAuthPlaceholders(f *config.File, unresolved []string) []string {
 }
 
 // doctorBasetenRouted names enabled clients that can use Baseten under
-// the one global routing gate or through a Baseten fallback.
+// the traditional global routing gate, independently, or through a Baseten fallback.
 func doctorBasetenRouted(f *config.File) []string {
 	if f == nil {
 		return nil
@@ -891,7 +897,7 @@ func doctorBasetenRouted(f *config.File) []string {
 		if !c.Enabled {
 			continue
 		}
-		if routingEnabled || c.FallbackRoute == "baseten" {
+		if routingEnabled || !config.IsNativeAllowed(c) || c.FallbackRoute == "baseten" {
 			out = append(out, c.Name)
 		}
 	}
@@ -1795,9 +1801,9 @@ func doctorSupervisionChecks(add addCheck, routerState portState, doorSpecs []do
 	}
 }
 
-// doctorE2EChecks fires live requests through the door ports (not the
-// router listeners), so a pass proves the full
-// harness-facing path. Real requests cost real money: without --probe
+// doctorE2EChecks uses each client's harness-facing endpoint: a door for
+// traditional clients and the direct listener for independent clients.
+// Real requests cost real money: without --probe
 // this is a skip, and with it a consent prompt runs unless --yes. After
 // each probe, the served-route check asserts the
 // answer actually came over the CONFIGURED route: the door's failover
@@ -1809,7 +1815,7 @@ func doctorE2EChecks(add addCheck, o doctorOpts, doorSpecs []door.Config, doorUp
 		return
 	}
 	var targets []doctorProbeTarget
-	routerTargets := map[string]string{} // door listen addr -> router target addr
+	routerTargets := map[string]string{} // harness endpoint -> router listener
 	for _, sp := range doorSpecs {
 		if !doorUp[sp.ListenAddr] {
 			continue
@@ -1824,8 +1830,30 @@ func doctorE2EChecks(add addCheck, o doctorOpts, doorSpecs []door.Config, doorUp
 		})
 		routerTargets[sp.ListenAddr] = sp.RouterTarget
 	}
+	if f != nil {
+		for _, client := range f.Clients {
+			if !client.Enabled || config.IsNativeAllowed(client) {
+				continue
+			}
+			if client.ModelPicker == nil || !client.ModelPicker.Enabled || len(client.ModelPicker.Models) == 0 {
+				add("e2e", "probe:"+portOf(client.BindAddr), docSkip, client.Name+" has no selected model to probe", "add a model in Switch before running the probe")
+				continue
+			}
+			if !dialOK(client.BindAddr) {
+				add("e2e", "probe:"+portOf(client.BindAddr), docSkip, client.Name+" direct listener is unavailable", "check the router client status")
+				continue
+			}
+			targets = append(targets, doctorProbeTarget{
+				ProtocolShape:  client.ProtocolShape,
+				BindAddr:       client.BindAddr,
+				RequestedModel: client.ModelPicker.Models[0].Alias,
+				Direct:         true,
+			})
+			routerTargets[client.BindAddr] = client.BindAddr
+		}
+	}
 	if len(targets) == 0 {
-		add("e2e", "probe", docSkip, "no healthy door port to probe", "")
+		add("e2e", "probe", docSkip, "no configured model and healthy harness endpoint to probe", "")
 		return
 	}
 	if !o.yes {
@@ -1838,6 +1866,10 @@ func doctorE2EChecks(add addCheck, o doctorOpts, doorSpecs []door.Config, doorUp
 	httpC := &http.Client{Timeout: time.Duration(o.timeoutSec) * time.Second}
 	for _, t := range targets {
 		port := portOf(t.BindAddr)
+		pathLabel := "the door"
+		if t.Direct {
+			pathLabel = "the direct listener"
+		}
 		probeStart := time.Now()
 		p := doctorProbeClient(httpC, t)
 		if doctorProbeOK(p) && p.FallbackTrigger == "auth_unavailable" {
@@ -1846,10 +1878,10 @@ func doctorE2EChecks(add addCheck, o doctorOpts, doorSpecs []door.Config, doorUp
 				"configure a usable Baseten credential, then rerun the probe")
 		} else if doctorProbeOK(p) {
 			add("e2e", "probe:"+port, docOK,
-				fmt.Sprintf("%d-token request through the door succeeded (status %d, %dms, model %s%s)", doctorProbeMaxTokens, p.Status, p.LatencyMs, orDash(p.Model), doctorProbeResponseSuffix(p)), "")
+				fmt.Sprintf("%d-token request through %s succeeded (status %d, %dms, model %s%s)", doctorProbeMaxTokens, pathLabel, p.Status, p.LatencyMs, orDash(p.Model), doctorProbeResponseSuffix(p)), "")
 		} else {
 			add("e2e", "probe:"+port, docFail,
-				fmt.Sprintf("%d-token request through the door failed (status %d%s): %s", doctorProbeMaxTokens, p.Status, doctorProbeResponseSuffix(p), orDash(p.Error)),
+				fmt.Sprintf("%d-token request through %s failed (status %d%s): %s", doctorProbeMaxTokens, pathLabel, p.Status, doctorProbeResponseSuffix(p), orDash(p.Error)),
 				"baseten-switch status   (then check the router and door logs)")
 		}
 		doctorProbeRouteCheck(add, port, p, probeStart, f, routerTargets[t.BindAddr], t.ProtocolShape, telPath)
@@ -1880,8 +1912,8 @@ func doctorProbeResponseSuffix(p *doctorProbeResult) string {
 // row. The expected route comes from gateway.ExpectedPrimaryRoute: a
 // model_routes mapping moves the designed route for the probe's model, and a
 // telemetry route_effective value alone cannot distinguish that mapping from
-// the router's fallback_route. The current door contract requires the
-// X-Baseten-Switch-Door stamp so the probe can be attributed safely.
+// the router's fallback_route. Traditional door probes require the routing
+// stamp; direct independent-listener probes use their own telemetry row.
 func doctorProbeRouteCheck(add addCheck, port string, p *doctorProbeResult, probeStart time.Time, f *config.File, routerTarget, shape, telPath string) {
 	name := "route:" + port
 	cli, ok := doctorClientFor(f, routerTarget, shape)
@@ -1895,8 +1927,12 @@ func doctorProbeRouteCheck(add addCheck, port string, p *doctorProbeResult, prob
 	}
 	configured := gateway.ExpectedPrimaryRoute(cli, globalRoutingEnabled, "")
 	probeModel := doctorProbeRequestModel(shape)
+	direct := !config.IsNativeAllowed(cli)
+	if direct && cli.ModelPicker != nil && len(cli.ModelPicker.Models) > 0 {
+		probeModel = cli.ModelPicker.Models[0].Alias
+	}
 	expected := gateway.ExpectedPrimaryRoute(cli, globalRoutingEnabled, probeModel)
-	if p.DoorVia == "fallback" {
+	if !direct && p.DoorVia == "fallback" {
 		outcome := "the probe passed"
 		if !doctorProbeOK(p) {
 			outcome = fmt.Sprintf("the probe failed with status %d", p.Status)
@@ -1906,11 +1942,11 @@ func doctorProbeRouteCheck(add addCheck, port string, p *doctorProbeResult, prob
 			"baseten-switch status   (the door tripped; check the router and the auth/health check)")
 		return
 	}
-	if p.DoorVia != "router" {
-		if !doctorProbeOK(p) && p.Status == 0 {
-			add("e2e", name, docSkip, "the failed probe returned no HTTP response; no served route can be attributed", "")
-			return
-		}
+	if !doctorProbeOK(p) && p.Status == 0 {
+		add("e2e", name, docSkip, "the failed probe returned no HTTP response; no served route can be attributed", "")
+		return
+	}
+	if !direct && p.DoorVia != "router" {
 		add("e2e", name, docFail,
 			"the door response omitted the required X-Baseten-Switch-Door routing stamp",
 			"baseten-switch up   (restart the door onto the current binary)")

@@ -9,15 +9,16 @@ import (
 	"github.com/basetenlabs/baseten-switch/gateway/internal/config"
 )
 
-const previewConfigUsage = "usage: baseten-switch config preview-snapshot --source PATH --output PATH --root PATH --router-addr HOST:PORT --door-addr HOST:PORT | baseten-switch config preview-validate --path PATH --root PATH --router-addr HOST:PORT --door-addr HOST:PORT"
+const previewConfigUsage = "usage: baseten-switch config preview-snapshot --source PATH --output PATH --root PATH --router-addr HOST:PORT --door-addr HOST:PORT [--desktop-addr HOST:PORT] | baseten-switch config preview-validate --path PATH --root PATH --router-addr HOST:PORT --door-addr HOST:PORT [--desktop-addr HOST:PORT]"
 
 type previewConfigArgs struct {
-	Source     string
-	Output     string
-	Path       string
-	Root       string
-	RouterAddr string
-	DoorAddr   string
+	Source      string
+	Output      string
+	Path        string
+	Root        string
+	RouterAddr  string
+	DoorAddr    string
+	DesktopAddr string
 }
 
 func cmdConfigPreviewSnapshot(args []string) int {
@@ -64,6 +65,8 @@ func parsePreviewConfigArgs(args []string) (previewConfigArgs, error) {
 			target = &out.RouterAddr
 		case "--door-addr":
 			target = &out.DoorAddr
+		case "--desktop-addr":
+			target = &out.DesktopAddr
 		default:
 			if strings.HasPrefix(name, "--") {
 				return out, fmt.Errorf("unknown Preview config flag: %s", name)
@@ -84,9 +87,10 @@ func parsePreviewConfigArgs(args []string) (previewConfigArgs, error) {
 
 func (a previewConfigArgs) policy() config.PreviewPolicy {
 	return config.PreviewPolicy{
-		Root:       a.Root,
-		RouterAddr: a.RouterAddr,
-		DoorAddr:   a.DoorAddr,
+		Root:        a.Root,
+		RouterAddr:  a.RouterAddr,
+		DoorAddr:    a.DoorAddr,
+		DesktopAddr: a.DesktopAddr,
 	}
 }
 

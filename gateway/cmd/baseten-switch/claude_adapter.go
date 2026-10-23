@@ -286,6 +286,9 @@ func claudeTargetClientName(f *config.File) (string, error) {
 	var target *config.Client
 	for i := range f.Clients {
 		c := &f.Clients[i]
+		if c.Name == config.ClaudeDesktopClientName {
+			continue
+		}
 		shape := c.ProtocolShape
 		if shape == "" {
 			shape = "anthropic"
@@ -351,6 +354,9 @@ func claudeDoorPort(f *config.File) (string, map[string]bool, map[string]string,
 	var target *config.Client
 	for i := range f.Clients {
 		c := &f.Clients[i]
+		if c.Name == config.ClaudeDesktopClientName {
+			continue
+		}
 		addPort(c.BindAddr)
 		shape := c.ProtocolShape
 		if shape == "" {
