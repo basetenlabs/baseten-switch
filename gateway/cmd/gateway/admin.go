@@ -220,7 +220,7 @@ type familyEntry struct {
 // switch position when absent. EffectiveModel "" means native
 // passthrough. Non-anthropic clients get nil.
 func computeFamilies(rc resolvedClientConfig) []familyEntry {
-	if rc.ProtocolShape != "anthropic" {
+	if rc.ProtocolShape != "anthropic" || rc.NativeDisabled {
 		return nil
 	}
 	out := make([]familyEntry, 0, len(modelFamilySet))
@@ -399,11 +399,12 @@ func modelRouteKeys(m map[string]string) []string {
 }
 
 type activeRoutingState struct {
-	bootID     string
-	generation uint64
-	activeHash string
-	file       *config.File
-	reloadErr  string
+	bootID                string
+	generation            uint64
+	activeHash            string
+	file                  *config.File
+	reloadErr             string
+	desktopModelDiscovery *desktopModelDiscovery
 }
 
 func (g *Gateway) activeRoutingState() activeRoutingState {
@@ -412,7 +413,8 @@ func (g *Gateway) activeRoutingState() activeRoutingState {
 	return activeRoutingState{
 		bootID: g.routerBootID, generation: g.activeGeneration,
 		activeHash: g.activeConfigHash, file: g.activeConfigFile,
-		reloadErr: g.reloadError,
+		reloadErr:             g.reloadError,
+		desktopModelDiscovery: g.desktopModelDiscovery,
 	}
 }
 
@@ -435,6 +437,9 @@ func fallbackStatus(g *Gateway, rc resolvedClientConfig) map[string]any {
 }
 
 func (g *Gateway) policyAwareFallbackCooldown(rc resolvedClientConfig) (fallbackCooldownState, bool) {
+	if rc.NativeDisabled {
+		return fallbackCooldownState{}, false
+	}
 	state, active := g.activeFallbackCooldown(rc.Name)
 	return state, active && cooldownEligible(rc.resolvedFallbackPolicy(), fallbackAllowLegacy, state)
 }
@@ -685,6 +690,9 @@ func effectiveSummary(
 	families []familyEntry,
 	snapshots ...*pricing.Snapshot,
 ) string {
+	if rc.NativeDisabled {
+		return fmt.Sprintf("Baseten · %d configured models", len(rc.SelectedModelAliases))
+	}
 	if rc.globalRoutingOff() {
 		return "Native · " + providerDisplayName(config.NativeRoute(rc.ProtocolShape))
 	}
@@ -723,13 +731,15 @@ func resolvedStatusClient(f *config.File, c config.Client) resolvedClientConfig 
 	}
 	rt := "baseten"
 	globalEnabled := f.Global.RoutingEnabled != nil && *f.Global.RoutingEnabled
-	if !globalEnabled {
+	if !globalEnabled && config.IsNativeAllowed(c) {
 		rt = config.NativeRoute(shape)
 	}
 	return resolvedClientConfig{
 		Name: c.Name, BindAddr: c.BindAddr, ProtocolShape: shape, Route: rt,
 		HasGlobalRoutingGate: true,
 		GlobalRoutingEnabled: globalEnabled,
+		NativeDisabled:       !config.IsNativeAllowed(c),
+		SelectedModelAliases: selectedModelAliases(c),
 		DefaultModel:         c.DefaultModel,
 		ModelAliases:         c.ModelAliases, SubagentModel: c.SubagentModel,
 		SubagentRouting: c.SubagentRouting, ModelRoutes: c.ModelRoutes,
@@ -816,7 +826,10 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 					"effective_source":  unmatched.source,
 				},
 			}
-			if c.Enabled && rcEff.ProtocolShape == "anthropic" {
+			clientStatus["allow_native"] = !rcEff.NativeDisabled
+			clientStatus["uses_global_routing"] = rcEff.usesGlobalRouting()
+			clientStatus["selected_model_aliases"] = rcEff.SelectedModelAliases
+			if c.Enabled && rcEff.ProtocolShape == "anthropic" && !rcEff.NativeDisabled {
 				clientStatus["baseten_model_fallback"] = basetenModelFallbackStatus(
 					rcEff,
 					desiredActiveMismatch,
@@ -866,7 +879,10 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 					"effective_source":  unmatched.source,
 				},
 			}
-			if cl.cfg.ProtocolShape == "anthropic" {
+			clientStatus["allow_native"] = !cl.cfg.NativeDisabled
+			clientStatus["uses_global_routing"] = cl.cfg.usesGlobalRouting()
+			clientStatus["selected_model_aliases"] = cl.cfg.SelectedModelAliases
+			if cl.cfg.ProtocolShape == "anthropic" && !cl.cfg.NativeDisabled {
 				clientStatus["baseten_model_fallback"] = basetenModelFallbackStatus(
 					cl.cfg,
 					desiredActiveMismatch,
@@ -901,13 +917,14 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	authUnavailableFallback := g.authUnavailableFallbackStatus()
 	writeJSON(w, 200, map[string]any{
-		"router_pid":          os.Getpid(),
-		"router_boot_id":      state.bootID,
-		"active_generation":   state.generation,
-		"active_config_hash":  state.activeHash,
-		"desired_config_hash": desiredHash,
-		"capabilities":        capabilities,
-		"health":              "ready",
+		"router_pid":                     os.Getpid(),
+		"router_boot_id":                 state.bootID,
+		"active_generation":              state.generation,
+		"active_config_hash":             state.activeHash,
+		"desired_config_hash":            desiredHash,
+		"claude_desktop_model_discovery": state.desktopModelDiscovery,
+		"capabilities":                   capabilities,
+		"health":                         "ready",
 		"reload": map[string]any{
 			"state": reloadState,
 			"error": reloadErr,

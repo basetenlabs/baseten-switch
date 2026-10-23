@@ -71,6 +71,12 @@ func (g *Gateway) adminModelCatalog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	contextLimits := modelContextLimitsFromSnapshot(g.pricing.Capture())
+	if r.URL.Query().Get("local_only") == "true" {
+		writeModelCatalogJSON(w, r.Method, modelCatalogResponse{
+			State: "ready", Models: []modelCatalogModel{}, ContextLimits: contextLimits,
+		})
+		return
+	}
 
 	// The live catalog belongs to the saved key or selected CLI profile. The
 	// environment fallback is intentionally excluded from this account view.
@@ -265,7 +271,7 @@ func basetenModelDisplayName(
 		pricing.ProviderBaseten,
 		canonicalID,
 	); ok {
-		return displayName
+		return modelmeta.HumanizeDisplayName(displayName)
 	}
 	return modelmeta.ResolveBaseten(canonicalID).DisplayName
 }

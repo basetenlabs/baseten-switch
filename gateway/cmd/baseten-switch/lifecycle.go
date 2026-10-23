@@ -771,11 +771,12 @@ func statErr(path string) (os.FileInfo, bool) {
 func routerClientRows(adminAddr string) []string {
 	var payload struct {
 		Clients []struct {
-			Name     string `json:"name"`
-			Enabled  bool   `json:"enabled"`
-			BindAddr string `json:"bind_addr"`
-			Route    string `json:"effective_route"`
-			Shape    string `json:"protocol_shape"`
+			Name        string `json:"name"`
+			Enabled     bool   `json:"enabled"`
+			BindAddr    string `json:"bind_addr"`
+			Route       string `json:"effective_route"`
+			Shape       string `json:"protocol_shape"`
+			AllowNative *bool  `json:"allow_native"`
 		} `json:"clients"`
 	}
 	if err := getJSON(adminAddr, "/v1/admin/status", &payload); err != nil {
@@ -794,7 +795,11 @@ func routerClientRows(adminAddr string) []string {
 		if port == "" {
 			port = c.BindAddr
 		}
-		rows = append(rows, fmt.Sprintf("%-13s %-6s %-10s switch %s", c.Name, port, c.Route, sw))
+		if c.AllowNative != nil && !*c.AllowNative {
+			rows = append(rows, fmt.Sprintf("%-13s %-6s %-10s independent gateway", c.Name, port, c.Route))
+		} else {
+			rows = append(rows, fmt.Sprintf("%-13s %-6s %-10s switch %s", c.Name, port, c.Route, sw))
+		}
 	}
 	return rows
 }

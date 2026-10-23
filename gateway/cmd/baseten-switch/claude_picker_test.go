@@ -699,7 +699,7 @@ func TestClaudePickerRowsContextBoundaries(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			rows, err := claudePickerRows(picker, aliases, tc.context, nil)
 			if tc.wantErr {
-				if err == nil || !strings.Contains(err.Error(), "below Claude Code's 200000-token model picker minimum") {
+				if err == nil || !strings.Contains(err.Error(), "below Claude's 200000-token model picker minimum") {
 					t.Fatalf("error = %v, want actionable unsupported-limit error", err)
 				}
 				return
@@ -849,7 +849,7 @@ func TestKnownUnsupportedContextBlocksPickerSync(t *testing.T) {
 	err := a.syncModelPicker(false)
 	if err == nil || !strings.Contains(
 		err.Error(),
-		"below Claude Code's 200000-token model picker minimum",
+		"below Claude's 200000-token model picker minimum",
 	) {
 		t.Fatalf("sync error = %v, want actionable unsupported-limit error", err)
 	}
@@ -871,7 +871,7 @@ func TestKnownUnsupportedContextBlocksPickerSync(t *testing.T) {
 	}
 	if status.UserFileSync != "blocked" || !strings.Contains(
 		status.Message,
-		"below Claude Code's 200000-token model picker minimum",
+		"below Claude's 200000-token model picker minimum",
 	) {
 		t.Fatalf("status = %+v, want blocked actionable diagnostic", status)
 	}

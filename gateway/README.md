@@ -50,6 +50,7 @@ up, down, restart, status
 on, off
 config init, config reset
 claude on|off|status|subagents|route|reasoning|picker
+claude-desktop setup|status|models add|remove|move
 codex on|off|status|route|reasoning
 whoami, auth login, doctor, spend
 gateway start|stop|restart|status

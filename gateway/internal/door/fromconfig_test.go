@@ -258,3 +258,35 @@ func TestDiffSpecs(t *testing.T) {
 		})
 	}
 }
+
+func TestSpecsFromConfigRejectsNoNativeClientWithoutPartialSpecs(t *testing.T) {
+	allowNative, noNative := true, false
+	legacy := client("native-client", "127.0.0.1:18081", "anthropic", true)
+	desktop := client("gateway-client", "127.0.0.1:18082", "anthropic", true)
+	desktop.AllowNative = &noNative
+	const desktopPort = "127.0.0.1:8082"
+	for _, withLegacyPort := range []bool{false, true} {
+		ports := []config.DoorPort{{BindAddr: desktopPort, RouterAddr: desktop.BindAddr}}
+		if withLegacyPort {
+			ports = append([]config.DoorPort{{BindAddr: "127.0.0.1:8081", RouterAddr: legacy.BindAddr}}, ports...)
+		}
+		file := doorFile(&config.Door{Ports: ports}, legacy, desktop)
+		specs, err := SpecsFromConfig(file, SpecsOptions{})
+		if err == nil || !strings.Contains(err.Error(), "allow_native false") || !strings.Contains(err.Error(), desktop.Name) {
+			t.Fatalf("withLegacyPort=%t: error=%v, want no-native rejection", withLegacyPort, err)
+		}
+		if specs != nil {
+			t.Fatalf("withLegacyPort=%t: returned partial native fallback specs: %+v", withLegacyPort, specs)
+		}
+	}
+
+	// Explicit native permission and omission retain the existing fallback.
+	for _, policy := range []*bool{nil, &allowNative} {
+		desktop.AllowNative = policy
+		file := doorFile(&config.Door{Ports: []config.DoorPort{{BindAddr: desktopPort, RouterAddr: desktop.BindAddr}}}, desktop)
+		specs, err := SpecsFromConfig(file, SpecsOptions{})
+		if err != nil || len(specs) != 1 || len(specs[0].Fallbacks) != 1 || specs[0].Fallbacks[0].Base != DefaultAnthropicBase {
+			t.Fatalf("native-capable policy=%v: specs=%+v error=%v", policy, specs, err)
+		}
+	}
+}

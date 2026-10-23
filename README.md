@@ -2,8 +2,9 @@
 
 Baseten Switch is a local macOS app and gateway that routes supported AI
 coding harnesses between their native providers and models served on Baseten.
-One global switch controls Baseten routing, and per-client mappings select the
-model that serves each request.
+A global switch controls routing overrides, and per-client mappings select the
+model that serves each request. Claude Desktop can use a separate local gateway
+whose selected Baseten models remain available while overrides are Off.
 
 > **Beta:** Baseten Switch is under active development. Interfaces,
 > configuration, and behavior may change between releases. The current macOS
@@ -56,7 +57,7 @@ override.
 The menu bar app is the primary interface for daily use. It provides:
 
 - the global Baseten routing switch;
-- Claude Code and Codex model configuration;
+- Claude Code, Claude Desktop, and Codex model configuration;
 - current health, active fallback, and authentication status;
 - recent traffic, performance, and spend views;
 - actions to start the system and run it at login.
@@ -145,6 +146,78 @@ To restore the Claude Code setting that existed before setup:
 ```sh
 baseten-switch claude off
 ```
+
+## Claude Desktop pilot
+
+Open **Clients → Claude Desktop** in Switch. Use **Manage models** to choose the
+Baseten models offered to Claude, then choose **Connect Claude Desktop…**. Switch
+prepares the local gateway, validates Claude's configuration, and asks before
+restarting Claude. Save your work, then choose **Restart and connect**. Switch
+backs up the affected configuration files, creates a named gateway configuration,
+and opens Claude. Saved settings and an observed gateway connection are reported
+separately. If Claude has not connected, finish its startup prompts and choose
+**Check again**.
+
+Automatic setup is currently verified for Claude Desktop **2.42304.0**,
+**3.6556.1**, and **3.6556.2**. Other versions use the manual guide. Switch preserves unrelated
+local configurations and refuses automatic changes when Claude has managed
+preferences or unrecognized configuration files.
+
+**Set up manually** remains available in the app. Its numbered guide includes
+copy buttons for the local URL, placeholder key, and authentication scheme, plus
+a configuration file that can be imported through Claude's configuration picker.
+The supported [in-app configuration window](https://claude.com/docs/third-party/claude-desktop/in-app-configuration)
+is under **Developer → Configure Third-Party Inference…**, after enabling
+**Help → Troubleshooting → Enable Developer Mode**. Use provider **Gateway**,
+credential kind **Static API key**, the displayed loopback URL, the non-secret
+placeholder `baseten-switch-local`, and **bearer** authentication. Enable model
+discovery with an empty explicit model list; turn Chat on and Auto mode off.
+Choose **Apply Changes**, then **Save & Restart**.
+
+Each selected model has a stable, opaque discovery ID, with its model name shown
+separately. Removing a model prevents new requests using either its discovery ID
+or saved routing alias; it does not retarget old IDs to a different model. After
+upgrading the pilot, restart Claude and reselect a model if an existing
+conversation still refers to an older picker ID. Quit and reopen Claude after
+adding, removing, or reordering models. Switch shows a **Restart Claude Desktop**
+notice while model-list changes are pending. Make several edits, then use its
+restart action after saving your work; if Claude is closed, the action opens it.
+The notice clears when Claude fetches the current ordered model list. This
+action does not repeat gateway setup. **Refresh models** reloads the available
+Baseten catalog in Switch; it does not refresh Claude's cached picker.
+Switch keeps the Baseten provider credential in its existing credential store.
+
+This pilot uses Baseten-hosted open models with local conversation history.
+Standard Claude account history and subscription routing are separate. Use
+Desktop's standard Anthropic sign-in choice to return to its standard experience.
+Like Claude Code, the Desktop picker offers Baseten catalog models for users to
+try without requiring per-model chat or tool certification. Chat, tools, images,
+and long conversations may work differently by model. Adding a model is blocked
+when its known context limit is below 200K tokens, matching the Claude Code
+picker's safeguard; unknown context limits remain unverified. Cowork
+compatibility is not established by the gateway setup.
+
+The **Routing overrides** toggle controls the other clients' routing policy.
+Desktop's gateway remains active when overrides are Off and never falls back to
+Anthropic. Stopping Switch's gateway leaves Desktop requests failing until the
+service is restored or Desktop is changed back to its standard configuration.
+The Desktop page reports local listener, authentication, and recent endpoint
+traffic separately. A successful model-discovery request confirms that Claude contacted the current gateway; it does not prove the current UI mode or model compatibility.
+
+The CLI manages the same saved selection:
+
+```sh
+baseten-switch claude-desktop setup
+baseten-switch claude-desktop status --json
+baseten-switch claude-desktop models add <baseten-model-slug> --dry-run --json
+baseten-switch claude-desktop models add <baseten-model-slug>
+baseten-switch claude-desktop models remove <alias>
+baseten-switch claude-desktop models move <alias> --before <other-alias>
+```
+
+Setup creates an empty selection on a dedicated `127.0.0.1:45274` listener
+(`127.0.0.1:45374` in Preview). Start the gateway with `baseten-switch up` if it
+is stopped. CLI model edits made while it is stopped remain saved until applied.
 
 ## Codex CLI
 

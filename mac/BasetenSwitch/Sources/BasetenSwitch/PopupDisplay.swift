@@ -102,6 +102,7 @@ enum AuthAttention: Equatable {
 /// effective route; this traversal does not derive a route from configuration.
 func clientRequiresBasetenAuth(_ client: ClientStatus) -> Bool {
     guard client.enabled else { return false }
+    if !client.allowNative { return true }
     if client.effectiveRoute == "baseten" { return true }
     if client.unmatchedNativeModel?.effectiveRoute == "baseten" { return true }
     return client.families.contains { $0.effectiveRoute == "baseten" }
@@ -121,8 +122,10 @@ func authAttention(
     if auth.health == "refresh_failed" { return .reauthenticate }
     guard auth.health == "signed_out",
           !auth.fallbackInUse,
-          globalRoutingEnabled,
-          clients.contains(where: clientRequiresBasetenAuth) else {
+          clients.contains(where: {
+              clientRequiresBasetenAuth($0)
+                  && (globalRoutingEnabled || !$0.allowNative)
+          }) else {
         return .none
     }
     return .signIn
@@ -272,6 +275,7 @@ func globalRoutingSubtitle(gatewayUp: Bool,
 func clientDisplayName(_ name: String) -> String {
     switch name {
     case "claude-code": return "Claude Code"
+    case "claude-desktop": return "Claude Desktop"
     case "codex": return "Codex"
     case "opencode": return "OpenCode"
     default: return name
@@ -282,6 +286,7 @@ func clientDisplayName(_ name: String) -> String {
 func clientIconName(_ name: String) -> String {
     switch name {
     case "claude-code": return "terminal"
+    case "claude-desktop": return "desktopcomputer"
     case "codex": return "chevron.left.forwardslash.chevron.right"
     case "opencode": return "curlybraces"
     default: return "app.dashed"
@@ -291,6 +296,9 @@ func clientIconName(_ name: String) -> String {
 /// A compact destination label for the quick-switch row. It formats only
 /// fields already resolved by the gateway and never computes a route.
 func routingDestinationLabel(_ client: ClientStatus) -> String {
+    if !client.allowNative {
+        return client.currentlyBound ? "Baseten gateway" : "Gateway unavailable"
+    }
     if client.fallbackActive {
         let native = client.nativeRoute.isEmpty ? "native" : client.nativeRoute
         return "Fallback · \(capitalizeFamily(native))"

@@ -278,7 +278,7 @@ func normalizeMutationInvocation(args []string) ([]string, error) {
 		return nil, fmt.Errorf("mutation options require an on, off, claude, codex, config, or mutation command")
 	}
 	command := args[i]
-	if command != "on" && command != "off" && command != "claude" && command != "codex" && command != "config" && command != "mutation" {
+	if command != "on" && command != "off" && command != "claude" && command != "claude-desktop" && command != "codex" && command != "config" && command != "mutation" {
 		return nil, fmt.Errorf("mutation options are supported only by on, off, claude, codex, config fallback, and mutation reconcile")
 	}
 	if command == "config" && (i+1 >= len(args) || args[i+1] != "fallback") {

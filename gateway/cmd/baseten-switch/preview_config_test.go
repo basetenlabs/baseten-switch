@@ -114,3 +114,13 @@ door:
 		t.Fatalf("stderr = %q, want bind_addr refusal", stderr.String())
 	}
 }
+
+func TestPreviewConfigParsesDesktopIsolationAddress(t *testing.T) {
+	got, err := parsePreviewConfigArgs([]string{"--path", "/tmp/preview/gateway.yaml", "--root", "/tmp/preview", "--router-addr", "127.0.0.1:45372", "--door-addr", "127.0.0.1:45371", "--desktop-addr", "127.0.0.1:45374"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.policy().DesktopAddr != "127.0.0.1:45374" {
+		t.Fatalf("Desktop policy address = %q", got.policy().DesktopAddr)
+	}
+}
