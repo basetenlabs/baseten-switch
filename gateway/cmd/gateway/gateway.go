@@ -2748,6 +2748,9 @@ func (g *Gateway) buildAttemptTargetWithSnapshot(
 	default:
 		res = proxy.RewriteModelInBody(body, "")
 	}
+	if rt == "baseten" {
+		res.NewBody = raiseMaxTokensFloor(res.NewBody)
+	}
 	modelForCost := res.UpstreamModel
 	if modelForCost == "" {
 		modelForCost = res.RequestedModel
@@ -2797,6 +2800,42 @@ func (g *Gateway) buildAttemptTargetWithSnapshot(
 		normalizeAnthropicUsage:    rt == "baseten" && upShape == "anthropic",
 		strippedToolTypes:          strippedTypes,
 	}, nil
+}
+
+// basetenMinMaxTokens is the smallest output-token limit Baseten
+// deployments accept; lower values fail with HTTP 400 ("max_tokens must
+// be at least 2"). Claude Desktop's model health check sends 1.
+const basetenMinMaxTokens = 2
+
+var maxTokensFields = []string{"max_tokens", "max_completion_tokens", "max_output_tokens"}
+
+// raiseMaxTokensFloor lifts any output-token limit below
+// basetenMinMaxTokens to the floor. Absent fields stay absent, and the
+// body is returned untouched when nothing changes or it does not parse.
+func raiseMaxTokensFloor(body []byte) []byte {
+	if !bytes.Contains(body, []byte(`"max_`)) {
+		return body
+	}
+	var data map[string]json.RawMessage
+	if err := json.Unmarshal(body, &data); err != nil {
+		return body
+	}
+	changed := false
+	for _, field := range maxTokensFields {
+		var n float64
+		if raw, ok := data[field]; ok && json.Unmarshal(raw, &n) == nil && n < basetenMinMaxTokens {
+			data[field] = json.RawMessage(strconv.Itoa(basetenMinMaxTokens))
+			changed = true
+		}
+	}
+	if !changed {
+		return body
+	}
+	nb, err := json.Marshal(data)
+	if err != nil {
+		return body
+	}
+	return nb
 }
 
 // stripAndRewriteResponses applies the responses tool-type strip and
