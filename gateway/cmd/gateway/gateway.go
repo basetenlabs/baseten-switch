@@ -2748,6 +2748,9 @@ func (g *Gateway) buildAttemptTargetWithSnapshot(
 	default:
 		res = proxy.RewriteModelInBody(body, "")
 	}
+	if rt == "baseten" {
+		res.NewBody = raiseMaxTokensFloor(res.NewBody)
+	}
 	modelForCost := res.UpstreamModel
 	if modelForCost == "" {
 		modelForCost = res.RequestedModel
@@ -2797,6 +2800,41 @@ func (g *Gateway) buildAttemptTargetWithSnapshot(
 		normalizeAnthropicUsage:    rt == "baseten" && upShape == "anthropic",
 		strippedToolTypes:          strippedTypes,
 	}, nil
+}
+
+// basetenMaxTokensFloor is Switch's compatibility floor for explicit
+// output-token limits on Baseten-bound requests.
+const basetenMaxTokensFloor = 8
+
+var maxTokensFields = []string{"max_tokens", "max_completion_tokens", "max_output_tokens"}
+
+// raiseMaxTokensFloor lifts any output-token limit below
+// basetenMaxTokensFloor to the floor. Absent fields stay absent, and the
+// body is returned untouched when nothing changes or it does not parse.
+func raiseMaxTokensFloor(body []byte) []byte {
+	if !bytes.Contains(body, []byte(`"max_`)) {
+		return body
+	}
+	var data map[string]json.RawMessage
+	if err := json.Unmarshal(body, &data); err != nil {
+		return body
+	}
+	changed := false
+	for _, field := range maxTokensFields {
+		var n *float64
+		if raw, ok := data[field]; ok && json.Unmarshal(raw, &n) == nil && n != nil && *n < basetenMaxTokensFloor {
+			data[field] = json.RawMessage(strconv.Itoa(basetenMaxTokensFloor))
+			changed = true
+		}
+	}
+	if !changed {
+		return body
+	}
+	nb, err := json.Marshal(data)
+	if err != nil {
+		return body
+	}
+	return nb
 }
 
 // stripAndRewriteResponses applies the responses tool-type strip and
