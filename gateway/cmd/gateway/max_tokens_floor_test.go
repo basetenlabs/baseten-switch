@@ -9,8 +9,7 @@ import (
 	"testing"
 )
 
-// Claude Desktop's model health check sends max_tokens:1; Baseten
-// deployments reject anything below 2, so the gateway must raise it.
+// Small explicit limits use the compatibility floor on Desktop requests.
 func TestDesktopMaxTokensFloorReachesBaseten(t *testing.T) {
 	model := desktopModelID("claude-baseten-alpha", "example/Alpha")
 	for _, test := range []struct {
@@ -20,13 +19,16 @@ func TestDesktopMaxTokensFloorReachesBaseten(t *testing.T) {
 		upstream string
 		stream   bool
 	}{
-		{name: "one", field: `,"max_tokens":1`, want: 2.0},
-		{name: "zero", field: `,"max_tokens":0`, want: 2.0},
-		{name: "two", field: `,"max_tokens":2`, want: 2.0},
+		{name: "one", field: `,"max_tokens":1`, want: 8.0},
+		{name: "zero", field: `,"max_tokens":0`, want: 8.0},
+		{name: "two", field: `,"max_tokens":2`, want: 8.0},
+		{name: "below floor", field: `,"max_tokens":7`, want: 8.0},
+		{name: "at floor", field: `,"max_tokens":8`, want: 8.0},
+		{name: "above floor", field: `,"max_tokens":9`, want: 9.0},
 		{name: "large", field: `,"max_tokens":32000`, want: 32000.0},
 		{name: "absent", want: nil},
-		{name: "streaming", field: `,"max_tokens":1`, want: 2.0, stream: true},
-		{name: "translated openai upstream", field: `,"max_tokens":1`, want: 2.0, upstream: "openai"},
+		{name: "streaming", field: `,"max_tokens":1`, want: 8.0, stream: true},
+		{name: "translated openai upstream", field: `,"max_tokens":1`, want: 8.0, upstream: "openai"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var got map[string]any
@@ -76,10 +78,13 @@ func TestBuildAttemptMaxTokensFloor(t *testing.T) {
 		field                   string
 		want                    any
 	}{
-		{name: "claude-code messages", route: "baseten", kind: "messages", body: `{"model":"claude-opus-4-8","max_tokens":1}`, cfg: resolvedAnthropicBaseten, field: "max_tokens", want: 2.0},
-		{name: "codex chat max_tokens", route: "baseten", kind: "chat", body: `{"model":"m","max_tokens":1}`, cfg: openAIBaseten, field: "max_tokens", want: 2.0},
-		{name: "codex chat max_completion_tokens", route: "baseten", kind: "chat", body: `{"model":"m","max_completion_tokens":1}`, cfg: openAIBaseten, field: "max_completion_tokens", want: 2.0},
-		{name: "codex responses max_output_tokens", route: "baseten", kind: "responses", body: `{"model":"m","max_output_tokens":1}`, cfg: openAIBaseten, field: "max_output_tokens", want: 2.0},
+		{name: "claude-code messages", route: "baseten", kind: "messages", body: `{"model":"claude-opus-4-8","max_tokens":1}`, cfg: resolvedAnthropicBaseten, field: "max_tokens", want: 8.0},
+		{name: "codex chat max_tokens", route: "baseten", kind: "chat", body: `{"model":"m","max_tokens":1}`, cfg: openAIBaseten, field: "max_tokens", want: 8.0},
+		{name: "codex chat max_completion_tokens", route: "baseten", kind: "chat", body: `{"model":"m","max_completion_tokens":1}`, cfg: openAIBaseten, field: "max_completion_tokens", want: 8.0},
+		{name: "codex responses max_output_tokens", route: "baseten", kind: "responses", body: `{"model":"m","max_output_tokens":1}`, cfg: openAIBaseten, field: "max_output_tokens", want: 8.0},
+		{name: "null max_tokens", route: "baseten", kind: "chat", body: `{"model":"m","max_tokens":null}`, cfg: openAIBaseten, field: "max_tokens", want: nil},
+		{name: "null max_completion_tokens", route: "baseten", kind: "chat", body: `{"model":"m","max_completion_tokens":null}`, cfg: openAIBaseten, field: "max_completion_tokens", want: nil},
+		{name: "null max_output_tokens", route: "baseten", kind: "responses", body: `{"model":"m","max_output_tokens":null}`, cfg: openAIBaseten, field: "max_output_tokens", want: nil},
 		{name: "large untouched", route: "baseten", kind: "chat", body: `{"model":"m","max_completion_tokens":4096}`, cfg: openAIBaseten, field: "max_completion_tokens", want: 4096.0},
 		{name: "native anthropic fallback untouched", route: "anthropic", kind: "messages", body: `{"model":"claude-opus-4-8","max_tokens":1}`, cfg: resolvedAnthropicBaseten, field: "max_tokens", want: 1.0},
 		{name: "native openai untouched", route: "openai", kind: "responses", body: `{"model":"m","max_output_tokens":1}`, cfg: openAIBaseten, field: "max_output_tokens", want: 1.0},
@@ -107,7 +112,7 @@ func openAIBaseten(t *testing.T) resolvedClientConfig {
 }
 
 func TestRaiseMaxTokensFloorKeepsBytesWhenUnchanged(t *testing.T) {
-	for _, body := range []string{`{"model":"m"}`, `{"model":"m","max_tokens":2}`, `{"max_tokens":"x"}`, `{"model":`} {
+	for _, body := range []string{`{"model":"m"}`, `{"model":"m","max_tokens":8}`, `{"max_tokens":null}`, `{"max_completion_tokens":null}`, `{"max_output_tokens":null}`, `{"max_tokens":"x"}`, `{"model":`} {
 		if got := string(raiseMaxTokensFloor([]byte(body))); got != body {
 			t.Fatalf("body %s rewritten to %s", body, got)
 		}

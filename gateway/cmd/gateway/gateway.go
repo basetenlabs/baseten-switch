@@ -2802,15 +2802,14 @@ func (g *Gateway) buildAttemptTargetWithSnapshot(
 	}, nil
 }
 
-// basetenMinMaxTokens is the smallest output-token limit Baseten
-// deployments accept; lower values fail with HTTP 400 ("max_tokens must
-// be at least 2"). Claude Desktop's model health check sends 1.
-const basetenMinMaxTokens = 2
+// basetenMaxTokensFloor is Switch's compatibility floor for explicit
+// output-token limits on Baseten-bound requests.
+const basetenMaxTokensFloor = 8
 
 var maxTokensFields = []string{"max_tokens", "max_completion_tokens", "max_output_tokens"}
 
 // raiseMaxTokensFloor lifts any output-token limit below
-// basetenMinMaxTokens to the floor. Absent fields stay absent, and the
+// basetenMaxTokensFloor to the floor. Absent fields stay absent, and the
 // body is returned untouched when nothing changes or it does not parse.
 func raiseMaxTokensFloor(body []byte) []byte {
 	if !bytes.Contains(body, []byte(`"max_`)) {
@@ -2822,9 +2821,9 @@ func raiseMaxTokensFloor(body []byte) []byte {
 	}
 	changed := false
 	for _, field := range maxTokensFields {
-		var n float64
-		if raw, ok := data[field]; ok && json.Unmarshal(raw, &n) == nil && n < basetenMinMaxTokens {
-			data[field] = json.RawMessage(strconv.Itoa(basetenMinMaxTokens))
+		var n *float64
+		if raw, ok := data[field]; ok && json.Unmarshal(raw, &n) == nil && n != nil && *n < basetenMaxTokensFloor {
+			data[field] = json.RawMessage(strconv.Itoa(basetenMaxTokensFloor))
 			changed = true
 		}
 	}
