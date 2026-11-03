@@ -35,14 +35,14 @@ jobs:
       attestations: write
     steps:
       - name: Check out the selected tag
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: chainguard-actions/actions-checkout@37298d8de412b35988dd165ffae45f45b329d365 # v7.0.1
         with:
           ref: refs/tags/${{ inputs.release_tag }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: chainguard-actions/actions-setup-go@a23f604fa6ac04bc887d814b1cf828c9fbaf51a7 # v7.0.0
         with:
           go-version-file: gateway/go.mod
           cache-dependency-path: gateway/go.sum
@@ -145,12 +145,12 @@ jobs:
           } >>"$GITHUB_OUTPUT"
 
       - name: Attest the exact final ZIP
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        uses: chainguard-actions/actions-attest@fd7c311a2ded9db8e69c205f3442b52a1547b2f9 # v4.2.2
         with:
           subject-path: ${{ steps.formula.outputs.artifact }}
 
       - name: Preserve formula and tap patch as workflow artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: chainguard-actions/actions-upload-artifact@7d21b863ba4fc97f698d6c451875ee6cf043953a # v7.0.1
         with:
           name: baseten-switch-${{ inputs.release_tag }}-homebrew
           path: |
@@ -195,20 +195,20 @@ jobs:
       actions: read
     steps:
       - name: Check out the verified release commit
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: chainguard-actions/actions-checkout@37298d8de412b35988dd165ffae45f45b329d365 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.release_commit }}
           persist-credentials: false
 
       - name: Download the formula from this release run
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: chainguard-actions/actions-download-artifact@870c1dcb0e6fdf15dcac84d72470ef41e4b7b99c # v8.0.1
         with:
           name: baseten-switch-${{ inputs.release_tag }}-homebrew
           path: ${{ runner.temp }}/homebrew-release
 
       - name: Create token for the Homebrew tap
         id: tap-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: chainguard-actions/actions-create-github-app-token@da9eff8b152366888336d79a4b4e69cfe07257d8 # v3.2.0
         with:
           client-id: ${{ secrets.APP_HOMEBREW_UPDATER_CLIENT_ID }}
           private-key: ${{ secrets.APP_HOMEBREW_UPDATER_PRIVATE_KEY }}
