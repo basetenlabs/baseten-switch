@@ -116,6 +116,67 @@ final class ClaudeDesktopConfigurationTests: XCTestCase {
         XCTAssertThrowsError(try store().apply(appVersion: version, connection: connection, isClaudeRunning: { false }))
     }
 
+    func testManualConnectionRecognitionIgnoresLocalKeyAndUnrelatedSettings() throws {
+        let entry = library.appendingPathComponent("\(defaultID).json")
+        let meta = library.appendingPathComponent("_meta.json")
+        let config = root.appendingPathComponent("claude_desktop_config.json")
+        try write(["appliedId": defaultID, "entries": [["id": defaultID, "name": "Local gateway"]]], to: meta)
+        try write(["deploymentMode": "3p"], to: config)
+        let settings: [String: Any] = [
+            "inferenceProvider": "gateway",
+            "inferenceGatewayBaseUrl": "http://127.0.0.1:45274",
+            "inferenceCredentialKind": "static",
+            "inferenceGatewayApiKey": "synthetic-local-key",
+            "inferenceGatewayAuthScheme": "bearer",
+        ]
+        for preferences in [[:], ["chatTabEnabled": false, "autoModeEnabled": true, "extra": "preserved"]] as [[String: Any]] {
+            try write(settings.merging(preferences) { _, new in new }, to: entry)
+            let before = try [entry, meta, config].map { try Data(contentsOf: $0) }
+            XCTAssertTrue(store().isConfigured(connection: connection))
+            XCTAssertEqual(try [entry, meta, config].map { try Data(contentsOf: $0) }, before)
+            XCTAssertFalse(fm.fileExists(atPath: state.path))
+        }
+    }
+
+    func testManualConnectionRecognitionRejectsIncompatibleOrMalformedSettings() throws {
+        let entry = library.appendingPathComponent("\(defaultID).json")
+        try write(["appliedId": defaultID, "entries": [["id": defaultID, "name": "Local gateway"]]],
+                  to: library.appendingPathComponent("_meta.json"))
+        try write(["deploymentMode": "3p"], to: root.appendingPathComponent("claude_desktop_config.json"))
+        let settings: [String: Any] = [
+            "inferenceProvider": "gateway",
+            "inferenceGatewayBaseUrl": "http://127.0.0.1:45274",
+            "inferenceCredentialKind": "static",
+            "inferenceGatewayApiKey": "synthetic-local-key",
+            "inferenceGatewayAuthScheme": "bearer",
+        ]
+        let invalid: [(String, Any)] = [
+            ("inferenceProvider", "firstParty"),
+            ("inferenceGatewayBaseUrl", "http://127.0.0.1:45374"),
+            ("inferenceGatewayBaseUrl", "http://example.invalid:45274"),
+            ("inferenceCredentialKind", "helper-script"),
+            ("inferenceGatewayAuthScheme", "unsupported"),
+            ("inferenceGatewayApiKey", ""),
+            ("inferenceGatewayApiKey", " \n\t"),
+            ("inferenceGatewayApiKey", 1),
+            ("inferenceGatewayApiKey", NSNull()),
+        ]
+        for (field, value) in invalid {
+            var changed = settings
+            changed[field] = value
+            try write(changed, to: entry)
+            XCTAssertFalse(store().isConfigured(connection: connection), field)
+        }
+        for field in settings.keys {
+            var changed = settings
+            changed.removeValue(forKey: field)
+            try write(changed, to: entry)
+            XCTAssertFalse(store().isConfigured(connection: connection), field)
+        }
+        try Data("{".utf8).write(to: entry)
+        XCTAssertFalse(store().isConfigured(connection: connection))
+    }
+
     func testUppercaseLibraryAndOwnershipIDsAreRefusedBeforeWrites() throws {
         let uppercaseID = "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"
         let metaURL = library.appendingPathComponent("_meta.json")
