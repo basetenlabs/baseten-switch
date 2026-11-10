@@ -120,6 +120,38 @@ final class ClaudeDesktopSetupTests: XCTestCase {
     }
 
     @MainActor
+    func testLoadRecognizesExistingManualConnectionWithoutWritesOrRestart() throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: library, withIntermediateDirectories: true)
+        let id = "11111111-1111-4111-8111-111111111111"
+        let files: [(URL, [String: Any])] = [
+            (library.appendingPathComponent("_meta.json"),
+             ["appliedId": id, "entries": [["id": id, "name": "Local gateway"]]]),
+            (library.appendingPathComponent("\(id).json"), [
+                "inferenceProvider": "gateway",
+                "inferenceGatewayBaseUrl": "http://127.0.0.1:45274",
+                "inferenceCredentialKind": "static",
+                "inferenceGatewayApiKey": "synthetic-local-key",
+                "inferenceGatewayAuthScheme": "bearer",
+                "extra": "preserved",
+            ]),
+            (support.appendingPathComponent("Claude-3p/claude_desktop_config.json"), ["deploymentMode": "3p"]),
+        ]
+        for (url, object) in files {
+            try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]).write(to: url)
+        }
+        let before = try files.map { try Data(contentsOf: $0.0) }
+        let app = SetupApplication()
+        let setup = ClaudeDesktopSetup(store: store(), application: app)
+        setup.load(connection: connection)
+        XCTAssertEqual(setup.phase, .configured)
+        XCTAssertFalse(setup.connectionIsConfirmed(by: nil, isCurrent: true))
+        XCTAssertTrue(app.events.isEmpty)
+        XCTAssertEqual(try files.map { try Data(contentsOf: $0.0) }, before)
+        XCTAssertFalse(fm.fileExists(atPath: support.appendingPathComponent("Baseten Switch").path))
+    }
+
+    @MainActor
     func testUnsupportedVersionNeverQuitsOrWrites() async throws {
         let app = SetupApplication()
         app.version = "9.0.0"

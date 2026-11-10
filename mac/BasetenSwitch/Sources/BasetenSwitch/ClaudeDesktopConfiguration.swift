@@ -154,8 +154,13 @@ struct ClaudeDesktopConfigurationStore {
                   entries.contains(where: { $0["id"] as? String == id }),
                   try object(at: root.appendingPathComponent("claude_desktop_config.json"))["deploymentMode"] as? String == "3p",
                   let file = try snapshot(library.appendingPathComponent("\(id).json")) else { return false }
-            return try NSDictionary(dictionary: JSONSerialization.jsonObject(with: file.data) as? [String: Any] ?? [:])
-                .isEqual(to: JSONSerialization.jsonObject(with: connection.configurationData()) as? [String: Any] ?? [:])
+            let settings = try object(file.data)
+            return settings["inferenceProvider"] as? String == "gateway"
+                && settings["inferenceGatewayBaseUrl"] as? String == connection.baseURL
+                && settings["inferenceCredentialKind"] as? String == "static"
+                && settings["inferenceGatewayAuthScheme"] as? String == connection.authScheme
+                && (settings["inferenceGatewayApiKey"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
         } catch { return false }
     }
 
