@@ -25,10 +25,10 @@
         let
           # Keep Nix builds on the same compiler as go.mod.
           go = pkgs.go_1_26.overrideAttrs (finalAttrs: _: {
-            version = "1.26.10";
+            version = "1.26.11";
             src = pkgs.fetchurl {
               url = "https://go.dev/dl/go${finalAttrs.version}.src.tar.gz";
-              hash = "sha256-/WPog7ovK/ypPBZGsx6+9j4rHk0rMXyXidl2po2B828=";
+              hash = "sha256-1EEBsP8n7SpMda1GwXucdDWSCeLrLKfJ32y0/baOGWk=";
             };
           });
           buildGoModule = pkgs.buildGoModule.override { inherit go; };
