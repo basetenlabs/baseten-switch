@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: chainguard-actions/actions-checkout@37298d8de412b35988dd165ffae45f45b329d365 # v7.0.1
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -35,12 +35,12 @@ jobs:
         working-directory: gateway
     steps:
       - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: chainguard-actions/actions-checkout@37298d8de412b35988dd165ffae45f45b329d365 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: chainguard-actions/actions-setup-go@a23f604fa6ac04bc887d814b1cf828c9fbaf51a7 # v7.0.0
         with:
           go-version-file: gateway/go.mod
           cache-dependency-path: gateway/go.sum
@@ -56,10 +56,10 @@ jobs:
         working-directory: gateway
     steps:
       - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: chainguard-actions/actions-checkout@37298d8de412b35988dd165ffae45f45b329d365 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: chainguard-actions/actions-setup-go@a23f604fa6ac04bc887d814b1cf828c9fbaf51a7 # v7.0.0
         with:
           go-version-file: gateway/go.mod
           cache-dependency-path: gateway/go.sum
@@ -79,10 +79,10 @@ jobs:
     runs-on: macos-15
     steps:
       - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: chainguard-actions/actions-checkout@37298d8de412b35988dd165ffae45f45b329d365 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: chainguard-actions/actions-setup-go@a23f604fa6ac04bc887d814b1cf828c9fbaf51a7 # v7.0.0
         with:
           go-version-file: gateway/go.mod
           cache-dependency-path: gateway/go.sum

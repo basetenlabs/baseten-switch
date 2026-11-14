@@ -30,7 +30,7 @@ for permission in 'contents: write' 'id-token: write' 'attestations: write'; do
 done
 
 while IFS= read -r action; do
-    [[ "$action" =~ ^actions/[a-z0-9-]+@[0-9a-f]{40}$ ]] \
+    [[ "$action" =~ ^chainguard-actions/actions-[a-z0-9-]+@[0-9a-f]{40}$ ]] \
         || fail "action is not allowlisted and pinned to a full commit SHA: $action"
 done < <(
     sed -nE 's/^[[:space:]]+uses:[[:space:]]+([^[:space:]#]+).*/\1/p' "$WORKFLOW"
@@ -97,7 +97,7 @@ check(Array(publisher["needs"]) == ["prepare"] && !publisher.key?("if"),
 check(publisher.fetch("permissions") == {"contents" => "read", "actions" => "read"},
       "Homebrew job must keep its workflow token read-only")
 steps = publisher.fetch("steps")
-checkout = steps.find { |step| step.fetch("uses", "").start_with?("actions/checkout@") }
+checkout = steps.find { |step| step.fetch("uses", "").start_with?("chainguard-actions/actions-checkout@") }
 check(checkout && checkout.fetch("with")["ref"] == '${{ needs.prepare.outputs.release_commit }}' &&
       checkout.fetch("with")["persist-credentials"] == false,
       "Homebrew source must be the verified release commit without persisted credentials")
@@ -108,14 +108,14 @@ check(verification && verification.fetch("run").include?('git verify-tag "$RELEA
       verification.fetch("run").include?('git rev-parse "HEAD^{commit}"'),
       "published source commit must come from signed tag verification")
 
-download = steps.find { |step| step.fetch("uses", "").start_with?("actions/download-artifact@") }
-upload = prepare.fetch("steps").find { |step| step.fetch("uses", "").start_with?("actions/upload-artifact@") }
+download = steps.find { |step| step.fetch("uses", "").start_with?("chainguard-actions/actions-download-artifact@") }
+upload = prepare.fetch("steps").find { |step| step.fetch("uses", "").start_with?("chainguard-actions/actions-upload-artifact@") }
 check(download && upload && download.fetch("with")["name"] == upload.fetch("with")["name"] &&
       download.fetch("with").keys.sort == ["name", "path"],
       "Homebrew formula must come from the matching artifact in this release run")
 check(download.fetch("with")["name"] == 'baseten-switch-${{ inputs.release_tag }}-homebrew',
       "Homebrew artifact must match the selected release")
-token_steps = steps.select { |step| step.fetch("uses", "").start_with?("actions/create-github-app-token@") }
+token_steps = steps.select { |step| step.fetch("uses", "").start_with?("chainguard-actions/actions-create-github-app-token@") }
 check(token_steps.length == 1, "Homebrew publication requires one scoped app token")
 token = token_steps.first
 token_inputs = token.fetch("with")
