@@ -147,7 +147,7 @@ To restore the Claude Code setting that existed before setup:
 baseten-switch claude off
 ```
 
-## Claude Desktop pilot
+## Claude Desktop Beta
 
 Open **Clients → Claude Desktop** in Switch. Use **Manage models** to choose the
 Baseten models offered to Claude, then choose **Connect Claude Desktop…**. Switch
@@ -177,7 +177,7 @@ Choose **Apply Changes**, then **Save & Restart**.
 Each selected model has a stable, opaque discovery ID, with its model name shown
 separately. Removing a model prevents new requests using either its discovery ID
 or saved routing alias; it does not retarget old IDs to a different model. After
-upgrading the pilot, restart Claude and reselect a model if an existing
+upgrading the beta, restart Claude and reselect a model if an existing
 conversation still refers to an older picker ID. Quit and reopen Claude after
 adding, removing, or reordering models. Switch shows a **Restart Claude Desktop**
 notice while model-list changes are pending. Make several edits, then use its
@@ -187,7 +187,7 @@ action does not repeat gateway setup. **Refresh models** reloads the available
 Baseten catalog in Switch; it does not refresh Claude's cached picker.
 Switch keeps the Baseten provider credential in its existing credential store.
 
-This pilot uses Baseten-hosted open models with local conversation history.
+This beta uses Baseten-hosted open models with local conversation history.
 Standard Claude account history and subscription routing are separate. Use
 Desktop's standard Anthropic sign-in choice to return to its standard experience.
 Like Claude Code, the Desktop picker offers Baseten catalog models for users to
