@@ -15,9 +15,10 @@ import (
 // this type validates the parsed configuration values that can affect runtime
 // paths, credentials, and listeners.
 type PreviewPolicy struct {
-	Root       string
-	RouterAddr string
-	DoorAddr   string
+	Root        string
+	RouterAddr  string
+	DoorAddr    string
+	DesktopAddr string
 }
 
 // BuildPreviewConfig parses a Stable config without expanding environment
@@ -57,6 +58,9 @@ func BuildPreviewConfig(source *File, policy PreviewPolicy) (*File, error) {
 	for i := range out.Clients {
 		client := &out.Clients[i]
 		client.BindAddr = policy.RouterAddr
+		if !IsNativeAllowed(*client) {
+			client.BindAddr = policy.desktopAddress()
+		}
 		if client.AuthToken == nil {
 			continue
 		}
@@ -130,10 +134,20 @@ func ValidatePreviewConfig(file *File, policy PreviewPolicy) error {
 		return fmt.Errorf("preview config: at least one client is required")
 	}
 	for _, client := range file.Clients {
-		if client.BindAddr != policy.RouterAddr {
+		wantBind := policy.RouterAddr
+		if !IsNativeAllowed(client) {
+			wantBind = policy.desktopAddress()
+			if err := validatePreviewAddress("desktop", wantBind); err != nil {
+				return err
+			}
+			if wantBind == policy.RouterAddr || wantBind == policy.DoorAddr {
+				return fmt.Errorf("preview config: Desktop address must differ from router and door addresses")
+			}
+		}
+		if client.BindAddr != wantBind {
 			return fmt.Errorf(
 				"preview config: client %q bind_addr %q must be %q",
-				client.Name, client.BindAddr, policy.RouterAddr)
+				client.Name, client.BindAddr, wantBind)
 		}
 		if client.AuthToken == nil || client.AuthToken.Value == "" {
 			continue
@@ -179,4 +193,13 @@ func validatePreviewAddress(component, address string) error {
 		return fmt.Errorf("preview config: invalid %s port %q", component, portText)
 	}
 	return nil
+}
+
+// desktopAddress keeps existing Preview callers compatible while reserving a
+// direct listener outside the native-capable door/router pair.
+func (p PreviewPolicy) desktopAddress() string {
+	if p.DesktopAddr != "" {
+		return p.DesktopAddr
+	}
+	return "127.0.0.1:45374"
 }

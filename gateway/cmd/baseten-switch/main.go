@@ -106,6 +106,8 @@ func dispatch(args []string) int {
 		return withUpdateNotice(args, cmdDoctor(args[1:]))
 	case "claude":
 		return cmdClaude(args[1:])
+	case "claude-desktop":
+		return cmdClaudeDesktop(args[1:])
 	case "codex":
 		return cmdCodex(args[1:])
 	case "pi":
@@ -354,7 +356,7 @@ order. Exit 0 when nothing fails, 1 on a failed check, and 2 on usage error.
 The diagnosis names the first failure and its concrete fix.
 
   --json     Emit the check array as JSON
-  --probe    Add live 2-token requests through healthy door ports
+  --probe    Add live 2-token requests through healthy client endpoints
   --verbose  Expand passing sections
   --fix      Confirm and apply automatable fixes, re-running after each
   --yes      Auto-confirm probe cost and fix prompts
@@ -388,6 +390,26 @@ edits use SIGHUP and live verification, not a restart.
 
 reasoning configures a catalog-validated, Claude Code-only reasoning policy
 for the final Baseten model.
+`},
+	{"claude-desktop", "Configure the independent Claude Desktop gateway", `Usage:
+  baseten-switch claude-desktop setup [mutation options]
+  baseten-switch claude-desktop status --json
+  baseten-switch claude-desktop models add <slug> [--alias <alias>] [--dry-run --json]
+  baseten-switch claude-desktop models remove <alias>
+  baseten-switch claude-desktop models move <alias> --before <alias>
+
+setup creates or enables only the local Desktop listener. It does not start
+services or change Claude Desktop settings. status prints derived setup fields,
+saved models, listener state, Baseten auth state, and recent request evidence.
+Configure Desktop through its gateway setup using these displayed fields.
+
+Model changes apply individually. Restart Desktop to refresh its model picker.
+Removed aliases remain recorded, but requests for removed models fail locally.
+The Desktop gateway stays active when traditional routing overrides are Off.
+
+Mutation options: --json, --operation-id, --if-config-hash, --if-active-token.
+BASETEN_SWITCH_CLAUDE_DESKTOP_ADDR selects the initial loopback listener address;
+the default is 127.0.0.1:45274. Existing saved addresses are preserved.
 `},
 	{"codex", "Manage the opt-in Codex gateway profile", `Usage:
   baseten-switch codex on|off|status
@@ -468,6 +490,8 @@ func commandOptionConsumesValue(args []string, index int) bool {
 		return len(args) > 1 &&
 			(args[1] == "route" || args[1] == "subagents" || args[1] == "reasoning") &&
 			mutationValue
+	case "claude-desktop":
+		return mutationValue || option == "--alias" || option == "--before"
 	case "codex":
 		return len(args) > 1 &&
 			(args[1] == "route" || args[1] == "reasoning") &&

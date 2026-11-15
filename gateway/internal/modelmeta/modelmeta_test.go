@@ -89,3 +89,9 @@ func TestResolveClaudeFamilySupportsCatalogAndFutureFamilies(t *testing.T) {
 		})
 	}
 }
+
+func TestCuratedDisplayNamePreservesCaseAndPath(t *testing.T) {
+	if got := HumanizeDisplayName("Example/DeepSeek-V4.1-Flash-1017"); got != "Example/DeepSeek V4.1 Flash 1017" {
+		t.Fatal(got)
+	}
+}

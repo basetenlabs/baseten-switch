@@ -79,6 +79,7 @@ private actor RecordingAuthWorkflow: AdminStatusReading, AuthReloading,
     private let suspendFirstReload: Bool
     private let suspendFirstStatus: Bool
     private let suspendFirstCatalog: Bool
+    private var failNextCatalog: Bool
     private var firstReloadStarted = false
     private var firstReloadContinuation: CheckedContinuation<Void, Never>?
     private var firstStatusStarted = false
@@ -95,7 +96,8 @@ private actor RecordingAuthWorkflow: AdminStatusReading, AuthReloading,
         reloadDelayNanoseconds: UInt64 = 0,
         suspendFirstReload: Bool = false,
         suspendFirstStatus: Bool = false,
-        suspendFirstCatalog: Bool = false
+        suspendFirstCatalog: Bool = false,
+        failFirstCatalog: Bool = false
     ) {
         self.statuses = statuses
         self.catalogs = catalogs
@@ -104,6 +106,7 @@ private actor RecordingAuthWorkflow: AdminStatusReading, AuthReloading,
         self.suspendFirstReload = suspendFirstReload
         self.suspendFirstStatus = suspendFirstStatus
         self.suspendFirstCatalog = suspendFirstCatalog
+        self.failNextCatalog = failFirstCatalog
     }
 
     func reloadAuth() async throws -> AuthStatus {
@@ -145,12 +148,15 @@ private actor RecordingAuthWorkflow: AdminStatusReading, AuthReloading,
             throw GatewayClientError.invalidPayload
         }
         let snapshot = catalogs.removeFirst()
+        let shouldFail = failNextCatalog
+        failNextCatalog = false
         if suspendFirstCatalog, !firstCatalogStarted {
             firstCatalogStarted = true
             await withCheckedContinuation { continuation in
                 firstCatalogContinuation = continuation
             }
         }
+        if shouldFail { throw URLError(.networkConnectionLost) }
         return snapshot
     }
 
@@ -1430,5 +1436,91 @@ final class ModelCatalogTests: XCTestCase {
             modelCatalogReader: modelCatalogReader,
             loginItemService: ModelCatalogLoginItemService(),
             startPolling: false)
+    }
+}
+
+extension ModelCatalogTests {
+    @MainActor
+    func testHealthyLoginRetriesFailedOrEmptyCatalogOnce() async {
+        for initial in [catalogSnapshot(state: .error, error: "Unavailable"), catalogSnapshot(state: .ready)] {
+            let ready = catalogSnapshot(state: .ready, models: [liveModel("example/recovered")])
+            let workflow = RecordingAuthWorkflow(
+                statuses: [
+                    adminSnapshot(signedIn: false, health: "signed_out"),
+                    adminSnapshot(signedIn: true, health: "ok"),
+                    adminSnapshot(signedIn: true, health: "ok"),
+                ], catalogs: [initial, ready])
+            let state = makeState(adminReader: workflow, authReloader: workflow, modelCatalogReader: workflow)
+            await state.refresh()
+            state.requestModelCatalogRefresh()
+            await state.waitForModelCatalogRefresh()
+            await state.refresh()
+            await state.waitForModelCatalogRefresh()
+            await state.refresh()
+            XCTAssertEqual(state.liveModelCatalogState, .ready(ready.models))
+            let events = await workflow.events
+            XCTAssertEqual(events, ["status", "catalog", "status", "catalog", "status"])
+        }
+    }
+
+    @MainActor
+    func testLoginRetriesAnEarlierInFlightCatalogErrorOnce() async {
+        let ready = catalogSnapshot(state: .ready, models: [liveModel("example/recovered")])
+        let workflow = RecordingAuthWorkflow(
+            statuses: [
+                adminSnapshot(signedIn: false, health: "signed_out"),
+                adminSnapshot(signedIn: true, health: "ok"),
+            ], catalogs: [catalogSnapshot(state: .error, error: "Unavailable"), ready], suspendFirstCatalog: true)
+        let state = makeState(adminReader: workflow, authReloader: workflow, modelCatalogReader: workflow)
+        await state.refresh()
+        state.requestModelCatalogRefresh()
+        await workflow.waitForFirstCatalogStart()
+        await state.refresh()
+        await workflow.releaseFirstCatalog()
+        await state.waitForModelCatalogRefresh()
+        XCTAssertEqual(state.liveModelCatalogState, .ready(ready.models))
+        let events = await workflow.events
+        XCTAssertEqual(events, ["status", "catalog", "status", "catalog"])
+    }
+
+    @MainActor
+    func testLoginRetriesAnEarlierInFlightCatalogTransportFailureOnce() async {
+        let ready = catalogSnapshot(state: .ready, models: [liveModel("example/recovered")])
+        let workflow = RecordingAuthWorkflow(
+            statuses: [
+                adminSnapshot(signedIn: false, health: "signed_out"),
+                adminSnapshot(signedIn: true, health: "ok"),
+                adminSnapshot(signedIn: true, health: "ok"),
+            ], catalogs: [ready, ready], suspendFirstCatalog: true, failFirstCatalog: true)
+        let state = makeState(adminReader: workflow, authReloader: workflow, modelCatalogReader: workflow)
+        await state.refresh()
+        state.requestModelCatalogRefresh()
+        await workflow.waitForFirstCatalogStart()
+        await state.refresh()
+        await workflow.releaseFirstCatalog()
+        await state.waitForModelCatalogRefresh()
+        await state.refresh()
+        XCTAssertEqual(state.liveModelCatalogState, .ready(ready.models))
+        let events = await workflow.events
+        XCTAssertEqual(events, ["status", "catalog", "status", "catalog", "status"])
+        state.stop()
+    }
+
+    @MainActor
+    func testRefreshingCatalogRetainsVisibleRowsAndDisablesMutation() async {
+        let old = catalogSnapshot(state: .ready, models: [liveModel("example/old")])
+        let new = catalogSnapshot(state: .ready, models: [liveModel("example/new")])
+        let workflow = RecordingAuthWorkflow(statuses: [], catalogs: [old, new])
+        let state = makeState(adminReader: workflow, authReloader: workflow, modelCatalogReader: workflow)
+        state.requestModelCatalogRefresh()
+        await state.waitForModelCatalogRefresh()
+        state.requestModelCatalogRefresh()
+        XCTAssertTrue(state.modelCatalogIsRefreshing)
+        XCTAssertFalse(state.modelCatalogAllowsMutation)
+        XCTAssertEqual(state.displayedModelCatalogState, .ready(old.models))
+        await state.waitForModelCatalogRefresh()
+        XCTAssertFalse(state.modelCatalogIsRefreshing)
+        XCTAssertTrue(state.modelCatalogAllowsMutation)
+        XCTAssertEqual(state.displayedModelCatalogState, .ready(new.models))
     }
 }

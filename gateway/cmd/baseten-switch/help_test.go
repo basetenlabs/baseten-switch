@@ -30,6 +30,7 @@ var expectedAdvertisedCommands = []string{
 	"auth",
 	"doctor",
 	"claude",
+	"claude-desktop",
 	"codex",
 	"pi",
 }

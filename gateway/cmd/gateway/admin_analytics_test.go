@@ -551,10 +551,12 @@ func TestAnalyticsCacheInvalidatesOnDisplayNameRenameWithoutRegrouping(t *testin
 }
 
 func TestAdminRawTelemetryReadsV1SegmentsAndAppliesTail(t *testing.T) {
-	g, path := analyticsGateway(t, time.Now())
+	now := time.Now().UTC()
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	g, path := analyticsGateway(t, now)
 	first := analyticsAdminEvent(
 		5,
-		time.Date(2026, time.July, 31, 23, 59, 0, 0, time.UTC),
+		monthStart.Add(-time.Minute),
 		"anthropic",
 		"claude-opus-4-8",
 		"claude-opus-4-8",
@@ -562,7 +564,7 @@ func TestAdminRawTelemetryReadsV1SegmentsAndAppliesTail(t *testing.T) {
 	)
 	second := analyticsAdminEvent(
 		6,
-		time.Date(2026, time.August, 1, 0, 1, 0, 0, time.UTC),
+		monthStart.Add(time.Minute),
 		"baseten",
 		"claude-opus-4-8",
 		"zai-org/GLM-5.2",

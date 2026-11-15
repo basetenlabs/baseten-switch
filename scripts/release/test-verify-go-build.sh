@@ -9,11 +9,11 @@ cat >"$scratch/go" <<'GO'
 printf '%s: %s\n' "$3" "$TEST_GO_VERSION"
 GO
 chmod +x "$scratch/go"
-for version in go1.26.10 go1.26.11 go1.27.3 go1.28.0; do
+for version in go1.26.11 go1.26.12 go1.27.4 go1.27.5 go1.28.0; do
   TEST_GO_VERSION="$version" GO="$scratch/go" \
     "$SCRIPT_DIR/verify-go-build.sh" fixture >/dev/null
 done
-for version in go1.25.15 go1.26.9 go1.27.1 go1.27.2 go1.28rc1 devel unknown ''; do
+for version in go1.25.15 go1.26.9 go1.26.10 go1.27.1 go1.27.2 go1.27.3 go1.28rc1 devel unknown ''; do
   if TEST_GO_VERSION="$version" GO="$scratch/go" \
     "$SCRIPT_DIR/verify-go-build.sh" fixture >"$scratch/result" 2>&1; then
     printf 'FAIL: accepted unsupported or unknown compiler %s\n' "$version" >&2

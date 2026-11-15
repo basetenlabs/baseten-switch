@@ -14,8 +14,10 @@ import (
 const doctorProbeMaxTokens = 2
 
 type doctorProbeTarget struct {
-	ProtocolShape string
-	BindAddr      string
+	ProtocolShape  string
+	BindAddr       string
+	RequestedModel string
+	Direct         bool
 }
 
 type doctorProbeResult struct {
@@ -47,14 +49,18 @@ func doctorProbeClient(c *http.Client, target doctorProbeTarget) *doctorProbeRes
 		shape = "anthropic"
 	}
 	url := "http://" + target.BindAddr
+	model := target.RequestedModel
+	if model == "" {
+		model = doctorProbeRequestModel(shape)
+	}
 	var body []byte
 	switch shape {
 	case "anthropic":
 		url += "/v1/messages"
-		body = []byte(fmt.Sprintf(`{"model":%q,"max_tokens":%d,"messages":[{"role":"user","content":"ping"}]}`, doctorProbeRequestModel(shape), doctorProbeMaxTokens))
+		body = []byte(fmt.Sprintf(`{"model":%q,"max_tokens":%d,"messages":[{"role":"user","content":"ping"}]}`, model, doctorProbeMaxTokens))
 	case "openai":
 		url += "/v1/chat/completions"
-		body = []byte(fmt.Sprintf(`{"model":%q,"max_tokens":%d,"messages":[{"role":"user","content":"ping"}]}`, doctorProbeRequestModel(shape), doctorProbeMaxTokens))
+		body = []byte(fmt.Sprintf(`{"model":%q,"max_tokens":%d,"messages":[{"role":"user","content":"ping"}]}`, model, doctorProbeMaxTokens))
 	case "monitor":
 		return &doctorProbeResult{Error: "monitor shape has no probe"}
 	default:
@@ -75,6 +81,9 @@ func doctorProbeClient(c *http.Client, target doctorProbeTarget) *doctorProbeRes
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 	doorVia := resp.Header.Get("X-Baseten-Switch-Door")
+	if target.Direct {
+		doorVia = ""
+	}
 	fallbackTrigger := ""
 	if doorVia == "router" {
 		fallbackTrigger = resp.Header.Get("X-Baseten-Switch-Fallback")

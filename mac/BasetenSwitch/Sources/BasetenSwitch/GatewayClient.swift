@@ -122,6 +122,7 @@ struct ReloadStatus: Equatable, Sendable {
 
 struct ClientStatus: Identifiable, Equatable, Sendable {
     let name: String
+    var allowNative: Bool
     var enabled: Bool
     var bindAddr: String
     var protocolShape: String
@@ -148,6 +149,7 @@ struct ClientStatus: Identifiable, Equatable, Sendable {
     init?(dict: [String: Any]) {
         guard let name = dict["name"] as? String else { return nil }
         self.name = name
+        allowNative = dict["allow_native"] as? Bool ?? true
         enabled = dict["enabled"] as? Bool ?? false
         bindAddr = dict["bind_addr"] as? String ?? ""
         protocolShape = dict["protocol_shape"] as? String ?? ""

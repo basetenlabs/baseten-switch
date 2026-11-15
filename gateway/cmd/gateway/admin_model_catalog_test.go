@@ -20,6 +20,26 @@ import (
 
 type modelCatalogRoundTripFunc func(*http.Request) (*http.Response, error)
 
+func TestModelCatalogLocalProjectionSkipsAccountDiscovery(t *testing.T) {
+	g, upstream, fallback := testModelCatalogGateway(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("local metadata requested upstream discovery")
+	}), true)
+	if err := g.pricing.ReplaceModelsDev([]byte(publicCatalogGatewayFixture), time.Now(), "local-test"); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		w := httptest.NewRecorder()
+		g.adminServer.Handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/admin/model-catalog?local_only=true", nil))
+		var response modelCatalogResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil || w.Code != http.StatusOK || response.State != "ready" || len(response.ContextLimits) == 0 {
+			t.Fatalf("local projection failed: %d %s (%v)", w.Code, w.Body.String(), err)
+		}
+	}
+	if upstream.Load() != 0 || fallback.Load() != 0 {
+		t.Fatalf("upstream calls=%d fallback=%d", upstream.Load(), fallback.Load())
+	}
+}
+
 func (f modelCatalogRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
 }

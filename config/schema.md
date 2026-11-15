@@ -19,7 +19,7 @@ SIGHUP. The native Mac app edits the same file through `baseten-switch`.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `routing_enabled` | bool | `true` in new configs | The one global routing gate. It must be explicitly present. Off is absolute: native requests use the protocol-native provider, and aliases, raw Baseten slugs, Baseten model mappings, dedicated Baseten subagents, fallback, and Baseten credentials are not consulted by request resolution. Saved policy remains editable and becomes active again when On. |
+| `routing_enabled` | bool | `true` in new configs | The routing override gate for clients with `allow_native: true` (the default). It must be explicitly present. For those clients, Off is absolute: native requests use the protocol-native provider, and aliases, raw Baseten slugs, Baseten model mappings, dedicated Baseten subagents, fallback, and Baseten credentials are not consulted by request resolution. Saved policy remains editable and becomes active again when On. |
 | `fallback_policy` | object | both triggers On | Independent controls for automatic native fallback after Baseten HTTP 429 and HTTP 5xx responses. An absent block or absent child resolves On. Explicit `null` is invalid. See below. |
 | `auth` | map[route] -> secret ref | (empty) | Environment fallback credentials per upstream route. The selected Baseten CLI profile supplies its OAuth or API-key credential automatically. `${VAR}` resolves from env or `~/.config/baseten-switch/env`. |
 | `telemetry_dir` | string | `~/.config/baseten-switch/telemetry` | Private directory containing versioned, monthly JSONL request segments. |
@@ -178,13 +178,14 @@ Each client entry maps one harness to one local bind address.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `name` | string | (required) | Harness identifier. Shown in the UI as the card title. |
-| `enabled` | bool | `true` | Disabled clients are skipped at config resolve time: the router never binds their port, so the front door serves its hardcoded native fallback for that harness. Their saved mappings and `fallback_route` are dormant intent that takes effect on re-enable. |
+| `enabled` | bool | `true` | Disabled clients are skipped at config resolve time and the router does not bind their port. A native-capable client behind the front door can use that door’s native fallback. Independent clients with `allow_native: false` cannot be front-door targets, so disabling one leaves its endpoint unavailable. Saved policy takes effect on re-enable. |
 | `bind_addr` | string | (required) | `host:port` the gateway listens on for this harness. Clients may share an address if their `protocol_shape`s differ: the gateway binds once and resolves the client per request from the path (anthropic shape owns `/v1/messages*`; openai shape owns `/v1/chat/completions` and `/v1/responses`; `/v1/models` disambiguates on the `anthropic-version` header). Two same-shape clients on one address is a config error: the later one is logged and skipped. |
+| `allow_native` | bool | `true` | Set `false` for an independent selected-model gateway, such as Claude Desktop. Only explicit selected Baseten alias IDs are accepted, regardless of `global.routing_enabled`. Requires a dedicated Anthropic-shape listener. Native routing, native fallback, family mappings and subagent overrides are rejected. |
 | `protocol_shape` | enum: `anthropic`,`openai` | `anthropic` | Wire shape the harness sends to the gateway. It selects the listener handler and native provider: `/v1/messages` and Anthropic for `anthropic`, `/v1/chat/completions` and OpenAI for `openai`. An anthropic listener with `upstream_shape: openai` uses cross-shape translation for Baseten traffic. The reverse translation is unsupported. |
 | `auth_token` | object | (empty) | Incoming-auth: what the harness sends to the gateway. |
-| `default_model` | baseten slug | (required for enabled clients) | Baseten target for requests that do not match an explicit `model_routes` family mapping. Must contain `/`. Disabled clients may omit it while parked. |
+| `default_model` | baseten slug | (required for enabled native-capable clients) | Baseten target for requests that do not match an explicit `model_routes` family mapping. Must contain `/`. Disabled clients and `allow_native: false` clients may omit it. |
 | `model_aliases` | map[alias id] -> baseten slug | (empty) | Anthropic-shape clients only. Defines stable picker and request model IDs. The gateway also synthesizes aliases into `GET /v1/models` for compatibility with older Claude Code gateway-discovery clients. Alias ids must begin with `claude` or `anthropic` and must not shadow real Anthropic model names (`claude-opus-*`, `claude-sonnet-*`, `claude-haiku-*`, `claude-instant-*`, `claude-<digit>*`); violations refuse the config at load. While global routing is On, a request naming an alias or raw Baseten slug is an explicit Baseten primary. Eligible 429 and 5xx responses use `native_fallback_model` when configured. While Off, the request fails locally without consulting Baseten. Unknown gateway aliases remain a loud error. |
-| `model_picker` | object | (absent) | Anthropic-shape clients only. Ordered desired projection into Claude Code's user-level `modelPicker`. An absent block means the integration has not been configured; a present disabled or empty block remains explicit saved intent. See `model_picker` below. |
+| `model_picker` | object | (absent) | Anthropic-shape clients only. Ordered model list for Claude Code settings synchronization or independent gateway discovery. An absent block means the integration has not been configured; a present disabled or empty block remains explicit saved intent. See `model_picker` below. |
 | `subagent_model` | string | (empty) | Anthropic-shape clients only. Rewrite target for Claude Code subagent requests. When global routing is On, the rewrite runs before the normal explicit-choice, family-mapping, and default-mapping ladder. When Off, saved subagent configuration is inactive and the original native model passes through. |
 | `subagent_routing` | enum: `on`,`off` | (absent) | Anthropic-shape clients only. Live toggle for the `subagent_model` rewrite, so the menubar can flip it without losing the configured model. `on` enables the rewrite; `off` disables it (sidechain traffic passes untouched, exact factory behavior). Absent means `on` when `subagent_model` is set, so the field exists purely as the off switch. Enabled = `subagent_model` non-empty and `subagent_routing` is not `off`. Validation at load: a value other than empty/`on`/`off`, or `subagent_routing` set while `subagent_model` is empty, is a config-load error. The `baseten-switch claude subagents on|off` verb flips this field then SIGHUPs the gateway; live sessions pick it up on their next sidechain request. |
 | `model_routes` | map[family]string | GLM-5.2 for fable, opus, sonnet, and haiku in new configs | Anthropic-shape per-family mappings. Keys are exactly `fable`, `opus`, `sonnet`, or `haiku`. `native` selects Anthropic; a configured alias or raw Baseten slug selects Baseten. A missing family uses the client's `default_model`. While global routing is Off, every mapping is dormant but remains editable. Baseten mappings retain the protocol-native fallback; native mappings do not activate fallback. |
@@ -204,9 +205,27 @@ migration preserves an existing valid target, writes a unique exact-byte
 backup, preserves the active file's permissions and comments, validates the
 result before installation, and is idempotent.
 
+### Independent selected-model gateway
+
+`claude-desktop setup` creates an opt-in client on `127.0.0.1:45274` with
+`allow_native: false` and an enabled, empty `model_picker`. Preview uses
+`127.0.0.1:45374`. The listener must use a loopback IP address, cannot share an
+address with another enabled client, and cannot be a `door` target. Its model
+aliases map directly to Baseten slugs. Only aliases listed in its enabled
+`model_picker.models` are accepted for inference or returned by discovery, in
+saved order. Empty or disabled selections expose no models and accept no model
+requests. Removing membership rejects the old ID even if its historical alias
+mapping remains saved.
+
+The global override gate and fallback policy do not change this listener's
+routing. Baseten authentication and normal error responses still apply.
+Native discovery, native inference and native fallback are unavailable.
+Switch's setup field `baseten-switch-local` is a non-secret placeholder for
+Desktop's gateway UI; it is not a Baseten credential or an inbound access token.
+
 ### `model_picker`
 
-`model_picker` curates the Baseten rows that Switch appends to Claude Code's
+For native-capable clients, `model_picker` curates the Baseten rows that Switch appends to Claude Code's
 native `/model` lineup. It does not replace `model_aliases`, enforce routing,
 or change Claude-owned native rows. Organization-managed Claude settings and
 Claude's `availableModels` policy remain authoritative and may prevent a
@@ -221,7 +240,7 @@ model_picker:
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | bool | `false` | When true, the Claude adapter synchronizes these rows. When false, routing aliases remain configured but Switch-owned picker rows are removed. |
+| `enabled` | bool | `false` | For native-capable clients, enables Claude Code settings synchronization; disabling removes Switch-owned picker rows while retaining routing aliases. Independent clients require this enabled and use these rows as their discovery and inference allowlist. |
 | `models` | ordered list[object] | `[]` | Saved row order. An empty list is valid. Aliases must be unique. |
 | `models[].alias` | string | (required) | Stable routing identity. It must exist in the same client's `model_aliases`. |
 

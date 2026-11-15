@@ -128,6 +128,21 @@ final class UpdatePresentationTests: XCTestCase {
     }
 
     @MainActor
+    func testUnconfiguredDesktopIsDiscoverableAndOpensItsConfiguration() {
+        let variant = testVariant()
+        let state = BasetenSwitchState(preview: .healthy, variant: variant)
+        var openedClient: String?
+        let controller = StatusItemController(
+            state: state, variant: variant,
+            openConfiguration: { openedClient = $0 })
+        let title = "Claude Desktop: Not configured"
+        XCTAssertEqual(controller.menuItemTitlesForTesting.filter { $0.hasPrefix("Claude Desktop:") }, [title])
+        XCTAssertTrue(controller.performMenuItemForTesting(
+            titled: "Configure Claude Desktop…", inSubmenu: title))
+        XCTAssertEqual(openedClient, "claude-desktop")
+    }
+
+    @MainActor
     func testCurrentMenuKeepsManualCheckBeforeOpenAppAndNoReleaseMarker() {
         let variant = testVariant()
         let updates = UpdateStore(

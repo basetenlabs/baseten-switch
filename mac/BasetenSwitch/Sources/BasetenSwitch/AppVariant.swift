@@ -36,6 +36,7 @@ struct RuntimeProfile: Equatable {
             "BASETEN_SWITCH_ADMIN_URL",
             "BASETEN_SWITCH_GATEWAY_ADMIN",
             "BASETEN_SWITCH_GATEWAY_PIDFILE",
+            "BASETEN_SWITCH_CLAUDE_DESKTOP_ADDR",
         ]
         var coordinationEnvironment: [String: String] = [:]
         for key in coordinationKeys {
@@ -85,6 +86,7 @@ struct RuntimeProfile: Equatable {
         var environment = [
             "BASETEN_SWITCH_CONFIG_PATH": config.path,
             "BASETEN_SWITCH_ADMIN_ADDR": "127.0.0.1:45373",
+            "BASETEN_SWITCH_CLAUDE_DESKTOP_ADDR": "127.0.0.1:45374",
             "BASETEN_SWITCH_ADMIN_URL": "http://127.0.0.1:45373",
             "BASETEN_SWITCH_GATEWAY_ADMIN": "http://127.0.0.1:45373",
             "BASETEN_SWITCH_GATEWAY_PORT": "45373",

@@ -241,6 +241,8 @@ final class RouterWindowController: NSObject, NSWindowDelegate, NSToolbarDelegat
             state.requestClientPageRefresh()
             if navigation.selection == .client("claude-code") {
                 state.requestClaudeModelPickerDiagnosticsRefresh()
+            } else if navigation.selection == .client("claude-desktop") {
+                state.requestClaudeDesktopStatusRefresh()
             }
         } else {
             state.requestInteractiveRefresh(includeStats: false)
@@ -313,6 +315,9 @@ func livePathConfiguredRoute(
     globalRoutingEnabled: Bool
 ) -> String {
     guard client.enabled else { return "Disabled" }
+    if !client.allowNative {
+        return "Selected Baseten models · independent of routing overrides"
+    }
     guard globalRoutingEnabled else {
         let native = client.nativeRoute.isEmpty
             ? "Native provider"
@@ -368,6 +373,7 @@ func livePathEffectiveRoute(_ client: ClientStatus) -> String {
 }
 
 func livePathModel(_ client: ClientStatus) -> String {
+    if !client.allowNative { return "Chosen in \(clientDisplayName(client.name))" }
     if let effectiveModel = client.unmatchedNativeModel?.effectiveModel,
        !effectiveModel.isEmpty {
         return catalogModelDisplayLabel(
@@ -382,6 +388,7 @@ func livePathModel(_ client: ClientStatus) -> String {
 }
 
 func livePathFallback(_ client: ClientStatus) -> String {
+    if !client.allowNative { return "Unavailable for this gateway client" }
     if client.fallbackActive {
         let route = client.fallback.servedRoute.isEmpty
             ? "native provider"
@@ -468,11 +475,11 @@ func windowGlobalRoutingPresentation(
     return WindowGlobalRoutingPresentation(
         status: stateLabel,
         overviewTitle: enabled
-            ? "Routing rules are active"
-            : "Native providers only",
+            ? "Routing overrides are active"
+            : "Routing overrides are Off",
         overviewDescription: enabled
-            ? "Supported requests use the saved per-model mappings. Use the menu bar to turn routing Off."
-            : "All supported requests use their native providers. Saved mappings remain editable. Use the menu bar to turn routing On.",
+            ? "Override clients use the saved model mappings. Claude Desktop’s gateway remains active when configured, independently of this switch."
+            : "Override clients use their native providers. Saved mappings remain editable. Claude Desktop’s gateway remains active when configured.",
         clientDescription: enabled
             ? "Global routing is On. Claude Code requests use the model mappings below."
             : "Global routing is Off. Native Claude models use Anthropic. Saved mappings remain editable and apply next time routing is On.")
@@ -592,15 +599,15 @@ private struct RouterConfigurationView: View {
                     .accessibilityIdentifier("sidebar-requests")
 
                 Section("Clients") {
-                    ForEach(state.clients) { client in
+                    ForEach(discoverableClientNames(state.clients), id: \.self) { name in
                         Label {
-                            Text(clientDisplayName(client.name))
+                            Text(clientDisplayName(name))
                         } icon: {
-                            ClientBrandMark(clientName: client.name)
+                            ClientBrandMark(clientName: name)
                         }
-                            .tag(RouterWindowDestination.client(client.name))
+                            .tag(RouterWindowDestination.client(name))
                             .accessibilityIdentifier(
-                                "sidebar-client-\(client.name)")
+                                "sidebar-client-\(name)")
                     }
                 }
             }
@@ -644,7 +651,12 @@ private struct RouterConfigurationView: View {
         case .requests:
             RequestsView(store: requestsStore)
         case .client(let name):
-            if let client = state.clients.first(where: { $0.name == name }) {
+            if name == "claude-desktop" {
+                ClaudeDesktopView(
+                    state: state,
+                    isPreview: isPreview,
+                    viewRequests: { navigation.selection = .requests })
+            } else if let client = state.clients.first(where: { $0.name == name }) {
                 ClientRoutingView(
                     state: state,
                     client: client,
@@ -664,7 +676,7 @@ private struct RouterConfigurationView: View {
 
     private func reconcileSelection(with names: [String]) {
         if case .client(let selected) = navigation.selection,
-           !names.contains(selected) {
+           selected != "claude-desktop", !names.contains(selected) {
             navigation.selection = .overview
         }
     }
@@ -911,7 +923,7 @@ private struct RoutingOverviewView: View {
 
     private var routingGroup: some View {
         RoutingSectionCard {
-            Label("Global Routing", systemImage: "arrow.triangle.branch")
+            Label("Routing Overrides", systemImage: "arrow.triangle.branch")
                 .font(.headline)
         } content: {
             VStack(alignment: .leading, spacing: 4) {
@@ -994,19 +1006,19 @@ private struct RoutingOverviewView: View {
                 } else {
                     fallbackToggle(
                         title: "Rate limits (HTTP 429)",
-                        description: "When a request routed to Baseten is rate limited, try the client's native provider once and use it briefly while Baseten recovers.",
+                        description: "For override clients, when Baseten rate limits a request, try the client's native provider once and use it briefly while Baseten recovers.",
                         trigger: .http429,
                         isOn: state.displayedFallback429,
                         identifier: "fallback-policy-429")
                     Divider()
                     fallbackToggle(
                         title: "Server errors (HTTP 5xx)",
-                        description: "When a request routed to Baseten returns a server error, try the client's native provider once and use it briefly while Baseten recovers.",
+                        description: "For override clients, when Baseten returns a server error, try the client's native provider once and use it briefly while Baseten recovers.",
                         trigger: .http5xx,
                         isOn: state.displayedFallback5xx,
                         identifier: "fallback-policy-5xx")
                 }
-                Text("Native Claude requests fall back to the exact model Claude requested. Baseten models selected from /model fall back to the model configured on the Claude Code page.")
+                Text("Native Claude requests fall back to the exact model Claude requested. Baseten models selected from /model fall back to the model configured on the Claude Code page. Claude Desktop gateway requests never use native fallback.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

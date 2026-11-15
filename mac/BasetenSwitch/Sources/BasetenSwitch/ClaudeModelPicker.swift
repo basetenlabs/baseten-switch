@@ -555,6 +555,83 @@ struct ClaudeModelPickerProjection: Equatable {
     let availableToAdd: [LiveModelCatalogEntry]
 }
 
+func filterAvailableModels(
+    _ models: [LiveModelCatalogEntry],
+    query: String
+) -> [LiveModelCatalogEntry] {
+    let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !query.isEmpty else { return models }
+    return models.filter {
+        $0.displayLabel.localizedCaseInsensitiveContains(query)
+            || $0.slug.localizedCaseInsensitiveContains(query)
+    }
+}
+
+struct ConfiguredModelRowView: View {
+    let row: ClaudeModelPickerRow
+    let rowState: String?
+    let canEdit: Bool
+    let canMoveUp: Bool
+    let canMoveDown: Bool
+    let accessibilityPrefix: String
+    let moveUp: () -> Void
+    let moveDown: () -> Void
+    let remove: () -> Void
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(row.label).font(.body.weight(.medium))
+                Text(row.description).font(.caption).foregroundStyle(.secondary)
+                Text(row.alias).font(.caption2.monospaced())
+                    .foregroundStyle(.tertiary).textSelection(.enabled)
+                if let rowState {
+                    Text(rowState).font(.caption2).foregroundStyle(.orange)
+                }
+            }
+            Spacer(minLength: 12)
+            Button(action: moveUp) { Image(systemName: "arrow.up") }
+                .buttonStyle(.borderless).disabled(!canEdit || !canMoveUp)
+                .help("Move up").accessibilityLabel("Move \(row.label) up")
+                .accessibilityIdentifier("\(accessibilityPrefix)-move-up-\(row.alias)")
+            Button(action: moveDown) { Image(systemName: "arrow.down") }
+                .buttonStyle(.borderless).disabled(!canEdit || !canMoveDown)
+                .help("Move down").accessibilityLabel("Move \(row.label) down")
+                .accessibilityIdentifier("\(accessibilityPrefix)-move-down-\(row.alias)")
+            Button("Remove", action: remove).disabled(!canEdit)
+                .accessibilityIdentifier("\(accessibilityPrefix)-remove-\(row.alias)")
+        }
+        .padding(.vertical, 3)
+        .accessibilityElement(children: .contain)
+    }
+}
+
+struct AvailableModelRowView: View {
+    let model: LiveModelCatalogEntry
+    let canAdd: Bool
+    let previewing: Bool
+    let accessibilityPrefix: String
+    let add: () -> Void
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(model.displayLabel).font(.body.weight(.medium))
+                Text(model.slug).font(.caption2.monospaced())
+                    .foregroundStyle(.secondary).textSelection(.enabled)
+            }
+            Spacer(minLength: 12)
+            if previewing {
+                ProgressView().controlSize(.small)
+                    .accessibilityLabel("Previewing \(model.displayLabel)")
+            }
+            Button("Add", action: add).disabled(!canAdd)
+                .accessibilityIdentifier("\(accessibilityPrefix)-add-\(model.slug)")
+        }
+        .padding(.vertical, 3)
+    }
+}
+
 func projectClaudeModelPicker(
     status: ClaudeModelPickerStatus?,
     liveState: LiveModelCatalogLoadState
@@ -1138,58 +1215,20 @@ struct ClaudeModelPickerSectionView: View {
         _ row: ClaudeModelPickerRow,
         index: Int
     ) -> some View {
-        HStack(alignment: .center, spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(rowDisplayLabel(row))
-                    .font(.body.weight(.medium))
-                Text(row.description)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text(row.alias)
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.tertiary)
-                    .textSelection(.enabled)
-                if let configuredRowState {
-                    Text(configuredRowState)
-                        .font(.caption2)
-                        .foregroundStyle(.orange)
-                }
-            }
-            Spacer(minLength: 12)
-            Button {
-                moveUp(index: index)
-            } label: {
-                Image(systemName: "arrow.up")
-            }
-            .buttonStyle(.borderless)
-            .disabled(!canEditConfiguredRows || index == 0)
-            .help("Move up")
-            .accessibilityLabel("Move \(rowDisplayLabel(row)) up")
-            .accessibilityIdentifier("claude-picker-move-up-\(row.alias)")
-
-            Button {
-                moveDown(index: index)
-            } label: {
-                Image(systemName: "arrow.down")
-            }
-            .buttonStyle(.borderless)
-            .disabled(
-                !canEditConfiguredRows
-                    || index == projection.configured.count - 1)
-            .help("Move down")
-            .accessibilityLabel("Move \(rowDisplayLabel(row)) down")
-            .accessibilityIdentifier("claude-picker-move-down-\(row.alias)")
-
-            Button("Remove") {
+        ConfiguredModelRowView(
+            row: row,
+            rowState: configuredRowState,
+            canEdit: canEditConfiguredRows,
+            canMoveUp: index > 0,
+            canMoveDown: index < projection.configured.count - 1,
+            accessibilityPrefix: "claude-picker",
+            moveUp: { moveUp(index: index) },
+            moveDown: { moveDown(index: index) },
+            remove: {
                 guard !isPreview else { return }
                 state.requestClaudeModelPicker(
                     claudeModelPickerRemoveMutation(alias: row.alias))
-            }
-            .disabled(!canEditConfiguredRows)
-            .accessibilityIdentifier("claude-picker-remove-\(row.alias)")
-        }
-        .padding(.vertical, 3)
-        .accessibilityElement(children: .contain)
+            })
     }
 
     private var availableSection: some View {
@@ -1255,29 +1294,12 @@ struct ClaudeModelPickerSectionView: View {
     private func availableRow(
         _ model: LiveModelCatalogEntry
     ) -> some View {
-        HStack(alignment: .center, spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(model.displayLabel)
-                    .font(.body.weight(.medium))
-                Text(model.slug)
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-            }
-            Spacer(minLength: 12)
-            if previewingSlug == model.slug {
-                ProgressView()
-                    .controlSize(.small)
-                    .accessibilityLabel(
-                        "Previewing \(model.displayLabel)")
-            }
-            Button("Add") {
-                beginAddPreview(slug: model.slug, alias: nil)
-            }
-            .disabled(!canAddModels || previewingSlug != nil)
-            .accessibilityIdentifier("claude-picker-add-\(model.slug)")
-        }
-        .padding(.vertical, 3)
+        AvailableModelRowView(
+            model: model,
+            canAdd: canAddModels && previewingSlug == nil,
+            previewing: previewingSlug == model.slug,
+            accessibilityPrefix: "claude-picker",
+            add: { beginAddPreview(slug: model.slug, alias: nil) })
     }
 
     private var projection: ClaudeModelPickerProjection {
@@ -1285,13 +1307,7 @@ struct ClaudeModelPickerSectionView: View {
     }
 
     private var filteredAvailable: [LiveModelCatalogEntry] {
-        let query = searchText.trimmingCharacters(
-            in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return projection.availableToAdd }
-        return projection.availableToAdd.filter {
-            $0.displayLabel.localizedCaseInsensitiveContains(query)
-                || $0.slug.localizedCaseInsensitiveContains(query)
-        }
+        filterAvailableModels(projection.availableToAdd, query: searchText)
     }
 
     private var canEditConfiguredRows: Bool {
@@ -1400,10 +1416,6 @@ struct ClaudeModelPickerSectionView: View {
                     state.lastError)
             }
         }
-    }
-
-    private func rowDisplayLabel(_ row: ClaudeModelPickerRow) -> String {
-        row.label
     }
 
     private func moveUp(index: Int) {

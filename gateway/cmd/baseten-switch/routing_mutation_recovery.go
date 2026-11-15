@@ -242,9 +242,10 @@ func validTerminalOperationShape(record mutationTerminalRecord) bool {
 	case "set_native_fallback_model":
 		return validMutationSurface(record.Operation, record.Surface) && !record.Requested && record.Client != "" && validConfigHash(record.KeyHash) && validConfigHash(record.RequestedTargetHash)
 	case "set_claude_route", "set_claude_subagents",
-		"add_claude_picker_model", "remove_claude_picker_model", "move_claude_picker_model":
+		"add_claude_picker_model", "remove_claude_picker_model", "move_claude_picker_model",
+		"add_claude_desktop_model", "remove_claude_desktop_model", "move_claude_desktop_model":
 		return validMutationSurface(record.Operation, record.Surface) && !record.Requested && record.Client != "" && validConfigHash(record.KeyHash) && validConfigHash(record.RequestedTargetHash)
-	case "enable_claude_picker", "disable_claude_picker":
+	case "enable_claude_picker", "disable_claude_picker", "setup_claude_desktop":
 		return validMutationSurface(record.Operation, record.Surface) && !record.Requested && record.Client != "" && validConfigHash(record.KeyHash) && record.RequestedTargetHash == ""
 	case "set_codex_route":
 		return validMutationSurface(record.Operation, record.Surface) && !record.Requested && record.Client != "" && validConfigHash(record.KeyHash) && validConfigHash(record.RequestedTargetHash)
@@ -268,6 +269,8 @@ func validMutationSurface(operation, surface string) bool {
 		return surface == mutationSurfaceClaude
 	case "set_codex_route":
 		return surface == mutationSurfaceCodex
+	case "setup_claude_desktop", "add_claude_desktop_model", "remove_claude_desktop_model", "move_claude_desktop_model":
+		return surface == mutationSurfaceClaudeDesktop
 	case "set_model_reasoning":
 		return surface == mutationSurfaceClaude || surface == mutationSurfaceCodex
 	default:
@@ -830,7 +833,7 @@ func reviewedMutationMessage(code string) string {
 	case "reasoning_preflight_failed":
 		return "the reasoning policy could not be validated against the running router"
 	case claudePickerContextMinimumErrorCode:
-		return "the selected Baseten model has a known context window below Claude Code's 200000-token model picker minimum; choose a model with at least 200000 tokens"
+		return "the selected Baseten model has a known context window below Claude's 200000-token model picker minimum; choose a model with at least 200000 tokens"
 	case "fingerprint_failed":
 		return "the routing request could not be identified safely"
 	case "cleanup_predicate_changed":

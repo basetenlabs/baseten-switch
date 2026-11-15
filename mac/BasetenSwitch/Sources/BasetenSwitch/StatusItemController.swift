@@ -128,7 +128,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     @discardableResult
-    func performMenuItemForTesting(titled title: String) -> Bool {
+    func performMenuItemForTesting(titled title: String, inSubmenu parent: String? = nil) -> Bool {
+        let menu = parent.flatMap { title in
+            self.menu.items.first(where: { $0.title == title })?.submenu
+        } ?? self.menu
         guard let index = menu.items.firstIndex(where: { $0.title == title }) else {
             return false
         }
@@ -156,7 +159,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.removeAllItems()
 
         let headerItem = NSMenuItem()
-        headerItem.title = "Global routing"
+        headerItem.title = "Routing overrides"
         let toggle = globalRoutingTogglePresentation(
             state: state,
             isPreviewFixture: isPreview)
@@ -193,6 +196,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 action: #selector(startSystem))
             start.isEnabled = !state.starting && state.canStartSystem
             menu.addItem(start)
+        }
+
+        if !state.clients.contains(where: { $0.name == "claude-desktop" }) {
+            let status = state.routingSnapshot == nil ? "Status unavailable" : "Not configured"
+            menu.addItem(clientMenuItem(
+                name: "claude-desktop", title: "Claude Desktop: \(status)"))
         }
 
         menu.addItem(trafficMenuItem())
@@ -251,9 +260,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         if let subtitle = authAttentionHeaderSubtitle(currentAuthAttention) {
             return subtitle
         }
+        if state.clients.contains(where: { $0.enabled && !$0.allowNative }) {
+            return state.confirmedGlobalRoutingEnabled
+                ? "Overrides On; Desktop gateway configured"
+                : "Overrides Off; Desktop gateway configured"
+        }
         return state.confirmedGlobalRoutingEnabled
-            ? "Routing rules are active"
-            : "Native providers only"
+            ? "Routing overrides are active"
+            : "Overrides Off; clients use native providers"
     }
 
     private var currentAuthAttention: AuthAttention {
@@ -352,18 +366,19 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     private func clientMenuItem(_ client: ClientStatus) -> NSMenuItem {
-        let item = NSMenuItem(
-            title: serverAuthoredClientMenuTitle(client),
-            action: nil,
-            keyEquivalent: "")
-        item.image = ClientBrandAssets.menuImage(for: client.name)
+        clientMenuItem(name: client.name, title: serverAuthoredClientMenuTitle(client))
+    }
 
-        let submenu = NSMenu(title: clientDisplayName(client.name))
+    private func clientMenuItem(name: String, title: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.image = ClientBrandAssets.menuImage(for: name)
+
+        let submenu = NSMenu(title: clientDisplayName(name))
         submenu.autoenablesItems = false
         let configure = actionItem(
-            "Configure \(clientDisplayName(client.name))…",
+            "Configure \(clientDisplayName(name))…",
             action: #selector(openConfigurationWindow(_:)))
-        configure.representedObject = client.name
+        configure.representedObject = name
         submenu.addItem(configure)
         item.submenu = submenu
         return item
@@ -577,7 +592,7 @@ final class StatusMenuHeaderView: NSView {
             isEnabled: switchEnabled,
             accessibilityStatus: accessibilityStatus,
             accessibilityHelp: disabledReason
-                ?? "Routes supported coding traffic using the saved model mappings.",
+                ?? "Controls routing overrides for coding clients. Claude Desktop’s configured gateway stays active when overrides are Off.",
             onToggle: onToggle)
         self.toggleModel = toggleModel
         toggleControl = StatusHeaderToggleControl(model: toggleModel)
@@ -853,7 +868,7 @@ final class StatusHeaderToggleControl: NSButton {
         setAccessibilityIdentifier(accessibilityIdentifier)
         // AppKit exposes NSSwitch to accessibility as a check box.
         setAccessibilityRole(.checkBox)
-        setAccessibilityLabel("Global routing")
+        setAccessibilityLabel("Routing overrides")
         configureLayers()
         synchronize()
     }

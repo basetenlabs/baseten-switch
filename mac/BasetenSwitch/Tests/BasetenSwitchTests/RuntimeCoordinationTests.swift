@@ -1728,7 +1728,7 @@ final class RuntimeCoordinationTests: XCTestCase {
         let controller = StatusItemController(state: state, variant: variant)
         XCTAssertEqual(
             controller.fixedHeaderSubtitleForTesting,
-            "Routing rules are active")
+            "Routing overrides are active")
         XCTAssertEqual(controller.displayedIconStateForTesting, .active)
         let healthyMenuTitles = controller.menuItemTitlesForTesting
         XCTAssertFalse(healthyMenuTitles.contains("Sign In to Baseten…"))
@@ -1766,7 +1766,7 @@ final class RuntimeCoordinationTests: XCTestCase {
         controller.menuNeedsUpdateForTesting()
         XCTAssertEqual(
             controller.fixedHeaderSubtitleForTesting,
-            "Routing rules are active")
+            "Routing overrides are active")
         XCTAssertEqual(controller.displayedIconStateForTesting, .active)
         XCTAssertFalse(
             controller.menuItemTitlesForTesting.contains("Sign In to Baseten…"))

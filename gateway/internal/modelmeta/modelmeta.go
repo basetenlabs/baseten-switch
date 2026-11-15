@@ -54,6 +54,9 @@ func basetenDisplayName(modelID string) string {
 	}
 }
 
+// HumanizeDisplayName preserves label capitalization and paths while spacing separators.
+func HumanizeDisplayName(label string) string { return humanizeLeaf(label) }
+
 func humanizeLeaf(leaf string) string {
 	var out strings.Builder
 	pendingSpace := false

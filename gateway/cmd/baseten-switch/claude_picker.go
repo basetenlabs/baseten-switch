@@ -97,7 +97,7 @@ type pickerContextMinimumError struct {
 
 func (e *pickerContextMinimumError) Error() string {
 	return fmt.Sprintf(
-		"Baseten model %q has a known context limit of %d tokens, below Claude Code's 200000-token model picker minimum; remove it from model_picker or select a model with at least 200000 tokens",
+		"Baseten model %q has a known context limit of %d tokens, below Claude's 200000-token model picker minimum; choose a model with at least 200000 tokens",
 		e.slug,
 		e.tokens,
 	)
@@ -136,7 +136,7 @@ var (
 	claudePickerVersionTimeout = 2 * time.Second
 	fetchClaudePickerCatalog   = func(adminAddr string) (claudePickerCatalogResponse, error) {
 		var response claudePickerCatalogResponse
-		err := getJSON(adminAddr, "/v1/admin/model-catalog", &response)
+		err := getJSON(adminAddr, "/v1/admin/model-catalog?local_only=true", &response)
 		return response, err
 	}
 )
@@ -257,7 +257,7 @@ func copyPickerAliases(aliases map[string]string) map[string]string {
 	return copy
 }
 
-func (a *claudeAdapter) preflightPickerContext(
+func preflightClaudePickerContext(
 	picker *config.ModelPicker,
 	aliases map[string]string,
 ) error {
@@ -1146,7 +1146,7 @@ func (a *claudeAdapter) mutatePickerConfig(args []string, opts mutationOptions, 
 		}
 		proposed := p
 		proposed.Enabled = true
-		if err := a.preflightPickerContext(
+		if err := preflightClaudePickerContext(
 			&proposed,
 			copyPickerAliases(a.modelAliases),
 		); err != nil {
@@ -1203,7 +1203,7 @@ func (a *claudeAdapter) mutatePickerConfig(args []string, opts mutationOptions, 
 		)
 		proposedAliases := copyPickerAliases(a.modelAliases)
 		proposedAliases[preview.Alias] = preview.Slug
-		if err := a.preflightPickerContext(
+		if err := preflightClaudePickerContext(
 			&proposed,
 			proposedAliases,
 		); err != nil {
@@ -1290,7 +1290,7 @@ func (a *claudeAdapter) mutatePickerConfig(args []string, opts mutationOptions, 
 		for alias, slug := range aliasesToAdd {
 			proposedAliases[alias] = slug
 		}
-		if err := a.preflightPickerContext(&p, proposedAliases); err != nil {
+		if err := preflightClaudePickerContext(&p, proposedAliases); err != nil {
 			code := "config_validation_failed"
 			if isPickerContextMinimum(err) {
 				code = claudePickerContextMinimumErrorCode
