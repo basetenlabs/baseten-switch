@@ -150,7 +150,7 @@ jobs:
           subject-path: ${{ steps.formula.outputs.artifact }}
 
       - name: Preserve formula and tap patch as workflow artifacts
-        uses: chainguard-actions/actions-upload-artifact@7d21b863ba4fc97f698d6c451875ee6cf043953a # v7.0.1
+        uses: chainguard-actions/actions-upload-artifact@c91615377dcc230c6b156542d25044f9b8d80dd8 # v7.0.2
         with:
           name: baseten-switch-${{ inputs.release_tag }}-homebrew
           path: |
