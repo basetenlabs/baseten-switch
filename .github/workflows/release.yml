@@ -145,7 +145,7 @@ jobs:
           } >>"$GITHUB_OUTPUT"
 
       - name: Attest the exact final ZIP
-        uses: chainguard-actions/actions-attest@fd7c311a2ded9db8e69c205f3442b52a1547b2f9 # v4.2.2
+        uses: chainguard-actions/actions-attest@a5926bd2ccd343f3a1cae4aa7c6fd094df2b5455 # v4.2.2
         with:
           subject-path: ${{ steps.formula.outputs.artifact }}
 
