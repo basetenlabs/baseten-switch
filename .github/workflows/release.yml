@@ -208,7 +208,7 @@ jobs:
 
       - name: Create token for the Homebrew tap
         id: tap-token
-        uses: chainguard-actions/actions-create-github-app-token@e8f098e248a2276eb73d76079faa9d1469695005 # v3.2.0
+        uses: chainguard-actions/actions-create-github-app-token@15b37cc57a685e864ed64f9fd595932cdfc6ed2e # v3.3.0
         with:
           client-id: ${{ secrets.APP_HOMEBREW_UPDATER_CLIENT_ID }}
           private-key: ${{ secrets.APP_HOMEBREW_UPDATER_PRIVATE_KEY }}
