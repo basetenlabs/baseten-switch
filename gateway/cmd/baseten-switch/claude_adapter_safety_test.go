@@ -20,14 +20,7 @@ func TestClaudeOnBackupBeforeModify(t *testing.T) {
 	writeSettingsFile(t, a, orig)
 
 	// Make the backup destination unwritable.
-	bdir := filepath.Dir(a.backupPath)
-	if err := os.MkdirAll(bdir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(bdir, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(bdir, 0o700) })
+	denyWrites(t, filepath.Dir(a.backupPath))
 
 	if rc := a.on(); rc != 1 {
 		t.Fatalf("rc = %d want 1 (backup write must fail)\n%s", rc, out.String())
