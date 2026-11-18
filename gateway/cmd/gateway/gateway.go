@@ -2729,6 +2729,12 @@ func (g *Gateway) buildAttemptTargetWithSnapshot(
 			return upstreamAttempt{}, err
 		}
 		body = tb
+		if rt == "baseten" {
+			body, _, err = translate.PrepareBasetenToolSchemas(body)
+			if err != nil {
+				return upstreamAttempt{}, err
+			}
+		}
 	}
 	var res proxy.RewriteResult
 	var strippedTypes []string

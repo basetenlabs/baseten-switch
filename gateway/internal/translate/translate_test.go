@@ -104,6 +104,71 @@ func TestRequestToOpenAIToolLoop(t *testing.T) {
 	}
 }
 
+func TestPrepareBasetenToolSchemasDowngradesUnicodePropertyPattern(t *testing.T) {
+	pattern := `^(?!__.*__$)[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}"\\./[\]]{1,200}$`
+	in, err := RequestToOpenAI([]byte(`{
+		"model":"m",
+		"tools":[{
+			"name":"Artifact",
+			"input_schema":{
+				"type":"object",
+				"properties":{
+					"field":{"type":"string","description":"Artifact field.","pattern":"^(?!__.*__$)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}\"\\\\./[\\]]{1,200}$"},
+					"ordinary":{"type":"string","pattern":"^[a-z]+$"},
+					"literal":{"type":"string","pattern":"\\\\p{Cc}"}
+				}
+			}
+		}],
+		"messages":[{"role":"user","content":"keep \\p{Cc} here"}]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, changed, err := PrepareBasetenToolSchemas(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("expected compatibility rewrite")
+	}
+
+	m := parse(t, out)
+	tools := m["tools"].([]any)
+	parameters := tools[0].(map[string]any)["function"].(map[string]any)["parameters"].(map[string]any)
+	properties := parameters["properties"].(map[string]any)
+	field := properties["field"].(map[string]any)
+	if _, exists := field["pattern"]; exists {
+		t.Fatalf("Unicode property pattern was not removed: %v", field)
+	}
+	wantDescription := "Artifact field.\nECMAScript pattern constraint: " + pattern
+	if field["description"] != wantDescription {
+		t.Fatalf("description = %q, want %q", field["description"], wantDescription)
+	}
+	if properties["ordinary"].(map[string]any)["pattern"] != "^[a-z]+$" {
+		t.Fatalf("ordinary pattern changed: %v", properties["ordinary"])
+	}
+	if properties["literal"].(map[string]any)["pattern"] != `\\p{Cc}` {
+		t.Fatalf("escaped literal changed: %v", properties["literal"])
+	}
+	if m["messages"].([]any)[0].(map[string]any)["content"] != `keep \p{Cc} here` {
+		t.Fatalf("message content changed: %v", m["messages"])
+	}
+}
+
+func TestPrepareBasetenToolSchemasNoopPreservesBytes(t *testing.T) {
+	in := []byte(`{"model":"m", "tools":[{"type":"function","function":{"name":"t","parameters":{"type":"object","properties":{"field":{"type":"string","pattern":"^[a-z]+$"}}}}}]}`)
+	out, changed, err := PrepareBasetenToolSchemas(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("unexpected compatibility rewrite")
+	}
+	if string(out) != string(in) {
+		t.Fatalf("no-op changed body:\n%s\nwant:\n%s", out, in)
+	}
+}
+
 func TestRequestToOpenAIRejectsImages(t *testing.T) {
 	in := []byte(`{"model":"m","messages":[{"role":"user","content":[{"type":"image","source":{}}]}]}`)
 	_, err := RequestToOpenAI(in)
