@@ -4501,7 +4501,13 @@ func (g *Gateway) relayTranslated(cl *clientListener, w http.ResponseWriter, res
 			relayErr = err
 			responseComplete = false
 		}
-		_ = tr.Finish()
+		if responseComplete || (relayErr == nil && tr.SawFinish()) {
+			_ = tr.Finish()
+		} else {
+			// The upstream stream ended before it finished. Tell the
+			// client instead of synthesizing a clean end_turn.
+			_ = tr.Abort("upstream stream ended before the response completed")
+		}
 	} else {
 		body, err := io.ReadAll(resp.Body)
 		var ab []byte

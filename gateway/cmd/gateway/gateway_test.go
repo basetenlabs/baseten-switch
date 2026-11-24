@@ -2973,3 +2973,51 @@ func TestSharedBindAddrModelsHeaderDisambiguation(t *testing.T) {
 		t.Fatalf("without anthropic-version header, models = %s, want openai upstream", b)
 	}
 }
+
+// TestMessagesTranslatedStreamCutOffIsNotReportedAsEndTurn: the openai
+// upstream sends part of a streamed answer and then drops the connection
+// (no finish_reason, no [DONE]). The anthropic-shape client must not get a
+// normal message_delta(stop_reason end_turn) + message_stop for it.
+func TestMessagesTranslatedStreamCutOffIsNotReportedAsEndTurn(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`data: {"id":"c1","model":"gpt-x","choices":[{"delta":{"role":"assistant","content":"The fix is to"}}]}` + "\n\n"))
+		w.(http.Flusher).Flush()
+		// Upstream dies mid-answer.
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}))
+	defer srv.Close()
+	cfg := testConfig(t, srv.URL, srv.URL)
+	cfg.OpenAIURL = srv.URL
+	rc := resolvedAnthropicBaseten(t)
+	rc.Route = "openai"
+	g, adminL, _ := newGateway(t, cfg, rc)
+	defer adminL.Close()
+	stop := start(t, g)
+	defer stop()
+
+	body := []byte(`{"model":"gpt-x","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"ping"}]}`)
+	req, _ := http.NewRequest("POST", clientURL(g, "claude-code", "/v1/messages"), bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	rb, _ := io.ReadAll(resp.Body)
+	s := string(rb)
+	if !strings.Contains(s, `"text":"The fix is to"`) {
+		t.Fatalf("partial text not relayed:\n%s", s)
+	}
+	if strings.Contains(s, "event: message_stop") || strings.Contains(s, `"stop_reason":"end_turn"`) {
+		t.Fatalf("cut-off upstream stream was reported to the client as a finished message:\n%s", s)
+	}
+	if !strings.Contains(s, "event: error") {
+		t.Fatalf("cut-off upstream stream ended without an error event:\n%s", s)
+	}
+}

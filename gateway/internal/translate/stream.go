@@ -171,6 +171,29 @@ func (t *StreamTranslator) Finish() error {
 	return t.emit("message_stop", map[string]any{"type": "message_stop"})
 }
 
+// SawFinish reports whether the upstream sent a finish_reason.
+func (t *StreamTranslator) SawFinish() bool { return t.finish != "" }
+
+// Abort ends the stream with an anthropic error event instead of a
+// normal message_delta/message_stop, for an upstream stream that ended
+// before it finished. Safe to call once, in place of Finish.
+func (t *StreamTranslator) Abort(message string) error {
+	if t.finished {
+		return nil
+	}
+	t.finished = true
+	if err := t.ensureStarted("", ""); err != nil {
+		return err
+	}
+	if err := t.closeOpenBlock(); err != nil {
+		return err
+	}
+	return t.emit("error", map[string]any{
+		"type":  "error",
+		"error": map[string]any{"type": "api_error", "message": message},
+	})
+}
+
 func (t *StreamTranslator) ensureStarted(id, model string) error {
 	if t.started {
 		return nil
